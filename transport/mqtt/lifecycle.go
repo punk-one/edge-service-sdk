@@ -169,7 +169,7 @@ func (c *mqttClient) connectOnce(mode string) error {
 		return fmt.Errorf("mqtt broker url is empty")
 	}
 
-	clientID := fmt.Sprintf("edge-service-s7-%d", time.Now().UnixNano())
+	clientID := fmt.Sprintf("edge-service-sdk-%d", time.Now().UnixNano())
 	opts, err := c.buildClientOptions(clientID)
 	if err != nil {
 		return err

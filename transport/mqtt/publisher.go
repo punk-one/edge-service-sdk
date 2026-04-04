@@ -126,6 +126,10 @@ func (p *MQTTPublisher) Close() error {
 
 func (p *MQTTPublisher) formatTelemetry(event outevent.TelemetryEvent, data map[string]interface{}, replayed bool) ([]byte, error) {
 	sendAt := time.Now().UnixMilli()
+	sourceName := strings.TrimSpace(event.SourceName)
+	if sourceName == "" {
+		sourceName = "telemetry"
+	}
 
 	switch strings.ToLower(strings.TrimSpace(p.telemetry.DataFormat)) {
 	case "raw":
@@ -135,7 +139,7 @@ func (p *MQTTPublisher) formatTelemetry(event outevent.TelemetryEvent, data map[
 			SendAt:     sendAt,
 			IsReplayed: replayed,
 			DeviceName: event.DeviceName,
-			SourceName: "S7-Device",
+			SourceName: sourceName,
 			Values:     data,
 		})
 	case "influx":
@@ -184,7 +188,7 @@ func (p *MQTTPublisher) convertToInfluxFormat(event outevent.TelemetryEvent, dat
 				}
 			}
 		}
-		lines = append(lines, fmt.Sprintf("s7_data,device=%s,field=%s,type=%s,trace_id=%s value=%v,is_replayed=%t %d", event.DeviceName, key, valueType, event.TraceID, actual, replayed, origin))
+		lines = append(lines, fmt.Sprintf("edge_device_data,device=%s,field=%s,type=%s,trace_id=%s value=%v,is_replayed=%t %d", event.DeviceName, key, valueType, event.TraceID, actual, replayed, origin))
 	}
 	return []byte(strings.Join(lines, "\n")), nil
 }

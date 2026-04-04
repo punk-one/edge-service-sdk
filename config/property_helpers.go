@@ -14,11 +14,13 @@ import (
 	"github.com/spf13/cast"
 )
 
-type propertyBinding struct {
+type PropertyBinding struct {
 	Path []string
 }
 
-func parsePropertyRequest(payload []byte) (rtapi.PropertyRequest, error) {
+type propertyBinding = PropertyBinding
+
+func ParsePropertyRequest(payload []byte) (rtapi.PropertyRequest, error) {
 	var req rtapi.PropertyRequest
 	if err := json.Unmarshal(payload, &req); err != nil {
 		return req, err
@@ -29,7 +31,7 @@ func parsePropertyRequest(payload []byte) (rtapi.PropertyRequest, error) {
 	return req, nil
 }
 
-func protocolPropertiesFromConfig(device contracts.DeviceConfig) map[string]contracts.ProtocolProperties {
+func ProtocolPropertiesFromConfig(device contracts.DeviceConfig) map[string]contracts.ProtocolProperties {
 	protocols := make(map[string]contracts.ProtocolProperties, len(device.Protocols))
 	for name, raw := range device.Protocols {
 		switch v := raw.(type) {
@@ -42,7 +44,7 @@ func protocolPropertiesFromConfig(device contracts.DeviceConfig) map[string]cont
 	return protocols
 }
 
-func buildTelemetryRequests(device contracts.DeviceConfig) ([]contracts.CommandRequest, error) {
+func BuildTelemetryRequests(device contracts.DeviceConfig) ([]contracts.CommandRequest, error) {
 	reqs := make([]contracts.CommandRequest, 0, len(device.Telemetry.Points))
 	for _, point := range device.Telemetry.Points {
 		req, err := point.ToCommandRequest(point.NodeName)
@@ -54,7 +56,7 @@ func buildTelemetryRequests(device contracts.DeviceConfig) ([]contracts.CommandR
 	return reqs, nil
 }
 
-func buildPropertyWriteRequests(device contracts.DeviceConfig, data map[string]interface{}) ([]contracts.CommandRequest, []*contracts.CommandValue, error) {
+func BuildPropertyWriteRequests(device contracts.DeviceConfig, data map[string]interface{}) ([]contracts.CommandRequest, []*contracts.CommandValue, error) {
 	var reqs []contracts.CommandRequest
 	var params []*contracts.CommandValue
 
@@ -93,9 +95,9 @@ func buildPropertyWriteRequests(device contracts.DeviceConfig, data map[string]i
 	return reqs, params, nil
 }
 
-func buildPropertyReadRequests(device contracts.DeviceConfig, data map[string]interface{}) ([]contracts.CommandRequest, []propertyBinding, error) {
+func BuildPropertyReadRequests(device contracts.DeviceConfig, data map[string]interface{}) ([]contracts.CommandRequest, []PropertyBinding, error) {
 	var reqs []contracts.CommandRequest
-	var bindings []propertyBinding
+	var bindings []PropertyBinding
 
 	for _, key := range sortedKeys(data) {
 		raw := data[key]
@@ -132,7 +134,7 @@ func buildPropertyReadRequests(device contracts.DeviceConfig, data map[string]in
 	return reqs, bindings, nil
 }
 
-func buildPropertyResponse(values []*contracts.CommandValue, bindings []propertyBinding) map[string]interface{} {
+func BuildPropertyResponse(values []*contracts.CommandValue, bindings []PropertyBinding) map[string]interface{} {
 	result := make(map[string]interface{})
 	for i, binding := range bindings {
 		if i >= len(values) {
@@ -141,6 +143,30 @@ func buildPropertyResponse(values []*contracts.CommandValue, bindings []property
 		setNestedValue(result, binding.Path, values[i].Value)
 	}
 	return result
+}
+
+func parsePropertyRequest(payload []byte) (rtapi.PropertyRequest, error) {
+	return ParsePropertyRequest(payload)
+}
+
+func protocolPropertiesFromConfig(device contracts.DeviceConfig) map[string]contracts.ProtocolProperties {
+	return ProtocolPropertiesFromConfig(device)
+}
+
+func buildTelemetryRequests(device contracts.DeviceConfig) ([]contracts.CommandRequest, error) {
+	return BuildTelemetryRequests(device)
+}
+
+func buildPropertyWriteRequests(device contracts.DeviceConfig, data map[string]interface{}) ([]contracts.CommandRequest, []*contracts.CommandValue, error) {
+	return BuildPropertyWriteRequests(device, data)
+}
+
+func buildPropertyReadRequests(device contracts.DeviceConfig, data map[string]interface{}) ([]contracts.CommandRequest, []PropertyBinding, error) {
+	return BuildPropertyReadRequests(device, data)
+}
+
+func buildPropertyResponse(values []*contracts.CommandValue, bindings []PropertyBinding) map[string]interface{} {
+	return BuildPropertyResponse(values, bindings)
 }
 
 func resolvePropertyPointWrite(device contracts.DeviceConfig, key string, raw interface{}) (contracts.CommandRequest, *contracts.CommandValue, bool, error) {
@@ -167,28 +193,28 @@ func resolvePropertyPointWrite(device contracts.DeviceConfig, key string, raw in
 	return contracts.CommandRequest{}, nil, false, nil
 }
 
-func resolvePropertyPointRead(device contracts.DeviceConfig, key string, raw interface{}) (contracts.CommandRequest, propertyBinding, bool, error) {
+func resolvePropertyPointRead(device contracts.DeviceConfig, key string, raw interface{}) (contracts.CommandRequest, PropertyBinding, bool, error) {
 	for _, point := range device.Property.Points {
 		nodeName, resolvedName, ok, err := resolvePointNodeName(point, key)
 		if err != nil {
-			return contracts.CommandRequest{}, propertyBinding{}, false, err
+			return contracts.CommandRequest{}, PropertyBinding{}, false, err
 		}
 		if !ok {
 			continue
 		}
 
 		if !readSelectionEnabled(raw) {
-			return contracts.CommandRequest{}, propertyBinding{}, false, fmt.Errorf("property %q read selector must be true or empty object", key)
+			return contracts.CommandRequest{}, PropertyBinding{}, false, fmt.Errorf("property %q read selector must be true or empty object", key)
 		}
 
 		req, err := point.ToCommandRequest(nodeName)
 		if err != nil {
-			return contracts.CommandRequest{}, propertyBinding{}, false, err
+			return contracts.CommandRequest{}, PropertyBinding{}, false, err
 		}
 		req.DeviceResourceName = resolvedName
-		return req, propertyBinding{Path: []string{resolvedName}}, true, nil
+		return req, PropertyBinding{Path: []string{resolvedName}}, true, nil
 	}
-	return contracts.CommandRequest{}, propertyBinding{}, false, nil
+	return contracts.CommandRequest{}, PropertyBinding{}, false, nil
 }
 
 func resolvePointNodeName(point contracts.PointConfig, key string) (nodeName string, resolvedName string, ok bool, err error) {
@@ -273,9 +299,9 @@ func buildStructWriteRequests(structDef contracts.PropertyStruct, items map[stri
 	return reqs, params, nil
 }
 
-func buildStructReadRequests(structDef contracts.PropertyStruct, items map[string]interface{}) ([]contracts.CommandRequest, []propertyBinding, error) {
+func buildStructReadRequests(structDef contracts.PropertyStruct, items map[string]interface{}) ([]contracts.CommandRequest, []PropertyBinding, error) {
 	var reqs []contracts.CommandRequest
-	var bindings []propertyBinding
+	var bindings []PropertyBinding
 
 	for _, indexKey := range sortedStructIndexKeys(items) {
 		rawFields := items[indexKey]
@@ -346,10 +372,10 @@ func buildStructFieldWrite(structDef contracts.PropertyStruct, field contracts.P
 	return req, value, nil
 }
 
-func buildStructFieldRead(structDef contracts.PropertyStruct, field contracts.PropertyStructField, index int, indexKey string) (contracts.CommandRequest, propertyBinding, error) {
+func buildStructFieldRead(structDef contracts.PropertyStruct, field contracts.PropertyStructField, index int, indexKey string) (contracts.CommandRequest, PropertyBinding, error) {
 	nodeName, err := structFieldNodeName(structDef, field, index)
 	if err != nil {
-		return contracts.CommandRequest{}, propertyBinding{}, err
+		return contracts.CommandRequest{}, PropertyBinding{}, err
 	}
 
 	point := contracts.PointConfig{
@@ -361,9 +387,9 @@ func buildStructFieldRead(structDef contracts.PropertyStruct, field contracts.Pr
 
 	req, err := point.ToCommandRequest(nodeName)
 	if err != nil {
-		return contracts.CommandRequest{}, propertyBinding{}, err
+		return contracts.CommandRequest{}, PropertyBinding{}, err
 	}
-	return req, propertyBinding{Path: []string{structDef.Name, indexKey, field.Name}}, nil
+	return req, PropertyBinding{Path: []string{structDef.Name, indexKey, field.Name}}, nil
 }
 
 func structFieldNodeName(structDef contracts.PropertyStruct, field contracts.PropertyStructField, index int) (string, error) {

@@ -18,7 +18,7 @@ Protocol projects such as S7, Fanuc, Modbus, and Mitsubishi should keep only pro
 ## Package Layout
 
 - `config`
-  Unified runtime configuration, device/profile loading, and bootstrap wiring.
+  Compatibility-facing configuration model, device/profile loading, and normalization helpers.
 - `driver`
   Shared driver contracts, device models, command request/value types, and value type constants.
 - `property`
@@ -30,9 +30,13 @@ Protocol projects such as S7, Fanuc, Modbus, and Mitsubishi should keep only pro
 - `ops/status`
   Device status tracking and snapshots.
 - `runtime/app`
-  SDK entry point for service bootstrap.
+  SDK entry point for service bootstrap and runtime assembly.
+- `runtime/config`
+  Runtime-facing config access layer used by bootstrap modules.
 - `runtime/dependency`
   Runtime dependency checks.
+- `runtime/property`
+  Property request execution and MQTT property topic integration.
 - `runtime/scheduler`
   Worker supervision and restart logic.
 - `telemetry`
@@ -47,8 +51,8 @@ Protocol projects such as S7, Fanuc, Modbus, and Mitsubishi should keep only pro
 ## Current Consumers
 
 - `edge-service-s7` already boots from `runtime/app` and uses SDK driver/logging contracts.
-- `edge-service-fanuc` still needs migration for config/runtime/property/auth/http/status/reliable integration.
+- `edge-service-fanuc` now reuses SDK runtime/config/property/auth/http/status/reliable modules and keeps only FOCAS/cgo driver logic locally.
 
 ## Version
 
-This repository is being published as `v0.5.0`.
+This repository is being published as `v0.6.0`.
