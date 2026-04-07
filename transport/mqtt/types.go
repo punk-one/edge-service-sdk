@@ -61,10 +61,11 @@ type MQTTConfig struct {
 
 // TopicConfig represents one MQTT topic section in config.
 type TopicConfig struct {
-	Topic      string `yaml:"topic"`
-	QoS        int    `yaml:"qos"`
-	Retain     bool   `yaml:"retain"`
-	DataFormat string `yaml:"dataFormat"`
+	Topic             string `yaml:"topic"`
+	QoS               int    `yaml:"qos"`
+	Retain            bool   `yaml:"retain"`
+	DataFormat        string `yaml:"dataFormat"`
+	HeartbeatInterval string `yaml:"heartbeatInterval"`
 }
 
 // MQTTPublisher implements telemetry/property/status MQTT I/O.

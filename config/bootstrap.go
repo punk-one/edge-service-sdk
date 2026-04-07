@@ -149,6 +149,11 @@ func loadMainConfig(configPath string) (Config, error) {
 			Retain:     false,
 			DataFormat: "rule",
 		},
+		StatusReport: mqtt.TopicConfig{
+			QoS:               0,
+			Retain:            false,
+			HeartbeatInterval: "30s",
+		},
 		LogLevel: "INFO",
 	}
 
@@ -293,6 +298,9 @@ func NormalizeConfig(config Config) Config {
 	config.Logging = EffectiveLoggerConfig(config)
 	if config.TelemetryPost.DataFormat == "" {
 		config.TelemetryPost.DataFormat = "rule"
+	}
+	if strings.TrimSpace(config.StatusReport.HeartbeatInterval) == "" {
+		config.StatusReport.HeartbeatInterval = "30s"
 	}
 	if strings.TrimSpace(config.Storage.SQLitePath) == "" {
 		if strings.TrimSpace(config.ReliableQueue.SQLitePath) != "" {

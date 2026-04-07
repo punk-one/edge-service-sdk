@@ -91,6 +91,7 @@ statusReport:
   topic: ""
   qos: 0
   retain: false
+  heartbeatInterval: "15s"
 `
 	if err := os.WriteFile(configPath, []byte(configYAML), 0o644); err != nil {
 		t.Fatalf("WriteFile configPath: %v", err)
@@ -118,5 +119,15 @@ statusReport:
 	}
 	if config.TelemetryPost.Topic != "v1/gateway/{productCode}/telemetry/post" || config.TelemetryPost.DataFormat != "rule" {
 		t.Fatalf("unexpected telemetryPost config: %#v", config.TelemetryPost)
+	}
+	if config.StatusReport.HeartbeatInterval != "15s" {
+		t.Fatalf("unexpected statusReport config: %#v", config.StatusReport)
+	}
+}
+
+func TestNormalizeConfigSetsDefaultStatusHeartbeatInterval(t *testing.T) {
+	config := NormalizeConfig(Config{})
+	if config.StatusReport.HeartbeatInterval != "30s" {
+		t.Fatalf("unexpected default status heartbeat interval: %#v", config.StatusReport)
 	}
 }

@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.6.1
+
+- Added `statusReport.heartbeatInterval` with a default of `30s`.
+- Changed MQTT `statusReport` payloads from device snapshot batches to per-device status messages.
+- Added incremental + heartbeat status publishing with per-device heartbeat scheduling.
+- Standardized status payload fields to `deviceCode`, `time`, `data.online`, `data.connectionState`, `data.lastSeenAt`, and `data.error`.
+
 ## v0.6.0
 
 - Moved runtime bootstrap assembly out of `config` into `runtime/app`.

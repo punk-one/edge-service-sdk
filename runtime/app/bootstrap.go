@@ -336,79 +336,11 @@ func buildRuntimeReadiness(authService *rtauth.Service, publisher mqtt.Publisher
 }
 
 func installStatusPublisher(tracker *rtstatus.Tracker, sdk *DeviceSDK, publisher mqtt.Publisher, topicConfig mqtt.TopicConfig, logClient logger.LoggingClient) {
-	if tracker == nil || publisher == nil || strings.TrimSpace(topicConfig.Topic) == "" {
+	reporter := newDeviceStatusPublisher(tracker, sdk, publisher, topicConfig, logClient)
+	if reporter == nil {
 		return
 	}
-
-	publish := func(states []rtstatus.DeviceState) {
-		if len(states) == 0 {
-			return
-		}
-		now := time.Now().UnixMilli()
-		if strings.Contains(topicConfig.Topic, "{productCode}") {
-			grouped := make(map[string][]map[string]interface{})
-			for _, state := range states {
-				grouped[state.ProductCode] = append(grouped[state.ProductCode], statusMap(state))
-			}
-			for productCode, items := range grouped {
-				devices := sdk.DevicesByProductCode(productCode)
-				if len(devices) == 0 {
-					continue
-				}
-				if err := publisher.PublishStatus(devices[0], map[string]interface{}{
-					"time":         now,
-					"product_code": productCode,
-					"devices":      items,
-				}); err != nil && logClient != nil {
-					logClient.Warnf("Failed to publish status snapshot for product %s: %v", productCode, err)
-				}
-			}
-			return
-		}
-
-		device, ok := firstDeviceConfig(sdk)
-		if !ok {
-			return
-		}
-		items := make([]map[string]interface{}, 0, len(states))
-		for _, state := range states {
-			items = append(items, statusMap(state))
-		}
-		if err := publisher.PublishStatus(device, map[string]interface{}{
-			"time":    now,
-			"devices": items,
-		}); err != nil && logClient != nil {
-			logClient.Warnf("Failed to publish global status snapshot: %v", err)
-		}
-	}
-
-	tracker.SetOnChange(publish)
-	publish(tracker.Snapshot())
-}
-
-func statusMap(state rtstatus.DeviceState) map[string]interface{} {
-	return map[string]interface{}{
-		"deviceCode":      state.DeviceCode,
-		"productCode":     state.ProductCode,
-		"connectionState": state.ConnectionState,
-		"connected":       state.Connected,
-		"lastConnectedAt": state.LastConnectedAt,
-		"lastReadAt":      state.LastReadAt,
-		"lastWriteAt":     state.LastWriteAt,
-		"lastSuccessAt":   state.LastSuccessAt,
-		"lastError":       state.LastError,
-		"lastErrorAt":     state.LastErrorAt,
-	}
-}
-
-func firstDeviceConfig(sdk *DeviceSDK) (contracts.DeviceConfig, bool) {
-	if sdk == nil {
-		return contracts.DeviceConfig{}, false
-	}
-	for _, device := range sdk.deviceConfigs {
-		return device, true
-	}
-	return contracts.DeviceConfig{}, false
+	reporter.Start()
 }
 
 func shouldEmitTelemetry(cfg contracts.TelemetryConfig, values []*contracts.CommandValue, state telemetryState, now time.Time) bool {
