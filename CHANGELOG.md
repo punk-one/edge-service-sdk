@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.6.3
+
+- Changed HTTP `/api/v1/runtime/status` response keys to `snake_case`.
+- Aligned runtime device-state keys with MQTT `statusReport`, including `device_code`, `connection_state`, and `last_*` fields.
+
 ## v0.6.2
 
 - Changed MQTT `telemetry.rule` payload keys to `trace_id`, `send_at`, and `is_replayed`.

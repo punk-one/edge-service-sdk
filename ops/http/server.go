@@ -178,30 +178,30 @@ func (s *Server) handleRuntimeStatus(c *gin.Context) {
 		if info, err := s.cfg.AuthService.CredentialInfo(); err == nil {
 			credentialInfo = gin.H{
 				"initialized": info.Initialized,
-				"appId":       info.AppID,
-				"updatedAt":   millisToRFC3339(info.UpdatedAt),
+				"app_id":      info.AppID,
+				"updated_at":  millisToRFC3339(info.UpdatedAt),
 			}
 		}
 	}
 
 	response := gin.H{
 		"service": gin.H{
-			"name":       s.cfg.ServiceName,
-			"version":    s.cfg.Version,
-			"type":       s.cfg.ServiceType,
-			"host":       normalizedHost(s.cfg.Host),
-			"port":       s.cfg.Port,
-			"address":    listenAddress(s.cfg.Host, s.cfg.Port),
-			"startupMsg": s.cfg.StartupMsg,
-			"startedAt":  s.cfg.StartedAt.Format(time.RFC3339),
-			"uptimeSec":  int64(time.Since(s.cfg.StartedAt).Seconds()),
+			"name":        s.cfg.ServiceName,
+			"version":     s.cfg.Version,
+			"type":        s.cfg.ServiceType,
+			"host":        normalizedHost(s.cfg.Host),
+			"port":        s.cfg.Port,
+			"address":     listenAddress(s.cfg.Host, s.cfg.Port),
+			"startup_msg": s.cfg.StartupMsg,
+			"started_at":  s.cfg.StartedAt.Format(time.RFC3339),
+			"uptime_sec":  int64(time.Since(s.cfg.StartedAt).Seconds()),
 		},
 		"runtime": gin.H{
-			"deviceCount":          s.cfg.DeviceCount,
-			"telemetryWorkerCount": s.cfg.TelemetryWorkerCount,
-			"ready":                ready,
-			"time":                 time.Now().Format(time.RFC3339),
-			"auth":                 credentialInfo,
+			"device_count":           s.cfg.DeviceCount,
+			"telemetry_worker_count": s.cfg.TelemetryWorkerCount,
+			"ready":                  ready,
+			"time":                   time.Now().Format(time.RFC3339),
+			"auth":                   credentialInfo,
 		},
 		"devices": s.deviceStates(),
 	}
@@ -216,12 +216,12 @@ func (s *Server) handleRuntimeStatus(c *gin.Context) {
 	if queueErr != nil {
 		queueBody["error"] = queueErr.Error()
 	} else {
-		queueBody["bufferDepth"] = queueStats.BufferDepth
-		queueBody["oldestPendingAgeMs"] = queueStats.OldestPendingAgeMs
-		queueBody["replayRatePerSec"] = queueStats.ReplayRatePerSec
-		queueBody["lastReplayAt"] = millisToRFC3339(queueStats.LastReplayAt)
+		queueBody["buffer_depth"] = queueStats.BufferDepth
+		queueBody["oldest_pending_age_ms"] = queueStats.OldestPendingAgeMs
+		queueBody["replay_rate_per_sec"] = queueStats.ReplayRatePerSec
+		queueBody["last_replay_at"] = millisToRFC3339(queueStats.LastReplayAt)
 	}
-	response["runtime"].(gin.H)["reliableQueue"] = queueBody
+	response["runtime"].(gin.H)["reliable_queue"] = queueBody
 
 	statusCode := http.StatusOK
 	if !ready {
@@ -378,16 +378,16 @@ func (s *Server) deviceStates() []gin.H {
 	response := make([]gin.H, 0, len(states))
 	for _, state := range states {
 		response = append(response, gin.H{
-			"deviceCode":      state.DeviceCode,
-			"productCode":     state.ProductCode,
-			"connectionState": state.ConnectionState,
-			"connected":       state.Connected,
-			"lastConnectedAt": millisToRFC3339(state.LastConnectedAt),
-			"lastReadAt":      millisToRFC3339(state.LastReadAt),
-			"lastWriteAt":     millisToRFC3339(state.LastWriteAt),
-			"lastSuccessAt":   millisToRFC3339(state.LastSuccessAt),
-			"lastError":       state.LastError,
-			"lastErrorAt":     millisToRFC3339(state.LastErrorAt),
+			"device_code":       state.DeviceCode,
+			"product_code":      state.ProductCode,
+			"connection_state":  state.ConnectionState,
+			"connected":         state.Connected,
+			"last_connected_at": millisToRFC3339(state.LastConnectedAt),
+			"last_read_at":      millisToRFC3339(state.LastReadAt),
+			"last_write_at":     millisToRFC3339(state.LastWriteAt),
+			"last_success_at":   millisToRFC3339(state.LastSuccessAt),
+			"last_error":        state.LastError,
+			"last_error_at":     millisToRFC3339(state.LastErrorAt),
 		})
 	}
 	return response

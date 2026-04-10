@@ -15,16 +15,16 @@ const (
 
 // DeviceState is the runtime-visible device connection state.
 type DeviceState struct {
-	DeviceCode      string `json:"deviceCode"`
-	ProductCode     string `json:"productCode"`
-	ConnectionState string `json:"connectionState"`
+	DeviceCode      string `json:"device_code"`
+	ProductCode     string `json:"product_code"`
+	ConnectionState string `json:"connection_state"`
 	Connected       bool   `json:"connected"`
-	LastConnectedAt int64  `json:"lastConnectedAt"`
-	LastReadAt      int64  `json:"lastReadAt"`
-	LastWriteAt     int64  `json:"lastWriteAt"`
-	LastSuccessAt   int64  `json:"lastSuccessAt"`
-	LastError       string `json:"lastError"`
-	LastErrorAt     int64  `json:"lastErrorAt"`
+	LastConnectedAt int64  `json:"last_connected_at"`
+	LastReadAt      int64  `json:"last_read_at"`
+	LastWriteAt     int64  `json:"last_write_at"`
+	LastSuccessAt   int64  `json:"last_success_at"`
+	LastError       string `json:"last_error"`
+	LastErrorAt     int64  `json:"last_error_at"`
 }
 
 // Tracker maintains device status for HTTP and MQTT reporting.
