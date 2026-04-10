@@ -39,3 +39,23 @@ func ProtocolPropertiesFromConfig(device contracts.DeviceConfig) map[string]cont
 func BuildTelemetryRequests(device contracts.DeviceConfig) ([]contracts.CommandRequest, error) {
 	return cfg.BuildTelemetryRequests(device)
 }
+
+func BuildPropertyReadRequests(device contracts.DeviceConfig, data map[string]interface{}) ([]contracts.CommandRequest, []cfg.PropertyBinding, error) {
+	return cfg.BuildPropertyReadRequests(device, data)
+}
+
+func BuildPropertyWriteRequests(device contracts.DeviceConfig, data map[string]interface{}) ([]contracts.CommandRequest, []*contracts.CommandValue, error) {
+	return cfg.BuildPropertyWriteRequests(device, data)
+}
+
+func BuildPropertyReadSelection(data map[string]interface{}) map[string]interface{} {
+	return cfg.BuildPropertyReadSelection(data)
+}
+
+func BuildAutoPropertyReadRequests(device contracts.DeviceConfig) ([]contracts.CommandRequest, []cfg.PropertyBinding, error) {
+	return cfg.BuildAutoPropertyReadRequests(device)
+}
+
+func BuildPropertyResponse(values []*contracts.CommandValue, bindings []cfg.PropertyBinding) map[string]interface{} {
+	return cfg.BuildPropertyResponse(values, bindings)
+}

@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.6.4
+
+- Changed property HTTP requests and responses to use `device_code` only; removed `product_code` from property payloads.
+- Changed property HTTP/MQTT request correlation field from `request_id` to `trace_id`.
+- Changed HTTP `property/get` and `property/set` to stay fully synchronous and never emit MQTT `propertyPost`.
+- Changed MQTT `propertySet` to publish a delayed `propertyPost` readback after 1 second when `propertyPost.topic` is configured.
+- Added property auto-report configuration with telemetry-style `interval`, `onChange`, `watchedFields`, and `heartbeatInterval`.
+- Added `property.structs[].autoReport` so large struct arrays can stay request-driven and skip automatic reporting.
+- Removed `product_code` from HTTP `/api/v1/runtime/status` device entries.
+
 ## v0.6.3
 
 - Changed HTTP `/api/v1/runtime/status` response keys to `snake_case`.

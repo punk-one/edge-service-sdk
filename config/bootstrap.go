@@ -263,6 +263,7 @@ func mergeDeviceWithProfile(device contracts.DeviceConfig, profile contracts.Dev
 	device = NormalizeDeviceConfig(device)
 	profile = NormalizeProfile(profile)
 	deviceHasTelemetryOverride := strings.TrimSpace(device.Telemetry.Interval) != "" || len(device.Telemetry.WatchedFields) > 0 || len(device.Telemetry.Points) > 0
+	deviceHasPropertyOverride := strings.TrimSpace(device.Property.Interval) != "" || len(device.Property.WatchedFields) > 0 || len(device.Property.Points) > 0 || len(device.Property.Structs) > 0
 
 	if strings.TrimSpace(device.Description) == "" {
 		device.Description = profile.Description
@@ -289,6 +290,18 @@ func mergeDeviceWithProfile(device contracts.DeviceConfig, profile contracts.Dev
 	}
 	if len(device.Property.Structs) == 0 && len(profile.Property.Structs) > 0 {
 		device.Property.Structs = cloneStructs(profile.Property.Structs)
+	}
+	if strings.TrimSpace(device.Property.Interval) == "" {
+		device.Property.Interval = profile.Property.Interval
+	}
+	if len(device.Property.WatchedFields) == 0 && len(profile.Property.WatchedFields) > 0 {
+		device.Property.WatchedFields = append([]string(nil), profile.Property.WatchedFields...)
+	}
+	if strings.TrimSpace(device.Property.HeartbeatInterval) == "" {
+		device.Property.HeartbeatInterval = profile.Property.HeartbeatInterval
+	}
+	if !deviceHasPropertyOverride {
+		device.Property.OnChange = profile.Property.OnChange
 	}
 
 	return NormalizeDeviceConfig(device)

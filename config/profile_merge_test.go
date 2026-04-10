@@ -35,6 +35,10 @@ func TestApplyProfilesMergesReusableProfile(t *testing.T) {
 				},
 			},
 			Property: contracts.PropertyConfig{
+				Interval:          "5s",
+				OnChange:          true,
+				WatchedFields:     []string{"reset"},
+				HeartbeatInterval: "30s",
 				Points: []contracts.PointConfig{
 					{Name: "reset", ValueType: "Bool", NodeName: "DB1.DBX0.1", ReadWrite: "RW"},
 				},
@@ -57,6 +61,12 @@ func TestApplyProfilesMergesReusableProfile(t *testing.T) {
 	}
 	if len(merged[0].Property.Points) != 1 || merged[0].Property.Points[0].ReadWrite != "RW" {
 		t.Fatalf("expected property points merged from profile, got %#v", merged[0].Property.Points)
+	}
+	if merged[0].Property.Interval != "5s" || !merged[0].Property.OnChange || merged[0].Property.HeartbeatInterval != "30s" {
+		t.Fatalf("expected property strategy merged from profile, got %#v", merged[0].Property)
+	}
+	if len(merged[0].Property.WatchedFields) != 1 || merged[0].Property.WatchedFields[0] != "reset" {
+		t.Fatalf("expected property watched fields merged from profile, got %#v", merged[0].Property.WatchedFields)
 	}
 }
 

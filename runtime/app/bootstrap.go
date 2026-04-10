@@ -50,7 +50,7 @@ func NewDeviceSDK(config rtconfig.Config, logClient logger.LoggingClient, tracke
 		deviceConfigs[deviceConfig.Name] = deviceConfig
 		productDevices[deviceConfig.ProductCode] = append(productDevices[deviceConfig.ProductCode], deviceConfig)
 		if tracker != nil {
-			tracker.RegisterDevice(deviceConfig.Name, deviceConfig.ProductCode)
+			tracker.RegisterDevice(deviceConfig.Name)
 		}
 		devices = append(devices, contracts.Device{
 			Name:        deviceConfig.Name,
@@ -225,6 +225,30 @@ func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver) {
 			return runTelemetryWorker(driver, deviceCopy, sdk, logClient)
 		})
 	}
+	if strings.TrimSpace(config.PropertyPost.Topic) != "" {
+		for _, device := range config.Devices {
+			device = rtconfig.NormalizeDeviceConfig(device)
+			reqs, _, err := rtconfig.BuildAutoPropertyReadRequests(device)
+			if err != nil {
+				logClient.Warnf("Skipping property worker for device %s: invalid property config: %v", device.Name, err)
+				continue
+			}
+			if len(reqs) == 0 || !propertyAutoReportingEnabled(device.Property) {
+				continue
+			}
+			deviceCopy := device
+			logClient.Infof(
+				"Registering property worker: device=%s product=%s interval=%s points=%d",
+				deviceCopy.Name,
+				deviceCopy.ProductCode,
+				strings.TrimSpace(deviceCopy.Property.Interval),
+				len(reqs),
+			)
+			super.Start(deviceCopy.Name+"-property", func() error {
+				return runPropertyWorker(driver, deviceCopy, publisher, logClient)
+			})
+		}
+	}
 
 	httpRuntime := httpserver.New(httpserver.Config{
 		ServiceName:          serviceName,
@@ -315,6 +339,48 @@ func runTelemetryWorker(driver contracts.ProtocolDriver, device contracts.Device
 			default:
 				logClient.Warnf("Async channel full; dropping telemetry for %s", device.Name)
 			}
+		}
+
+		<-ticker.C
+	}
+}
+
+func runPropertyWorker(driver contracts.ProtocolDriver, device contracts.DeviceConfig, publisher mqtt.Publisher, logClient logger.LoggingClient) error {
+	duration, err := parsePropertyInterval(device.Property.Interval)
+	if err != nil {
+		return fmt.Errorf("invalid property interval %s for device %s: %w", device.Property.Interval, device.Name, err)
+	}
+
+	reqs, bindings, err := rtconfig.BuildAutoPropertyReadRequests(device)
+	if err != nil {
+		return fmt.Errorf("invalid property points for device %s: %w", device.Name, err)
+	}
+	if len(reqs) == 0 {
+		return nil
+	}
+
+	ticker := time.NewTicker(duration)
+	defer ticker.Stop()
+
+	state := telemetryState{
+		lastValues:    make(map[string]interface{}),
+		lastEmittedAt: make(map[string]int64),
+	}
+	for {
+		values, err := driver.HandleReadCommands(device.Name, rtconfig.ProtocolPropertiesFromConfig(device), reqs)
+		if err != nil {
+			logClient.Errorf("Property read failed for device %s: %v", device.Name, err)
+		} else if shouldEmitProperty(device.Property, values, state, time.Now()) {
+			now := time.Now().UnixMilli()
+			updateTelemetryState(state, values, now)
+			_ = publisher.PublishPropertyPost(device, map[string]interface{}{
+				"device_code": device.Name,
+				"time":        now,
+				"success":     true,
+				"trace_id":    "",
+				"error":       "",
+				"data":        rtconfig.BuildPropertyResponse(values, bindings),
+			})
 		}
 
 		<-ticker.C
@@ -480,6 +546,132 @@ func heartbeatDue(cfg contracts.TelemetryConfig, point contracts.PointConfig, la
 		return false
 	}
 	return now.UnixMilli()-lastEmittedAt >= duration.Milliseconds()
+}
+
+func propertyAutoReportingEnabled(cfg contracts.PropertyConfig) bool {
+	duration, err := parsePropertyInterval(cfg.Interval)
+	if err != nil || duration <= 0 {
+		return false
+	}
+	return true
+}
+
+func shouldEmitProperty(cfg contracts.PropertyConfig, values []*contracts.CommandValue, state telemetryState, now time.Time) bool {
+	if len(values) == 0 {
+		return false
+	}
+
+	current := snapshotFromValues(values)
+	if len(state.lastValues) == 0 && len(current) > 0 {
+		return true
+	}
+
+	if !propertyHasFilterStrategy(cfg) {
+		return true
+	}
+
+	watched := watchedFieldSet(cfg.WatchedFields)
+	for _, value := range values {
+		pointCfg, hasPointCfg := findPropertyPointConfig(cfg, value.DeviceResourceName)
+		lastValue, hasLast := state.lastValues[value.DeviceResourceName]
+		if !hasLast {
+			return true
+		}
+
+		if propertyHeartbeatDue(cfg, pointCfg, state.lastEmittedAt[value.DeviceResourceName], now) {
+			return true
+		}
+
+		if pointCfg.Deadband > 0 {
+			changed, comparable := exceedsDeadband(lastValue, value.Value, pointCfg.Deadband)
+			if comparable {
+				if changed {
+					return true
+				}
+				continue
+			}
+		}
+
+		onChange := cfg.OnChange
+		if hasPointCfg && pointCfg.OnChange != nil {
+			onChange = *pointCfg.OnChange
+		}
+		if !onChange {
+			continue
+		}
+
+		if len(watched) > 0 && !(hasPointCfg && hasPointStrategy(pointCfg)) {
+			if _, ok := watched[value.DeviceResourceName]; !ok {
+				continue
+			}
+		}
+
+		if !reflect.DeepEqual(lastValue, value.Value) {
+			return true
+		}
+	}
+
+	if len(cfg.WatchedFields) > 0 {
+		for _, field := range cfg.WatchedFields {
+			if !reflect.DeepEqual(state.lastValues[field], current[field]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func propertyHasFilterStrategy(cfg contracts.PropertyConfig) bool {
+	if cfg.OnChange || len(cfg.WatchedFields) > 0 || strings.TrimSpace(cfg.HeartbeatInterval) != "" {
+		return true
+	}
+	for _, point := range cfg.Points {
+		if hasPointStrategy(point) {
+			return true
+		}
+	}
+	return false
+}
+
+func findPropertyPointConfig(cfg contracts.PropertyConfig, name string) (contracts.PointConfig, bool) {
+	for _, point := range cfg.Points {
+		if point.Name == name {
+			return point, true
+		}
+	}
+	return contracts.PointConfig{}, false
+}
+
+func propertyHeartbeatDue(cfg contracts.PropertyConfig, point contracts.PointConfig, lastEmittedAt int64, now time.Time) bool {
+	interval := strings.TrimSpace(point.HeartbeatInterval)
+	if interval == "" {
+		interval = strings.TrimSpace(cfg.HeartbeatInterval)
+	}
+	if interval == "" || lastEmittedAt == 0 {
+		return false
+	}
+
+	duration, err := time.ParseDuration(interval)
+	if err != nil || duration <= 0 {
+		return false
+	}
+	return now.UnixMilli()-lastEmittedAt >= duration.Milliseconds()
+}
+
+func parsePropertyInterval(raw string) (time.Duration, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return 0, nil
+	}
+
+	duration, err := time.ParseDuration(trimmed)
+	if err != nil {
+		return 0, err
+	}
+	if duration <= 0 {
+		return 0, nil
+	}
+	return duration, nil
 }
 
 func exceedsDeadband(previous interface{}, current interface{}, deadband float64) (bool, bool) {

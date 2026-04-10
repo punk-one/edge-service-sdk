@@ -379,7 +379,6 @@ func (s *Server) deviceStates() []gin.H {
 	for _, state := range states {
 		response = append(response, gin.H{
 			"device_code":       state.DeviceCode,
-			"product_code":      state.ProductCode,
 			"connection_state":  state.ConnectionState,
 			"connected":         state.Connected,
 			"last_connected_at": millisToRFC3339(state.LastConnectedAt),

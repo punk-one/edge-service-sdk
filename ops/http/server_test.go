@@ -64,7 +64,7 @@ func TestHandlePropertyGetRejectsMissingAuthHeaders(t *testing.T) {
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/v1/property/get", bytes.NewBufferString(`{"product_code":"acm","device_code":"acm006","data":{"x":true}}`))
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/v1/property/get", bytes.NewBufferString(`{"device_code":"acm006","data":{"x":true}}`))
 
 	server := New(Config{
 		AuthService: authService,
@@ -123,7 +123,6 @@ func TestHandleRuntimeStatusUsesSnakeCaseFields(t *testing.T) {
 			return []rtstatus.DeviceState{
 				{
 					DeviceCode:      "acm006",
-					ProductCode:     "acm",
 					ConnectionState: rtstatus.StateConnected,
 					Connected:       true,
 					LastConnectedAt: 1710000000000,
@@ -184,6 +183,9 @@ func TestHandleRuntimeStatusUsesSnakeCaseFields(t *testing.T) {
 	}
 	if got := device["connection_state"]; got != rtstatus.StateConnected {
 		t.Fatalf("connection_state = %#v, want %q", got, rtstatus.StateConnected)
+	}
+	if _, ok := device["product_code"]; ok {
+		t.Fatalf("did not expect device.product_code in payload: %#v", device)
 	}
 	if _, ok := device["last_success_at"]; !ok {
 		t.Fatalf("expected device.last_success_at in payload: %#v", device)

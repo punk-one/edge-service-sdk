@@ -70,8 +70,12 @@ type TelemetryConfig struct {
 
 // PropertyConfig defines remotely readable/writable properties for a device.
 type PropertyConfig struct {
-	Points  []PointConfig    `yaml:"points"`
-	Structs []PropertyStruct `yaml:"structs"`
+	Interval          string           `yaml:"interval"`
+	OnChange          bool             `yaml:"onChange"`
+	WatchedFields     []string         `yaml:"watchedFields"`
+	HeartbeatInterval string           `yaml:"heartbeatInterval"`
+	Points            []PointConfig    `yaml:"points"`
+	Structs           []PropertyStruct `yaml:"structs"`
 }
 
 // PointConfig defines a telemetry/property point configured directly on the device.
@@ -93,12 +97,13 @@ type PointConfig struct {
 
 // PropertyStruct describes a structured property collection such as wheels[1..450].
 type PropertyStruct struct {
-	Name      string                `yaml:"name"`
-	Kind      string                `yaml:"kind"`
-	IndexBase int                   `yaml:"indexBase"`
-	MaxItems  int                   `yaml:"maxItems"`
-	Address   PropertyStructAddress `yaml:"address"`
-	Fields    []PropertyStructField `yaml:"fields"`
+	Name       string                `yaml:"name"`
+	Kind       string                `yaml:"kind"`
+	IndexBase  int                   `yaml:"indexBase"`
+	MaxItems   int                   `yaml:"maxItems"`
+	AutoReport bool                  `yaml:"autoReport"`
+	Address    PropertyStructAddress `yaml:"address"`
+	Fields     []PropertyStructField `yaml:"fields"`
 }
 
 // PropertyStructAddress defines the base address mapping for a struct array.

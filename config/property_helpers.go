@@ -134,6 +134,57 @@ func BuildPropertyReadRequests(device contracts.DeviceConfig, data map[string]in
 	return reqs, bindings, nil
 }
 
+func BuildPropertyReadSelection(data map[string]interface{}) map[string]interface{} {
+	if len(data) == 0 {
+		return map[string]interface{}{}
+	}
+
+	selection := make(map[string]interface{}, len(data))
+	for key, raw := range data {
+		selection[key] = buildReadSelectionValue(raw)
+	}
+	return selection
+}
+
+func BuildAutoPropertyReadRequests(device contracts.DeviceConfig) ([]contracts.CommandRequest, []PropertyBinding, error) {
+	reqs := make([]contracts.CommandRequest, 0, len(device.Property.Points))
+	bindings := make([]PropertyBinding, 0, len(device.Property.Points))
+
+	for _, point := range device.Property.Points {
+		nodeName := strings.TrimSpace(point.NodeName)
+		if nodeName == "" {
+			continue
+		}
+		req, err := point.ToCommandRequest(nodeName)
+		if err != nil {
+			return nil, nil, err
+		}
+		req.DeviceResourceName = point.Name
+		reqs = append(reqs, req)
+		bindings = append(bindings, PropertyBinding{Path: []string{point.Name}})
+	}
+
+	for _, structDef := range device.Property.Structs {
+		if !structDef.AutoReport || structDef.MaxItems <= 0 {
+			continue
+		}
+		for offset := 0; offset < structDef.MaxItems; offset++ {
+			index := structIndexBase(structDef) + offset
+			indexKey := strconv.Itoa(index)
+			for _, field := range structDef.Fields {
+				req, binding, err := buildStructFieldRead(structDef, field, index, indexKey)
+				if err != nil {
+					return nil, nil, err
+				}
+				reqs = append(reqs, req)
+				bindings = append(bindings, binding)
+			}
+		}
+	}
+
+	return reqs, bindings, nil
+}
+
 func BuildPropertyResponse(values []*contracts.CommandValue, bindings []PropertyBinding) map[string]interface{} {
 	result := make(map[string]interface{})
 	for i, binding := range bindings {
@@ -163,6 +214,14 @@ func buildPropertyWriteRequests(device contracts.DeviceConfig, data map[string]i
 
 func buildPropertyReadRequests(device contracts.DeviceConfig, data map[string]interface{}) ([]contracts.CommandRequest, []PropertyBinding, error) {
 	return BuildPropertyReadRequests(device, data)
+}
+
+func buildPropertyReadSelection(data map[string]interface{}) map[string]interface{} {
+	return BuildPropertyReadSelection(data)
+}
+
+func buildAutoPropertyReadRequests(device contracts.DeviceConfig) ([]contracts.CommandRequest, []PropertyBinding, error) {
+	return BuildAutoPropertyReadRequests(device)
 }
 
 func buildPropertyResponse(values []*contracts.CommandValue, bindings []PropertyBinding) map[string]interface{} {
@@ -563,4 +622,18 @@ func sortedStructIndexKeys(items map[string]interface{}) []string {
 		return keys[i] < keys[j]
 	})
 	return keys
+}
+
+func buildReadSelectionValue(raw interface{}) interface{} {
+	if nested, ok := raw.(map[string]interface{}); ok {
+		if len(nested) == 0 {
+			return map[string]interface{}{}
+		}
+		selection := make(map[string]interface{}, len(nested))
+		for key, value := range nested {
+			selection[key] = buildReadSelectionValue(value)
+		}
+		return selection
+	}
+	return true
 }

@@ -132,3 +132,40 @@ func TestParseStructIndexRejectsOutOfRange(t *testing.T) {
 		t.Fatal("expected parseStructIndex to reject 451")
 	}
 }
+
+func TestBuildPropertyReadSelectionUsesWriteShape(t *testing.T) {
+	selection := BuildPropertyReadSelection(map[string]interface{}{
+		"status_text": "READY",
+		"wheels": map[string]interface{}{
+			"2": map[string]interface{}{
+				"diameter": 40,
+				"height":   42,
+			},
+		},
+	})
+
+	if selection["status_text"] != true {
+		t.Fatalf("expected point selection to be true, got %#v", selection["status_text"])
+	}
+	wheels := selection["wheels"].(map[string]interface{})
+	item := wheels["2"].(map[string]interface{})
+	if item["diameter"] != true || item["height"] != true {
+		t.Fatalf("expected nested struct selection to be true flags, got %#v", item)
+	}
+}
+
+func TestBuildAutoPropertyReadRequestsSkipsNonAutoReportStructs(t *testing.T) {
+	device := testDeviceConfig()
+	device.Property.Structs[0].AutoReport = false
+
+	reqs, bindings, err := BuildAutoPropertyReadRequests(device)
+	if err != nil {
+		t.Fatalf("BuildAutoPropertyReadRequests() error = %v", err)
+	}
+	if len(reqs) != 1 || len(bindings) != 1 {
+		t.Fatalf("expected only direct property points to auto-report, got %d reqs %d bindings", len(reqs), len(bindings))
+	}
+	if got := reqs[0].DeviceResourceName; got != "status_text" {
+		t.Fatalf("unexpected auto-report point %q", got)
+	}
+}

@@ -16,7 +16,6 @@ const (
 // DeviceState is the runtime-visible device connection state.
 type DeviceState struct {
 	DeviceCode      string `json:"device_code"`
-	ProductCode     string `json:"product_code"`
 	ConnectionState string `json:"connection_state"`
 	Connected       bool   `json:"connected"`
 	LastConnectedAt int64  `json:"last_connected_at"`
@@ -49,15 +48,11 @@ func (t *Tracker) SetOnChange(fn func([]DeviceState)) {
 }
 
 // RegisterDevice initializes a device entry with unknown state.
-func (t *Tracker) RegisterDevice(deviceCode, productCode string) {
+func (t *Tracker) RegisterDevice(deviceCode string) {
 	t.update(deviceCode, func(state *DeviceState) bool {
 		changed := false
 		if state.DeviceCode != deviceCode {
 			state.DeviceCode = deviceCode
-			changed = true
-		}
-		if state.ProductCode != productCode {
-			state.ProductCode = productCode
 			changed = true
 		}
 		if state.ConnectionState == "" {
@@ -226,9 +221,6 @@ func (t *Tracker) update(deviceCode string, mutate func(*DeviceState) bool) {
 	state := t.states[deviceCode]
 	if state.DeviceCode == "" {
 		state.DeviceCode = deviceCode
-		if state.ConnectionState == "" {
-			state.ConnectionState = StateUnknown
-		}
 	}
 	changed = mutate(&state)
 	if changed {
@@ -251,10 +243,7 @@ func cloneStates(states map[string]DeviceState) []DeviceState {
 		items = append(items, state)
 	}
 	sort.Slice(items, func(i, j int) bool {
-		if items[i].ProductCode == items[j].ProductCode {
-			return items[i].DeviceCode < items[j].DeviceCode
-		}
-		return items[i].ProductCode < items[j].ProductCode
+		return items[i].DeviceCode < items[j].DeviceCode
 	})
 	return items
 }
