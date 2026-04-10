@@ -37,15 +37,15 @@ type statusSummary struct {
 }
 
 type statusMessage struct {
-	DeviceCode string            `json:"deviceCode"`
+	DeviceCode string            `json:"device_code"`
 	Time       int64             `json:"time"`
 	Data       statusPayloadData `json:"data"`
 }
 
 type statusPayloadData struct {
 	Online          bool                `json:"online"`
-	ConnectionState string              `json:"connectionState"`
-	LastSeenAt      int64               `json:"lastSeenAt"`
+	ConnectionState string              `json:"connection_state"`
+	LastSeenAt      int64               `json:"last_seen_at"`
 	Error           *statusPayloadError `json:"error"`
 }
 
@@ -220,10 +220,10 @@ func statusSummaryFromData(data statusPayloadData) statusSummary {
 
 func statusMessageToMap(message statusMessage) map[string]interface{} {
 	data := map[string]interface{}{
-		"online":          message.Data.Online,
-		"connectionState": message.Data.ConnectionState,
-		"lastSeenAt":      message.Data.LastSeenAt,
-		"error":           nil,
+		"online":           message.Data.Online,
+		"connection_state": message.Data.ConnectionState,
+		"last_seen_at":     message.Data.LastSeenAt,
+		"error":            nil,
 	}
 	if message.Data.Error != nil {
 		data["error"] = map[string]interface{}{
@@ -232,9 +232,9 @@ func statusMessageToMap(message statusMessage) map[string]interface{} {
 		}
 	}
 	return map[string]interface{}{
-		"deviceCode": message.DeviceCode,
-		"time":       message.Time,
-		"data":       data,
+		"device_code": message.DeviceCode,
+		"time":        message.Time,
+		"data":        data,
 	}
 }
 

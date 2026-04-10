@@ -159,10 +159,10 @@ func (p *MQTTPublisher) convertToRuleFormat(event outevent.TelemetryEvent, data 
 		simplified[key] = actualValue(value)
 	}
 	return json.Marshal(map[string]interface{}{
-		"traceId":     event.TraceID,
+		"trace_id":    event.TraceID,
 		"time":        event.CollectedAt,
-		"sendAt":      sendAt,
-		"isReplayed":  replayed,
+		"send_at":     sendAt,
+		"is_replayed": replayed,
 		"data":        simplified,
 		"device_code": event.DeviceName,
 	})

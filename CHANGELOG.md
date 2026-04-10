@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.6.2
+
+- Changed MQTT `telemetry.rule` payload keys to `trace_id`, `send_at`, and `is_replayed`.
+- Changed MQTT `statusReport` payload keys to `device_code`, `data.connection_state`, and `data.last_seen_at`.
+
 ## v0.6.1
 
 - Added `statusReport.heartbeatInterval` with a default of `30s`.
