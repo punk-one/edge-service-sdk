@@ -27,7 +27,9 @@ type Publisher interface {
 	PublishTelemetry(device contracts.DeviceConfig, data map[string]interface{}) error
 	PublishCommandValues(device contracts.DeviceConfig, values []*contracts.CommandValue) error
 	PublishTelemetryEvent(event outevent.TelemetryEvent, replayed bool) error
-	PublishPropertyPost(device contracts.DeviceConfig, payload map[string]interface{}) error
+	PublishPropertyResult(device contracts.DeviceConfig, payload map[string]interface{}) error
+	PublishPropertyReport(device contracts.DeviceConfig, payload map[string]interface{}) error
+	PublishCommandResult(device contracts.DeviceConfig, payload map[string]interface{}) error
 	PublishStatus(device contracts.DeviceConfig, payload map[string]interface{}) error
 	Subscribe(topic string, qos byte, handler MessageHandler) error
 	HealthCheck() error
@@ -70,10 +72,12 @@ type TopicConfig struct {
 
 // MQTTPublisher implements telemetry/property/status MQTT I/O.
 type MQTTPublisher struct {
-	telemetry    TopicConfig
-	propertyPost TopicConfig
-	statusReport TopicConfig
-	client       *mqttClient
+	telemetry      TopicConfig
+	propertyResult TopicConfig
+	propertyReport TopicConfig
+	commandResult  TopicConfig
+	statusReport   TopicConfig
+	client         *mqttClient
 }
 
 type mqttMessage struct {

@@ -196,6 +196,62 @@ func BuildPropertyResponse(values []*contracts.CommandValue, bindings []Property
 	return result
 }
 
+func BuildPropertyReadSelectionFromNames(device contracts.DeviceConfig, properties []string) (map[string]interface{}, error) {
+	selection := make(map[string]interface{})
+	if len(properties) == 0 {
+		for _, point := range device.Property.Points {
+			selection[point.Name] = true
+		}
+		for _, structDef := range device.Property.Structs {
+			items, err := buildStructSelection(structDef)
+			if err != nil {
+				return nil, err
+			}
+			if len(items) > 0 {
+				selection[structDef.Name] = items
+			}
+		}
+		if len(selection) == 0 {
+			return nil, fmt.Errorf("no readable property fields resolved")
+		}
+		return selection, nil
+	}
+
+	for _, rawName := range properties {
+		name := strings.TrimSpace(rawName)
+		if name == "" {
+			continue
+		}
+
+		matchedPoint := false
+		for _, point := range device.Property.Points {
+			if point.Name == name {
+				selection[name] = true
+				matchedPoint = true
+				break
+			}
+		}
+		if matchedPoint {
+			continue
+		}
+
+		structDef, ok := findPropertyStruct(device, name)
+		if !ok {
+			return nil, fmt.Errorf("unknown property key %q", name)
+		}
+		items, err := buildStructSelection(structDef)
+		if err != nil {
+			return nil, err
+		}
+		selection[name] = items
+	}
+
+	if len(selection) == 0 {
+		return nil, fmt.Errorf("no readable property fields resolved")
+	}
+	return selection, nil
+}
+
 func parsePropertyRequest(payload []byte) (rtapi.PropertyRequest, error) {
 	return ParsePropertyRequest(payload)
 }
@@ -226,6 +282,10 @@ func buildAutoPropertyReadRequests(device contracts.DeviceConfig) ([]contracts.C
 
 func buildPropertyResponse(values []*contracts.CommandValue, bindings []PropertyBinding) map[string]interface{} {
 	return BuildPropertyResponse(values, bindings)
+}
+
+func buildPropertyReadSelectionFromNames(device contracts.DeviceConfig, properties []string) (map[string]interface{}, error) {
+	return BuildPropertyReadSelectionFromNames(device, properties)
 }
 
 func resolvePropertyPointWrite(device contracts.DeviceConfig, key string, raw interface{}) (contracts.CommandRequest, *contracts.CommandValue, bool, error) {
@@ -622,6 +682,18 @@ func sortedStructIndexKeys(items map[string]interface{}) []string {
 		return keys[i] < keys[j]
 	})
 	return keys
+}
+
+func buildStructSelection(structDef contracts.PropertyStruct) (map[string]interface{}, error) {
+	if structDef.MaxItems <= 0 {
+		return nil, fmt.Errorf("property struct %q requires maxItems > 0 for full selection", structDef.Name)
+	}
+	items := make(map[string]interface{}, structDef.MaxItems)
+	base := structIndexBase(structDef)
+	for offset := 0; offset < structDef.MaxItems; offset++ {
+		items[strconv.Itoa(base+offset)] = map[string]interface{}{}
+	}
+	return items, nil
 }
 
 func buildReadSelectionValue(raw interface{}) interface{} {

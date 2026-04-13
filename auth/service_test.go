@@ -45,10 +45,10 @@ func TestBootstrapIssueTokenAndAuthorize(t *testing.T) {
 		t.Fatal("expected access token")
 	}
 
-	body := []byte(`{"product_code":"acm","device_code":"acm006"}`)
+	body := []byte(`{"device_code":"acm006","data":{"properties":["status_text"]}}`)
 	protected := ProtectedRequest{
 		Method:    "POST",
-		Path:      "/api/v1/property/get",
+		Path:      "/api/v1/device/control/property/get",
 		Body:      body,
 		AppID:     "demo",
 		Token:     tokenResp.AccessToken,

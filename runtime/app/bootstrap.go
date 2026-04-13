@@ -7,12 +7,15 @@ import (
 	"time"
 
 	rtauth "github.com/punk-one/edge-service-sdk/auth"
+	cmdapi "github.com/punk-one/edge-service-sdk/command"
 	contracts "github.com/punk-one/edge-service-sdk/driver"
 	logger "github.com/punk-one/edge-service-sdk/logging"
 	httpserver "github.com/punk-one/edge-service-sdk/ops/http"
 	rtstatus "github.com/punk-one/edge-service-sdk/ops/status"
 	rtapi "github.com/punk-one/edge-service-sdk/property"
+	rtcommand "github.com/punk-one/edge-service-sdk/runtime/command"
 	rtconfig "github.com/punk-one/edge-service-sdk/runtime/config"
+	rtcontrol "github.com/punk-one/edge-service-sdk/runtime/control"
 	dependency "github.com/punk-one/edge-service-sdk/runtime/dependency"
 	rtproperty "github.com/punk-one/edge-service-sdk/runtime/property"
 	supervisor "github.com/punk-one/edge-service-sdk/runtime/scheduler"
@@ -134,8 +137,34 @@ func (s *DeviceSDK) DeviceWriteFailed(deviceName string, err error) {
 	}
 }
 
-func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver) {
+func validateCommandBindings(devices []contracts.DeviceConfig, registry cmdapi.Registry) error {
+	for _, device := range devices {
+		seen := map[string]struct{}{}
+		for _, command := range device.Commands {
+			identifier := strings.TrimSpace(command.Identifier)
+			if identifier == "" {
+				return fmt.Errorf("device %s profile %s has empty command identifier", strings.TrimSpace(device.Name), strings.TrimSpace(device.ProfileName))
+			}
+			if _, ok := seen[identifier]; ok {
+				return fmt.Errorf("device %s profile %s declares duplicate command %q", strings.TrimSpace(device.Name), strings.TrimSpace(device.ProfileName), identifier)
+			}
+			seen[identifier] = struct{}{}
+			if registry == nil {
+				return fmt.Errorf("device %s profile %s declares command %q but no command registry is configured", strings.TrimSpace(device.Name), strings.TrimSpace(device.ProfileName), identifier)
+			}
+			if _, _, ok := registry.Lookup(identifier); !ok {
+				return fmt.Errorf("device %s profile %s declares command %q but it is not registered", strings.TrimSpace(device.Name), strings.TrimSpace(device.ProfileName), identifier)
+			}
+		}
+	}
+	return nil
+}
+
+func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver, registry cmdapi.Registry) {
 	fmt.Printf("Starting %s version %s\n", serviceName, version)
+	if registry == nil {
+		registry = cmdapi.NewRegistry()
+	}
 
 	config, err := rtconfig.LoadConfig("./configs/config.yaml")
 	if err != nil {
@@ -159,7 +188,12 @@ func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver) {
 	)
 	logClient.Infof("Logging level set to: %s", logLevel)
 
-	publisher := mqtt.NewMQTTPublisher(config.MQTT, config.TelemetryPost, config.PropertyPost, config.StatusReport, logClient)
+	if err := validateCommandBindings(config.Devices, registry); err != nil {
+		logClient.Errorf("Failed to validate command bindings: %v", err)
+		return
+	}
+
+	publisher := mqtt.NewMQTTPublisher(config.MQTT, config.TelemetryReport, config.PropertyResult, config.PropertyReport, config.CommandResult, config.StatusReport, logClient)
 	telemetrySink, err := reliable.NewDispatcher(config.ReliableQueue, publisher, logClient)
 	if err != nil {
 		logClient.Errorf("Failed to initialize reliable telemetry dispatcher: %v", err)
@@ -193,8 +227,31 @@ func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver) {
 		return
 	}
 
-	propertyService := rtproperty.NewService(sdk, driver, publisher, logClient)
+	controlStore, err := rtcontrol.NewSQLiteStore(config.ControlStore.SQLitePath)
+	if err != nil {
+		logClient.Errorf("Failed to initialize control store: %v", err)
+		return
+	}
+	defer func() {
+		if closeErr := controlStore.Close(); closeErr != nil {
+			logClient.Warnf("Failed to close control store: %v", closeErr)
+		}
+	}()
+	propertyService := rtproperty.NewService(sdk, driver, publisher, controlStore, logClient)
 	propertyService.RegisterMQTTHandlers(config)
+	if err := propertyService.ResumePending(); err != nil {
+		logClient.Warnf("Failed to resume pending property tasks: %v", err)
+	}
+
+	commandService := rtcommand.NewService(sdk, driver, publisher, controlStore, logClient, registry)
+	commandService.RegisterMQTTHandlers(config)
+	if err := commandService.ResumePending(); err != nil {
+		logClient.Warnf("Failed to resume pending commands: %v", err)
+	}
+
+	queryService := newMQTTQueryService(sdk, registry, controlStore, publisher, logClient)
+	queryService.RegisterMQTTHandlers(config)
+
 	installStatusPublisher(statusTracker, sdk, publisher, config.StatusReport, logClient)
 
 	go processAsyncValues(sdk, telemetrySink, logClient)
@@ -225,7 +282,7 @@ func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver) {
 			return runTelemetryWorker(driver, deviceCopy, sdk, logClient)
 		})
 	}
-	if strings.TrimSpace(config.PropertyPost.Topic) != "" {
+	if strings.TrimSpace(config.PropertyReport.Topic) != "" {
 		for _, device := range config.Devices {
 			device = rtconfig.NormalizeDeviceConfig(device)
 			reqs, _, err := rtconfig.BuildAutoPropertyReadRequests(device)
@@ -271,7 +328,24 @@ func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver) {
 		PropertySet: func(req rtapi.PropertyRequest) (rtapi.PropertySetResponse, int) {
 			return propertyService.ExecuteSet(req, "")
 		},
-		Logger: logClient,
+		CommandCall: func(identifier string, req cmdapi.CommandRequest) (cmdapi.CommandResponse, int) {
+			return commandService.Execute(identifier, req, "")
+		},
+		PropertyModelQuery:         buildPropertyModelQuery(sdk),
+		TelemetryModelQuery:        buildTelemetryModelQuery(sdk),
+		CommandListQuery:           buildCommandListQuery(sdk, registry),
+		CommandDetailQuery:         buildCommandDetailQuery(sdk, registry),
+		CommandInputQuery:          buildCommandInputQuery(sdk, registry),
+		CommandOutputQuery:         buildCommandOutputQuery(sdk, registry),
+		PropertyResultQuery:        buildPropertyResultQuery(controlStore),
+		CommandResultQuery:         buildCommandResultQuery(controlStore),
+		ControlJobListQuery:        buildControlJobListQuery(controlStore),
+		ControlJobExportQuery:      buildControlJobExportQuery(controlStore),
+		ControlJobDiagnosticsQuery: buildControlJobDiagnosticsQuery(controlStore),
+		ControlJobQuery:            buildControlJobQuery(controlStore),
+		ControlJobResultQuery:      buildControlJobResultQuery(controlStore),
+		ControlJobEventsQuery:      buildControlJobEventsQuery(controlStore),
+		Logger:                     logClient,
 	})
 	if httpRuntime.Enabled() {
 		super.Start("http-runtime", func() error {
@@ -373,12 +447,9 @@ func runPropertyWorker(driver contracts.ProtocolDriver, device contracts.DeviceC
 		} else if shouldEmitProperty(device.Property, values, state, time.Now()) {
 			now := time.Now().UnixMilli()
 			updateTelemetryState(state, values, now)
-			_ = publisher.PublishPropertyPost(device, map[string]interface{}{
+			_ = publisher.PublishPropertyReport(device, map[string]interface{}{
 				"device_code": device.Name,
 				"time":        now,
-				"success":     true,
-				"trace_id":    "",
-				"error":       "",
 				"data":        rtconfig.BuildPropertyResponse(values, bindings),
 			})
 		}

@@ -52,10 +52,18 @@ func BuildPropertyReadSelection(data map[string]interface{}) map[string]interfac
 	return cfg.BuildPropertyReadSelection(data)
 }
 
+func BuildPropertyReadSelectionFromNames(device contracts.DeviceConfig, properties []string) (map[string]interface{}, error) {
+	return cfg.BuildPropertyReadSelectionFromNames(device, properties)
+}
+
 func BuildAutoPropertyReadRequests(device contracts.DeviceConfig) ([]contracts.CommandRequest, []cfg.PropertyBinding, error) {
 	return cfg.BuildAutoPropertyReadRequests(device)
 }
 
 func BuildPropertyResponse(values []*contracts.CommandValue, bindings []cfg.PropertyBinding) map[string]interface{} {
 	return cfg.BuildPropertyResponse(values, bindings)
+}
+
+func BuildTelemetryReadRequestsFromNames(device contracts.DeviceConfig, names []string) ([]contracts.CommandRequest, []string, error) {
+	return cfg.BuildTelemetryReadRequestsFromNames(device, names)
 }

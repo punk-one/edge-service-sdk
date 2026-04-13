@@ -12,12 +12,14 @@ import (
 )
 
 // NewMQTTPublisher creates a new MQTT publisher.
-func NewMQTTPublisher(config MQTTConfig, telemetry TopicConfig, propertyPost TopicConfig, statusReport TopicConfig, logger logger.LoggingClient) *MQTTPublisher {
+func NewMQTTPublisher(config MQTTConfig, telemetry TopicConfig, propertyResult TopicConfig, propertyReport TopicConfig, commandResult TopicConfig, statusReport TopicConfig, logger logger.LoggingClient) *MQTTPublisher {
 	return &MQTTPublisher{
-		telemetry:    telemetry,
-		propertyPost: propertyPost,
-		statusReport: statusReport,
-		client:       newMQTTClient(config, logger),
+		telemetry:      telemetry,
+		propertyResult: propertyResult,
+		propertyReport: propertyReport,
+		commandResult:  commandResult,
+		statusReport:   statusReport,
+		client:         newMQTTClient(config, logger),
 	}
 }
 
@@ -81,8 +83,16 @@ func (p *MQTTPublisher) PublishCommandValues(device contracts.DeviceConfig, valu
 	return p.PublishTelemetryEvent(event, false)
 }
 
-func (p *MQTTPublisher) PublishPropertyPost(device contracts.DeviceConfig, payload map[string]interface{}) error {
-	return p.publishJSONTopic(resolveTopic(p.propertyPost.Topic, device.ProductCode), payload, p.propertyPost.QoS, p.propertyPost.Retain)
+func (p *MQTTPublisher) PublishPropertyResult(device contracts.DeviceConfig, payload map[string]interface{}) error {
+	return p.publishJSONTopic(resolveTopic(p.propertyResult.Topic, device.ProductCode), payload, p.propertyResult.QoS, p.propertyResult.Retain)
+}
+
+func (p *MQTTPublisher) PublishPropertyReport(device contracts.DeviceConfig, payload map[string]interface{}) error {
+	return p.publishJSONTopic(resolveTopic(p.propertyReport.Topic, device.ProductCode), payload, p.propertyReport.QoS, p.propertyReport.Retain)
+}
+
+func (p *MQTTPublisher) PublishCommandResult(device contracts.DeviceConfig, payload map[string]interface{}) error {
+	return p.publishJSONTopic(resolveTopic(p.commandResult.Topic, device.ProductCode), payload, p.commandResult.QoS, p.commandResult.Retain)
 }
 
 func (p *MQTTPublisher) PublishStatus(device contracts.DeviceConfig, payload map[string]interface{}) error {
@@ -111,6 +121,10 @@ func (p *MQTTPublisher) publishRaw(message mqttMessage) error {
 
 func (p *MQTTPublisher) Subscribe(topic string, qos byte, handler MessageHandler) error {
 	return p.client.Subscribe(topic, qos, handler)
+}
+
+func (p *MQTTPublisher) PublishJSON(topic string, qos byte, retain bool, payload interface{}) error {
+	return p.client.PublishJSON(topic, qos, retain, payload)
 }
 
 func (p *MQTTPublisher) HealthCheck() error {

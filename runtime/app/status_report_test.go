@@ -45,7 +45,15 @@ func (p *fakeStatusPublisher) PublishTelemetryEvent(event outevent.TelemetryEven
 	return nil
 }
 
-func (p *fakeStatusPublisher) PublishPropertyPost(device contracts.DeviceConfig, payload map[string]interface{}) error {
+func (p *fakeStatusPublisher) PublishPropertyResult(device contracts.DeviceConfig, payload map[string]interface{}) error {
+	return nil
+}
+
+func (p *fakeStatusPublisher) PublishPropertyReport(device contracts.DeviceConfig, payload map[string]interface{}) error {
+	return nil
+}
+
+func (p *fakeStatusPublisher) PublishCommandResult(device contracts.DeviceConfig, payload map[string]interface{}) error {
 	return nil
 }
 
@@ -99,7 +107,7 @@ func TestInstallStatusPublisherUsesIncrementalAndHeartbeat(t *testing.T) {
 	publisher := &fakeStatusPublisher{}
 
 	installStatusPublisher(tracker, sdk, publisher, mqtt.TopicConfig{
-		Topic:             "v1/gateway/{productCode}/status/post",
+		Topic:             "v1/gateway/{productCode}/status/report",
 		HeartbeatInterval: "50ms",
 	}, &statusTestLogger{})
 

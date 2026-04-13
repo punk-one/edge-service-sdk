@@ -1,11 +1,19 @@
 # Changelog
 
+## v0.6.5
+
+- Added shared `command` and `control` packages for command descriptors, control requests/results, and common control error semantics.
+- Added `runtime/command` and `runtime/control` for command execution, async command resume, SQLite-backed control job persistence, diagnostics, and export.
+- Added HTTP model/query APIs and control tracing APIs, including device model query, job list/export/diagnostics, and trace-based property/command result lookup.
+- Added MQTT query handling in `runtime/app` so model and control-state views can be queried through MQTT request/reply topics.
+- Enhanced property runtime progress/failure reporting and helper utilities used by property operations and runtime commands.
+
 ## v0.6.4
 
 - Changed property HTTP requests and responses to use `device_code` only; removed `product_code` from property payloads.
 - Changed property HTTP/MQTT request correlation field from `request_id` to `trace_id`.
-- Changed HTTP `property/get` and `property/set` to stay fully synchronous and never emit MQTT `propertyPost`.
-- Changed MQTT `propertySet` to publish a delayed `propertyPost` readback after 1 second when `propertyPost.topic` is configured.
+- Changed HTTP `property/get` and `property/set` to stop reusing the old MQTT property result alias and align on the current `property/result` result flow.
+- Changed MQTT property write follow-up handling to align on the current `property/result` result topic instead of the legacy result alias.
 - Added property auto-report configuration with telemetry-style `interval`, `onChange`, `watchedFields`, and `heartbeatInterval`.
 - Added `property.structs[].autoReport` so large struct arrays can stay request-driven and skip automatic reporting.
 - Removed `product_code` from HTTP `/api/v1/runtime/status` device entries.

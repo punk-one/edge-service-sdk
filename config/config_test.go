@@ -72,8 +72,8 @@ reliableQueue:
 device:
   profilesDir: "` + profilesDir + `"
   devicesDir: "` + devicesDir + `"
-telemetryPost:
-  topic: "v1/gateway/{productCode}/telemetry/post"
+telemetryReport:
+  topic: "v1/gateway/{productCode}/telemetry/report"
   qos: 0
   retain: false
   dataFormat: "rule"
@@ -83,9 +83,16 @@ propertySet:
 propertyGet:
   topic: ""
   qos: 0
-propertyPost:
+propertyResult:
   topic: ""
   qos: 0
+  retain: false
+queryRequest:
+  topic: "v1/gateway/{productCode}/query/request"
+  qos: 1
+queryResult:
+  topic: "v1/gateway/{productCode}/query/result"
+  qos: 1
   retain: false
 statusReport:
   topic: ""
@@ -117,8 +124,11 @@ statusReport:
 	if config.Device.ProfilesDir != profilesDir || config.Device.DevicesDir != devicesDir {
 		t.Fatalf("unexpected device config: %#v", config.Device)
 	}
-	if config.TelemetryPost.Topic != "v1/gateway/{productCode}/telemetry/post" || config.TelemetryPost.DataFormat != "rule" {
-		t.Fatalf("unexpected telemetryPost config: %#v", config.TelemetryPost)
+	if config.TelemetryReport.Topic != "v1/gateway/{productCode}/telemetry/report" || config.TelemetryReport.DataFormat != "rule" {
+		t.Fatalf("unexpected telemetryReport config: %#v", config.TelemetryReport)
+	}
+	if config.QueryRequest.Topic != "v1/gateway/{productCode}/query/request" || config.QueryResult.Topic != "v1/gateway/{productCode}/query/result" {
+		t.Fatalf("unexpected query config: request=%#v result=%#v", config.QueryRequest, config.QueryResult)
 	}
 	if config.StatusReport.HeartbeatInterval != "15s" {
 		t.Fatalf("unexpected statusReport config: %#v", config.StatusReport)

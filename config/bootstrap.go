@@ -17,25 +17,37 @@ import (
 
 // Config represents the application configuration.
 type Config struct {
-	Logging       logger.Config            `yaml:"logging"`
-	Service       ServiceConfig            `yaml:"service"`
-	Storage       StorageConfig            `yaml:"storage"`
-	Auth          AuthConfig               `yaml:"auth"`
-	MQTT          mqtt.MQTTConfig          `yaml:"mqtt"`
-	ReliableQueue reliable.Config          `yaml:"reliableQueue"`
-	Device        DeviceConfig             `yaml:"device"`
-	TelemetryPost mqtt.TopicConfig         `yaml:"telemetryPost"`
-	PropertySet   mqtt.TopicConfig         `yaml:"propertySet"`
-	PropertyGet   mqtt.TopicConfig         `yaml:"propertyGet"`
-	PropertyPost  mqtt.TopicConfig         `yaml:"propertyPost"`
-	StatusReport  mqtt.TopicConfig         `yaml:"statusReport"`
-	Devices       []contracts.DeviceConfig `yaml:"deviceList"`
-	LogLevel      string                   `yaml:"logLevel"`
+	Logging         logger.Config            `yaml:"logging"`
+	Service         ServiceConfig            `yaml:"service"`
+	Storage         StorageConfig            `yaml:"storage"`
+	Auth            AuthConfig               `yaml:"auth"`
+	MQTT            mqtt.MQTTConfig          `yaml:"mqtt"`
+	ReliableQueue   reliable.Config          `yaml:"reliableQueue"`
+	Device          DeviceConfig             `yaml:"device"`
+	TelemetryReport mqtt.TopicConfig         `yaml:"telemetryReport"`
+	PropertySet     mqtt.TopicConfig         `yaml:"propertySet"`
+	PropertyGet     mqtt.TopicConfig         `yaml:"propertyGet"`
+	PropertyResult  mqtt.TopicConfig         `yaml:"propertyResult"`
+	PropertyReport  mqtt.TopicConfig         `yaml:"propertyReport"`
+	CommandCall     mqtt.TopicConfig         `yaml:"commandCall"`
+	CommandResult   mqtt.TopicConfig         `yaml:"commandResult"`
+	QueryRequest    mqtt.TopicConfig         `yaml:"queryRequest"`
+	QueryResult     mqtt.TopicConfig         `yaml:"queryResult"`
+	StatusReport    mqtt.TopicConfig         `yaml:"statusReport"`
+	ControlStore    ControlStoreConfig       `yaml:"controlStore"`
+	Devices         []contracts.DeviceConfig `yaml:"deviceList"`
+	LogLevel        string                   `yaml:"logLevel"`
 }
 
 // StorageConfig represents shared runtime storage.
 type StorageConfig struct {
 	SQLitePath string `yaml:"sqlitePath"`
+}
+
+// ControlStoreConfig controls local control job persistence.
+type ControlStoreConfig struct {
+	SQLitePath    string `yaml:"sqlitePath"`
+	RetentionDays int    `yaml:"retentionDays"`
 }
 
 // AuthConfig represents auth-related runtime configuration.
@@ -143,16 +155,61 @@ func loadMainConfig(configPath string) (Config, error) {
 			MaxReconnectIntervalSec: 60,
 			DisconnectQuiesceMs:     250,
 		},
-		TelemetryPost: mqtt.TopicConfig{
-			Topic:      "v1/gateway/{productCode}/telemetry/post",
+		TelemetryReport: mqtt.TopicConfig{
+			Topic:      "v1/gateway/{productCode}/telemetry/report",
 			QoS:        0,
 			Retain:     false,
 			DataFormat: "rule",
 		},
+		PropertySet: mqtt.TopicConfig{
+			Topic:  "v1/gateway/{productCode}/property/set",
+			QoS:    0,
+			Retain: false,
+		},
+		PropertyGet: mqtt.TopicConfig{
+			Topic:  "v1/gateway/{productCode}/property/get",
+			QoS:    0,
+			Retain: false,
+		},
+		PropertyResult: mqtt.TopicConfig{
+			Topic:  "v1/gateway/{productCode}/property/result",
+			QoS:    0,
+			Retain: false,
+		},
+		PropertyReport: mqtt.TopicConfig{
+			Topic:  "v1/gateway/{productCode}/property/report",
+			QoS:    0,
+			Retain: false,
+		},
+		CommandCall: mqtt.TopicConfig{
+			Topic:  "v1/gateway/{productCode}/command/call/{identifier}",
+			QoS:    0,
+			Retain: false,
+		},
+		CommandResult: mqtt.TopicConfig{
+			Topic:  "v1/gateway/{productCode}/command/result",
+			QoS:    0,
+			Retain: false,
+		},
+		QueryRequest: mqtt.TopicConfig{
+			Topic:  "v1/gateway/{productCode}/query/request",
+			QoS:    0,
+			Retain: false,
+		},
+		QueryResult: mqtt.TopicConfig{
+			Topic:  "v1/gateway/{productCode}/query/result",
+			QoS:    0,
+			Retain: false,
+		},
 		StatusReport: mqtt.TopicConfig{
+			Topic:             "v1/gateway/{productCode}/status/report",
 			QoS:               0,
 			Retain:            false,
 			HeartbeatInterval: "30s",
+		},
+		ControlStore: ControlStoreConfig{
+			SQLitePath:    "./data/runtime.db",
+			RetentionDays: 7,
 		},
 		LogLevel: "INFO",
 	}
@@ -264,6 +321,7 @@ func mergeDeviceWithProfile(device contracts.DeviceConfig, profile contracts.Dev
 	profile = NormalizeProfile(profile)
 	deviceHasTelemetryOverride := strings.TrimSpace(device.Telemetry.Interval) != "" || len(device.Telemetry.WatchedFields) > 0 || len(device.Telemetry.Points) > 0
 	deviceHasPropertyOverride := strings.TrimSpace(device.Property.Interval) != "" || len(device.Property.WatchedFields) > 0 || len(device.Property.Points) > 0 || len(device.Property.Structs) > 0
+	deviceHasCommandOverride := len(device.Commands) > 0
 
 	if strings.TrimSpace(device.Description) == "" {
 		device.Description = profile.Description
@@ -303,14 +361,17 @@ func mergeDeviceWithProfile(device contracts.DeviceConfig, profile contracts.Dev
 	if !deviceHasPropertyOverride {
 		device.Property.OnChange = profile.Property.OnChange
 	}
+	if !deviceHasCommandOverride && len(profile.Commands) > 0 {
+		device.Commands = cloneCommands(profile.Commands)
+	}
 
 	return NormalizeDeviceConfig(device)
 }
 
 func NormalizeConfig(config Config) Config {
 	config.Logging = EffectiveLoggerConfig(config)
-	if config.TelemetryPost.DataFormat == "" {
-		config.TelemetryPost.DataFormat = "rule"
+	if config.TelemetryReport.DataFormat == "" {
+		config.TelemetryReport.DataFormat = "rule"
 	}
 	if strings.TrimSpace(config.StatusReport.HeartbeatInterval) == "" {
 		config.StatusReport.HeartbeatInterval = "30s"
@@ -323,6 +384,12 @@ func NormalizeConfig(config Config) Config {
 		}
 	}
 	config.ReliableQueue.SQLitePath = config.Storage.SQLitePath
+	if strings.TrimSpace(config.ControlStore.SQLitePath) == "" {
+		config.ControlStore.SQLitePath = config.Storage.SQLitePath
+	}
+	if config.ControlStore.RetentionDays <= 0 {
+		config.ControlStore.RetentionDays = 7
+	}
 	if config.Auth.AccessTokenTTLMin <= 0 {
 		config.Auth.AccessTokenTTLMin = 10
 	}
@@ -352,6 +419,9 @@ func NormalizeDeviceConfig(device contracts.DeviceConfig) contracts.DeviceConfig
 			device.Property.Structs[i].Fields[j].ValueType = contracts.NormalizedValueType(device.Property.Structs[i].Fields[j].ValueType)
 		}
 	}
+	for i := range device.Commands {
+		device.Commands[i].Identifier = strings.TrimSpace(device.Commands[i].Identifier)
+	}
 	return device
 }
 
@@ -370,6 +440,9 @@ func NormalizeProfile(profile contracts.DeviceProfile) contracts.DeviceProfile {
 		for j := range profile.Property.Structs[i].Fields {
 			profile.Property.Structs[i].Fields[j].ValueType = contracts.NormalizedValueType(profile.Property.Structs[i].Fields[j].ValueType)
 		}
+	}
+	for i := range profile.Commands {
+		profile.Commands[i].Identifier = strings.TrimSpace(profile.Commands[i].Identifier)
 	}
 	return profile
 }
@@ -396,6 +469,15 @@ func cloneStructs(items []contracts.PropertyStruct) []contracts.PropertyStruct {
 		cloned[i] = items[i]
 		cloned[i].Fields = append([]contracts.PropertyStructField(nil), items[i].Fields...)
 	}
+	return cloned
+}
+
+func cloneCommands(items []contracts.CommandConfig) []contracts.CommandConfig {
+	if len(items) == 0 {
+		return nil
+	}
+	cloned := make([]contracts.CommandConfig, len(items))
+	copy(cloned, items)
 	return cloned
 }
 

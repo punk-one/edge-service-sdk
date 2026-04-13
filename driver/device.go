@@ -48,6 +48,7 @@ type DeviceConfig struct {
 	ConnectionStrategy string                 `yaml:"connectionStrategy"`
 	Telemetry          TelemetryConfig        `yaml:"telemetry"`
 	Property           PropertyConfig         `yaml:"property"`
+	Commands           []CommandConfig        `yaml:"commands"`
 }
 
 // DeviceProfile defines a reusable point/profile template shared by many devices.
@@ -57,6 +58,7 @@ type DeviceProfile struct {
 	Labels      []string        `yaml:"labels"`
 	Telemetry   TelemetryConfig `yaml:"telemetry"`
 	Property    PropertyConfig  `yaml:"property"`
+	Commands    []CommandConfig `yaml:"commands"`
 }
 
 // TelemetryConfig defines periodic telemetry collection for a device.
@@ -121,6 +123,11 @@ type PropertyStructField struct {
 	FieldOffset int    `yaml:"fieldOffset"`
 	MaxLength   int    `yaml:"maxLength"`
 	ReadWrite   string `yaml:"readWrite"`
+}
+
+// CommandConfig declares one remotely callable command supported by a device/profile.
+type CommandConfig struct {
+	Identifier string `yaml:"identifier"`
 }
 
 // ResourceProperties represents resource properties

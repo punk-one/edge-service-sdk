@@ -43,6 +43,7 @@ func TestApplyProfilesMergesReusableProfile(t *testing.T) {
 					{Name: "reset", ValueType: "Bool", NodeName: "DB1.DBX0.1", ReadWrite: "RW"},
 				},
 			},
+			Commands: []contracts.CommandConfig{{Identifier: "reset_alarm"}},
 		},
 	}
 
@@ -68,11 +69,40 @@ func TestApplyProfilesMergesReusableProfile(t *testing.T) {
 	if len(merged[0].Property.WatchedFields) != 1 || merged[0].Property.WatchedFields[0] != "reset" {
 		t.Fatalf("expected property watched fields merged from profile, got %#v", merged[0].Property.WatchedFields)
 	}
+	if len(merged[0].Commands) != 1 || merged[0].Commands[0].Identifier != "reset_alarm" {
+		t.Fatalf("expected commands merged from profile, got %#v", merged[0].Commands)
+	}
 }
 
 func TestApplyProfilesFailsForUnknownProfile(t *testing.T) {
 	_, err := applyProfiles([]contracts.DeviceConfig{{Name: "d1", ProfileName: "missing"}}, map[string]contracts.DeviceProfile{})
 	if err == nil {
 		t.Fatal("expected error for missing profile")
+	}
+}
+
+func TestApplyProfilesAllowsDeviceCommandOverride(t *testing.T) {
+	devices := []contracts.DeviceConfig{{
+		Name:        "acm006",
+		ProfileName: "acm-profile",
+		ProductCode: "acm",
+		Commands:    []contracts.CommandConfig{{Identifier: "custom_only"}},
+	}}
+	profiles := map[string]contracts.DeviceProfile{
+		"acm-profile": {
+			Name:     "acm-profile",
+			Commands: []contracts.CommandConfig{{Identifier: "reset_alarm"}},
+		},
+	}
+
+	merged, err := applyProfiles(devices, profiles)
+	if err != nil {
+		t.Fatalf("applyProfiles() error = %v", err)
+	}
+	if len(merged) != 1 {
+		t.Fatalf("expected 1 merged device, got %d", len(merged))
+	}
+	if len(merged[0].Commands) != 1 || merged[0].Commands[0].Identifier != "custom_only" {
+		t.Fatalf("expected device commands override profile commands, got %#v", merged[0].Commands)
 	}
 }

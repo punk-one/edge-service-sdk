@@ -1,31 +1,15 @@
 package property
 
-// PropertyRequest is the shared request model used by MQTT and HTTP property operations.
-type PropertyRequest struct {
-	DeviceCode string                 `json:"device_code"`
-	Time       int64                  `json:"time"`
-	TraceID    string                 `json:"trace_id,omitempty"`
-	Data       map[string]interface{} `json:"data"`
-}
+import ctl "github.com/punk-one/edge-service-sdk/control"
 
-// PropertyResponse is returned by property get operations.
-type PropertyResponse struct {
-	DeviceCode string                 `json:"device_code"`
-	Time       int64                  `json:"time"`
-	Success    bool                   `json:"success"`
-	TraceID    string                 `json:"trace_id,omitempty"`
-	Error      string                 `json:"error,omitempty"`
-	Data       map[string]interface{} `json:"data"`
-}
+// PropertyRequest uses the unified control request envelope.
+type PropertyRequest = ctl.Request
 
-// PropertySetResponse is returned by property set operations.
-type PropertySetResponse struct {
-	DeviceCode string `json:"device_code"`
-	Time       int64  `json:"time"`
-	Success    bool   `json:"success"`
-	TraceID    string `json:"trace_id,omitempty"`
-	Error      string `json:"error,omitempty"`
-}
+// PropertyResponse uses the unified control result envelope.
+type PropertyResponse = ctl.Result
+
+// PropertySetResponse uses the unified control result envelope.
+type PropertySetResponse = ctl.Result
 
 // BootstrapInitRequest initializes the single app credential.
 type BootstrapInitRequest struct {
