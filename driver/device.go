@@ -87,6 +87,7 @@ type PointConfig struct {
 	NodeName          string  `yaml:"nodeName"`
 	NodeNameTemplate  string  `yaml:"nodeNameTemplate"`
 	ArrayKeyPattern   string  `yaml:"arrayKeyPattern"`
+	ByteSize          int     `yaml:"byteSize"`
 	MaxLength         int     `yaml:"maxLength"`
 	Scale             string  `yaml:"scale"`
 	Precision         int     `yaml:"precision"`
@@ -188,7 +189,7 @@ func (p PointConfig) ToCommandRequest(nodeName string) (CommandRequest, error) {
 	if readWrite == "" {
 		readWrite = "R"
 	}
-	return CommandRequest{
+	req := CommandRequest{
 		DeviceResourceName: p.Name,
 		Type:               valueType,
 		Attributes: map[string]interface{}{
@@ -201,5 +202,9 @@ func (p PointConfig) ToCommandRequest(nodeName string) (CommandRequest, error) {
 			Precision: p.Precision,
 			MaxLength: p.MaxLength,
 		},
-	}, nil
+	}
+	if p.ByteSize > 0 {
+		req.Attributes["ByteSize"] = p.ByteSize
+	}
+	return req, nil
 }
