@@ -17,6 +17,13 @@ It extracts the common runtime, control, and transport capabilities out of proto
 - control job persistence, result history, diagnostics, export, and MQTT query handling
 - dependency checks, worker supervision, and shared logging contracts
 
+## What's New In v0.6.7
+
+- property get/set now supports `name[index]` format for struct arrays: `BuildPropertyReadSelectionFromNames` accepts `wheels[1]`, `wheels[1,3,5]`, `wheels[1-10]` to read specific indices
+- `BuildPropertyWriteRequests` accepts `wheels[2]` single-index writes
+- `BuildPropertyReadRequests` resolves `name[index]` keys for readback support
+- added `parseStructNameWithIndices`, `parseIndexList`, `deduplicateAndSort`, `buildStructSelectionForIndices` helpers
+
 ## What's New In v0.6.5
 
 - added shared `command` and `control` packages for command descriptors, execution contracts, and control request/result models
@@ -41,7 +48,7 @@ func main() {
     registry := cmdapi.NewRegistry()
     // registry.MustRegister(yourCommand)
 
-    app.Bootstrap("edge-service-yourproto", "v0.6.5", newDriver(), registry)
+    app.Bootstrap("edge-service-yourproto", "v0.6.7", newDriver(), registry)
 }
 ```
 
@@ -133,4 +140,4 @@ MQTT runtime capabilities include telemetry/property/status publishing, property
 
 ## Version
 
-This repository is being published as `v0.6.5`.
+This repository is being published as `v0.6.7`.
