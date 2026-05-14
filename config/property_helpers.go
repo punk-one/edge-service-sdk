@@ -70,14 +70,28 @@ func BuildPropertyWriteRequests(device contracts.DeviceConfig, data map[string]i
 			continue
 		}
 
-		structDef, ok := findPropertyStruct(device, key)
+		structName, indices, parseErr := parseStructNameWithIndices(key)
+		if parseErr != nil {
+			return nil, nil, parseErr
+		}
+
+		structDef, ok := findPropertyStruct(device, structName)
 		if !ok {
 			return nil, nil, fmt.Errorf("unknown property key %q", key)
 		}
 
-		items, ok := raw.(map[string]interface{})
-		if !ok {
-			return nil, nil, fmt.Errorf("property struct %q expects object payload", key)
+		var items map[string]interface{}
+		if indices != nil {
+			if len(indices) != 1 {
+				return nil, nil, fmt.Errorf("property write on %q requires single index, got %d", key, len(indices))
+			}
+			items = map[string]interface{}{strconv.Itoa(indices[0]): raw}
+		} else {
+			var ok bool
+			items, ok = raw.(map[string]interface{})
+			if !ok {
+				return nil, nil, fmt.Errorf("property struct %q expects object payload", key)
+			}
 		}
 
 		structReqs, structParams, err := buildStructWriteRequests(structDef, items)
@@ -109,14 +123,26 @@ func BuildPropertyReadRequests(device contracts.DeviceConfig, data map[string]in
 			continue
 		}
 
+		var items map[string]interface{}
 		structDef, ok := findPropertyStruct(device, key)
 		if !ok {
-			return nil, nil, fmt.Errorf("unknown property key %q", key)
-		}
-
-		items, ok := raw.(map[string]interface{})
-		if !ok {
-			return nil, nil, fmt.Errorf("property struct %q expects object payload", key)
+			structName, indices, parseErr := parseStructNameWithIndices(key)
+			if parseErr != nil || indices == nil {
+				return nil, nil, fmt.Errorf("unknown property key %q", key)
+			}
+			structDef, ok = findPropertyStruct(device, structName)
+			if !ok {
+				return nil, nil, fmt.Errorf("unknown property key %q", key)
+			}
+			items = make(map[string]interface{}, len(indices))
+			for _, idx := range indices {
+				items[strconv.Itoa(idx)] = raw
+			}
+		} else {
+			items, ok = raw.(map[string]interface{})
+			if !ok {
+				return nil, nil, fmt.Errorf("property struct %q expects object payload", key)
+			}
 		}
 
 		structReqs, structBindings, err := buildStructReadRequests(structDef, items)
@@ -235,15 +261,29 @@ func BuildPropertyReadSelectionFromNames(device contracts.DeviceConfig, properti
 			continue
 		}
 
-		structDef, ok := findPropertyStruct(device, name)
+		structName, indices, parseErr := parseStructNameWithIndices(name)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+
+		structDef, ok := findPropertyStruct(device, structName)
 		if !ok {
 			return nil, fmt.Errorf("unknown property key %q", name)
 		}
-		items, err := buildStructSelection(structDef)
+
+		var (
+			items map[string]interface{}
+			err   error
+		)
+		if indices != nil {
+			items, err = buildStructSelectionForIndices(structDef, indices)
+		} else {
+			items, err = buildStructSelection(structDef)
+		}
 		if err != nil {
 			return nil, err
 		}
-		selection[name] = items
+		selection[structName] = items
 	}
 
 	if len(selection) == 0 {
@@ -692,6 +732,106 @@ func buildStructSelection(structDef contracts.PropertyStruct) (map[string]interf
 	base := structIndexBase(structDef)
 	for offset := 0; offset < structDef.MaxItems; offset++ {
 		items[strconv.Itoa(base+offset)] = map[string]interface{}{}
+	}
+	return items, nil
+}
+
+func parseIndexList(inner string) ([]int, error) {
+	parts := strings.Split(inner, ",")
+	var indices []int
+	seen := make(map[int]bool)
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.Contains(part, "-") {
+			rangeParts := strings.SplitN(part, "-", 2)
+			if len(rangeParts) != 2 {
+				return nil, fmt.Errorf("invalid range %q", part)
+			}
+			start, err := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
+			if err != nil {
+				return nil, fmt.Errorf("invalid range start %q", rangeParts[0])
+			}
+			end, err := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
+			if err != nil {
+				return nil, fmt.Errorf("invalid range end %q", rangeParts[1])
+			}
+			if start > end {
+				return nil, fmt.Errorf("invalid range %q: start > end", part)
+			}
+			for i := start; i <= end; i++ {
+				if !seen[i] {
+					indices = append(indices, i)
+					seen[i] = true
+				}
+			}
+		} else {
+			n, err := strconv.Atoi(part)
+			if err != nil {
+				return nil, fmt.Errorf("invalid index %q", part)
+			}
+			if !seen[n] {
+				indices = append(indices, n)
+				seen[n] = true
+			}
+		}
+	}
+	return indices, nil
+}
+
+func deduplicateAndSort(indices []int) []int {
+	if len(indices) <= 1 {
+		return indices
+	}
+	unique := make(map[int]bool)
+	result := make([]int, 0, len(indices))
+	for _, idx := range indices {
+		if !unique[idx] {
+			unique[idx] = true
+			result = append(result, idx)
+		}
+	}
+	sort.Ints(result)
+	return result
+}
+
+var structNameIndexPattern = regexp.MustCompile(`^(\w+)\[([^\]]+)\]$`)
+
+func parseStructNameWithIndices(raw string) (structName string, indices []int, err error) {
+	if strings.HasSuffix(raw, "[]") {
+		return "", nil, fmt.Errorf("empty index spec in %q", raw)
+	}
+	matches := structNameIndexPattern.FindStringSubmatch(raw)
+	if len(matches) == 3 {
+		structName = matches[1]
+		indices, err = parseIndexList(matches[2])
+		if err != nil {
+			return "", nil, fmt.Errorf("invalid index spec in %q: %w", raw, err)
+		}
+		indices = deduplicateAndSort(indices)
+		return structName, indices, nil
+	}
+	return raw, nil, nil
+}
+
+func buildStructSelectionForIndices(structDef contracts.PropertyStruct, indices []int) (map[string]interface{}, error) {
+	if len(indices) == 0 {
+		return nil, fmt.Errorf("property struct %q requires at least one index", structDef.Name)
+	}
+	base := structIndexBase(structDef)
+	for _, idx := range indices {
+		if idx < base {
+			return nil, fmt.Errorf("struct index %d on %s is below base %d", idx, structDef.Name, base)
+		}
+		if structDef.MaxItems > 0 && idx >= base+structDef.MaxItems {
+			return nil, fmt.Errorf("struct index %d on %s exceeds maxItems %d (base=%d)", idx, structDef.Name, structDef.MaxItems, base)
+		}
+	}
+	items := make(map[string]interface{}, len(indices))
+	for _, idx := range indices {
+		items[strconv.Itoa(idx)] = map[string]interface{}{}
 	}
 	return items, nil
 }

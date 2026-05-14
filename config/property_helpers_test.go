@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strconv"
 	"testing"
 
 	contracts "github.com/punk-one/edge-service-sdk/driver"
@@ -167,5 +168,358 @@ func TestBuildAutoPropertyReadRequestsSkipsNonAutoReportStructs(t *testing.T) {
 	}
 	if got := reqs[0].DeviceResourceName; got != "status_text" {
 		t.Fatalf("unexpected auto-report point %q", got)
+	}
+}
+
+func TestParseStructNameWithIndices(t *testing.T) {
+	tests := []struct {
+		raw         string
+		wantName    string
+		wantIndices []int
+		wantErr     bool
+	}{
+		{"machine_data", "machine_data", nil, false},
+		{"machine_data[1]", "machine_data", []int{1}, false},
+		{"machine_data[1,3,5]", "machine_data", []int{1, 3, 5}, false},
+		{"machine_data[1-5]", "machine_data", []int{1, 2, 3, 4, 5}, false},
+		{"machine_data[5-1]", "", nil, true},
+		{"machine_data[1,3-5,7]", "machine_data", []int{1, 3, 4, 5, 7}, false},
+		{"machine_data[1,1,1]", "machine_data", []int{1}, false},
+		{"machine_data[a]", "", nil, true},
+		{"machine_data[1-a]", "", nil, true},
+		{"machine_data[]", "", nil, true},
+		{"[1]", "[1]", nil, false},
+		{"", "", nil, false},
+	}
+	for _, tt := range tests {
+		name, indices, err := parseStructNameWithIndices(tt.raw)
+		if tt.wantErr {
+			if err == nil {
+				t.Errorf("parseStructNameWithIndices(%q) expected error", tt.raw)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseStructNameWithIndices(%q) unexpected error: %v", tt.raw, err)
+			continue
+		}
+		if name != tt.wantName {
+			t.Errorf("parseStructNameWithIndices(%q) structName = %q, want %q", tt.raw, name, tt.wantName)
+		}
+		if len(indices) != len(tt.wantIndices) {
+			t.Errorf("parseStructNameWithIndices(%q) indices = %v, want %v", tt.raw, indices, tt.wantIndices)
+			continue
+		}
+		for i := range indices {
+			if indices[i] != tt.wantIndices[i] {
+				t.Errorf("parseStructNameWithIndices(%q) indices = %v, want %v", tt.raw, indices, tt.wantIndices)
+				break
+			}
+		}
+	}
+}
+
+func TestDeduplicateAndSort(t *testing.T) {
+	tests := []struct {
+		input []int
+		want  []int
+	}{
+		{[]int{3, 1, 2}, []int{1, 2, 3}},
+		{[]int{1, 1, 1}, []int{1}},
+		{[]int{5, 3, 5, 3, 1}, []int{1, 3, 5}},
+		{nil, nil},
+		{[]int{1}, []int{1}},
+	}
+	for _, tt := range tests {
+		got := deduplicateAndSort(tt.input)
+		if len(got) != len(tt.want) {
+			t.Errorf("deduplicateAndSort(%v) = %v, want %v", tt.input, got, tt.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tt.want[i] {
+				t.Errorf("deduplicateAndSort(%v) = %v, want %v", tt.input, got, tt.want)
+				break
+			}
+		}
+	}
+}
+
+func TestBuildPropertyReadSelectionFromNamesAllIndices(t *testing.T) {
+	device := testDeviceConfig()
+	selection, err := BuildPropertyReadSelectionFromNames(device, []string{"wheels"})
+	if err != nil {
+		t.Fatalf("BuildPropertyReadSelectionFromNames() error = %v", err)
+	}
+	wheels, ok := selection["wheels"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected wheels to be map, got %T", selection["wheels"])
+	}
+	if len(wheels) != 450 {
+		t.Fatalf("expected 450 wheel indices, got %d", len(wheels))
+	}
+	// verify first and last
+	if _, ok := wheels["1"]; !ok {
+		t.Fatal("expected index 1")
+	}
+	if _, ok := wheels["450"]; !ok {
+		t.Fatal("expected index 450")
+	}
+}
+
+func TestBuildPropertyReadSelectionFromNamesSingleIndex(t *testing.T) {
+	device := testDeviceConfig()
+	selection, err := BuildPropertyReadSelectionFromNames(device, []string{"wheels[1]"})
+	if err != nil {
+		t.Fatalf("BuildPropertyReadSelectionFromNames() error = %v", err)
+	}
+	wheels, ok := selection["wheels"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected wheels to be map, got %T", selection["wheels"])
+	}
+	if len(wheels) != 1 {
+		t.Fatalf("expected 1 wheel index, got %d", len(wheels))
+	}
+	if _, ok := wheels["1"]; !ok {
+		t.Fatal("expected index 1")
+	}
+}
+
+func TestBuildPropertyReadSelectionFromNamesMultiIndex(t *testing.T) {
+	device := testDeviceConfig()
+	selection, err := BuildPropertyReadSelectionFromNames(device, []string{"wheels[1,3,5]"})
+	if err != nil {
+		t.Fatalf("BuildPropertyReadSelectionFromNames() error = %v", err)
+	}
+	wheels, ok := selection["wheels"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected wheels to be map, got %T", selection["wheels"])
+	}
+	if len(wheels) != 3 {
+		t.Fatalf("expected 3 wheel indices, got %d", len(wheels))
+	}
+	for _, idx := range []string{"1", "3", "5"} {
+		if _, ok := wheels[idx]; !ok {
+			t.Fatalf("expected index %s", idx)
+		}
+	}
+}
+
+func TestBuildPropertyReadSelectionFromNamesRange(t *testing.T) {
+	device := testDeviceConfig()
+	selection, err := BuildPropertyReadSelectionFromNames(device, []string{"wheels[1-5]"})
+	if err != nil {
+		t.Fatalf("BuildPropertyReadSelectionFromNames() error = %v", err)
+	}
+	wheels, ok := selection["wheels"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected wheels to be map, got %T", selection["wheels"])
+	}
+	if len(wheels) != 5 {
+		t.Fatalf("expected 5 wheel indices, got %d", len(wheels))
+	}
+	for i := 1; i <= 5; i++ {
+		key := strconv.Itoa(i)
+		if _, ok := wheels[key]; !ok {
+			t.Fatalf("expected index %d", i)
+		}
+	}
+}
+
+func TestBuildPropertyReadSelectionFromNamesIndexOutOfRange(t *testing.T) {
+	device := testDeviceConfig()
+	_, err := BuildPropertyReadSelectionFromNames(device, []string{"wheels[451]"})
+	if err == nil {
+		t.Fatal("expected error for index 451 exceeding maxItems 450")
+	}
+}
+
+func TestBuildPropertyReadSelectionFromNamesBelowBase(t *testing.T) {
+	device := testDeviceConfig()
+	_, err := BuildPropertyReadSelectionFromNames(device, []string{"wheels[0]"})
+	if err == nil {
+		t.Fatal("expected error for index 0 below base 1")
+	}
+}
+
+func TestBuildPropertyReadSelectionFromNamesInvalidFormat(t *testing.T) {
+	device := testDeviceConfig()
+	invalidKeys := []string{"wheels[a]", "wheels[1-a]", "wheels[]", "wheels[1-]"}
+	for _, key := range invalidKeys {
+		_, err := BuildPropertyReadSelectionFromNames(device, []string{key})
+		if err == nil {
+			t.Errorf("expected error for key %q", key)
+		}
+	}
+}
+
+func TestBuildPropertyReadSelectionFromNamesEndToEnd(t *testing.T) {
+	device := testDeviceConfig()
+	selection, err := BuildPropertyReadSelectionFromNames(device, []string{"wheels[1,2]"})
+	if err != nil {
+		t.Fatalf("BuildPropertyReadSelectionFromNames() error = %v", err)
+	}
+	reqs, bindings, err := BuildPropertyReadRequests(device, selection)
+	if err != nil {
+		t.Fatalf("BuildPropertyReadRequests() error = %v", err)
+	}
+	// 2 indices * 2 fields (diameter, height) = 4 requests
+	if len(reqs) != 4 || len(bindings) != 4 {
+		t.Fatalf("expected 4 read requests and bindings, got %d and %d", len(reqs), len(bindings))
+	}
+	// verify both fields for wheels[1] and wheels[2]
+	fieldCount := make(map[string]int)
+	for _, binding := range bindings {
+		if len(binding.Path) == 3 && binding.Path[0] == "wheels" {
+			fieldCount[binding.Path[1]+"."+binding.Path[2]]++
+		}
+	}
+	if fieldCount["1.diameter"] != 1 || fieldCount["1.height"] != 1 {
+		t.Fatalf("expected wheels[1] fields, got %v", fieldCount)
+	}
+	if fieldCount["2.diameter"] != 1 || fieldCount["2.height"] != 1 {
+		t.Fatalf("expected wheels[2] fields, got %v", fieldCount)
+	}
+}
+
+func TestBuildPropertyReadSelectionFromNamesMultiStruct(t *testing.T) {
+	device := testDeviceConfig()
+	device.Property.Structs = append(device.Property.Structs, contracts.PropertyStruct{
+		Name:      "gears",
+		Kind:      "struct_array",
+		IndexBase: 1,
+		MaxItems:  10,
+		Address: contracts.PropertyStructAddress{
+			DBNumber:    200,
+			BaseOffset:  100,
+			IndexStride: 10,
+			Unit:        "word",
+		},
+		Fields: []contracts.PropertyStructField{
+			{Name: "teeth", ValueType: "Int16", FieldOffset: 0},
+		},
+	})
+
+	selection, err := BuildPropertyReadSelectionFromNames(device, []string{"wheels[1-3]", "gears[5]"})
+	if err != nil {
+		t.Fatalf("BuildPropertyReadSelectionFromNames() error = %v", err)
+	}
+
+	wheels, ok := selection["wheels"].(map[string]interface{})
+	if !ok || len(wheels) != 3 {
+		t.Fatalf("expected 3 wheels, got %d", len(wheels))
+	}
+	gears, ok := selection["gears"].(map[string]interface{})
+	if !ok || len(gears) != 1 {
+		t.Fatalf("expected 1 gear, got %d", len(gears))
+	}
+	if _, ok := gears["5"]; !ok {
+		t.Fatal("expected gear index 5")
+	}
+}
+
+func TestBuildPropertyWriteRequestsWithIndex(t *testing.T) {
+	device := testDeviceConfig()
+	reqs, params, err := BuildPropertyWriteRequests(device, map[string]interface{}{
+		"wheels[2]": map[string]interface{}{
+			"diameter": 40,
+			"height":   42,
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildPropertyWriteRequests() error = %v", err)
+	}
+	if len(reqs) != 2 || len(params) != 2 {
+		t.Fatalf("expected 2 requests and params, got %d and %d", len(reqs), len(params))
+	}
+	// Verify node names for wheels[2]: baseOffset=20, indexBase=1, indexStride=20
+	// index 2 -> (2-1)*20+20 = 40 -> field offset 0 = DBW40, field offset 2 = DBW42
+	for _, req := range reqs {
+		nodeName := req.Attributes["NodeName"]
+		if nodeName == "DB200.DBW40" || nodeName == "DB200.DBW42" {
+			continue
+		}
+		t.Fatalf("unexpected node name %q", nodeName)
+	}
+}
+
+func TestBuildPropertyWriteRequestsRejectsMulti(t *testing.T) {
+	device := testDeviceConfig()
+	_, _, err := BuildPropertyWriteRequests(device, map[string]interface{}{
+		"wheels[1,3]": map[string]interface{}{
+			"diameter": 40,
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for multi-index write")
+	}
+}
+
+func TestBuildPropertyWriteRequestsBackwardCompat(t *testing.T) {
+	device := testDeviceConfig()
+	reqs, params, err := BuildPropertyWriteRequests(device, map[string]interface{}{
+		"wheels": map[string]interface{}{
+			"2": map[string]interface{}{
+				"diameter": 40,
+				"height":   42,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildPropertyWriteRequests() error = %v", err)
+	}
+	if len(reqs) != 2 || len(params) != 2 {
+		t.Fatalf("expected 2 requests and params, got %d and %d", len(reqs), len(params))
+	}
+}
+
+func TestBuildPropertyReadRequestsWithIndexKey(t *testing.T) {
+	device := testDeviceConfig()
+	// Simulate the selection map produced by BuildPropertyReadSelectionFromNames
+	// with name[index] format keys in the readback payload
+	reqs, bindings, err := BuildPropertyReadRequests(device, map[string]interface{}{
+		"wheels[2]": map[string]interface{}{
+			"height": true,
+		},
+		"wheels[3]": map[string]interface{}{},
+	})
+	if err != nil {
+		t.Fatalf("BuildPropertyReadRequests() error = %v", err)
+	}
+	// wheels[2] has 1 field (height), wheels[3] has all 2 fields = 3 total
+	if len(reqs) != 3 || len(bindings) != 3 {
+		t.Fatalf("expected 3 read requests and bindings, got %d and %d", len(reqs), len(bindings))
+	}
+	fieldCount := make(map[string]int)
+	for _, binding := range bindings {
+		if len(binding.Path) == 3 && binding.Path[0] == "wheels" {
+			fieldCount[binding.Path[1]+"."+binding.Path[2]]++
+		}
+	}
+	if fieldCount["2.height"] != 1 {
+		t.Fatalf("expected wheels[2].height, got %v", fieldCount)
+	}
+	if fieldCount["3.diameter"] != 1 || fieldCount["3.height"] != 1 {
+		t.Fatalf("expected wheels[3] both fields, got %v", fieldCount)
+	}
+}
+
+func TestBuildPropertyReadRequestsBackwardCompat(t *testing.T) {
+	device := testDeviceConfig()
+	reqs, bindings, err := BuildPropertyReadRequests(device, map[string]interface{}{
+		"wheels": map[string]interface{}{
+			"2": map[string]interface{}{
+				"height": true,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildPropertyReadRequests() error = %v", err)
+	}
+	if len(reqs) != 1 || len(bindings) != 1 {
+		t.Fatalf("expected 1 read request and binding, got %d and %d", len(reqs), len(bindings))
+	}
+	if len(bindings[0].Path) != 3 || bindings[0].Path[0] != "wheels" || bindings[0].Path[1] != "2" || bindings[0].Path[2] != "height" {
+		t.Fatalf("unexpected binding path: %v", bindings[0].Path)
 	}
 }

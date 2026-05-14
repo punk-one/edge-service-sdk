@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.6.7
+
+- Added `name[index]` support for property get: `BuildPropertyReadSelectionFromNames` now accepts `properties: ["wheels[1]", "wheels[1,3,5]", "wheels[1-10]"]` to read specific struct array indices instead of all items.
+- Added `name[index]` support for property set: `BuildPropertyWriteRequests` accepts `wheels[2]` payload format for single-index struct writes.
+- Added `name[index]` support for property readback: `BuildPropertyReadRequests` resolves `name[index]` keys from selection maps.
+- Added `parseStructNameWithIndices`, `parseIndexList`, `deduplicateAndSort`, and `buildStructSelectionForIndices` helper functions.
+
 ## v0.6.5
 
 - Added shared `command` and `control` packages for command descriptors, control requests/results, and common control error semantics.
