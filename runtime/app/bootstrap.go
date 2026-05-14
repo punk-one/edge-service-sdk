@@ -260,27 +260,61 @@ func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver, reg
 	workerCount := 0
 	for _, device := range config.Devices {
 		device = rtconfig.NormalizeDeviceConfig(device)
-		if len(device.Telemetry.Points) == 0 {
-			logClient.Warnf("Skipping device %s: telemetry.points is empty", device.Name)
+		hasLegacyPoints := len(device.Telemetry.Points) > 0
+		hasGroups := len(device.Telemetry.Groups) > 0
+
+		if !hasLegacyPoints && !hasGroups {
+			logClient.Warnf("Skipping device %s: no telemetry points or groups", device.Name)
 			continue
 		}
-		workerCount++
-		deviceCopy := device
-		interval := deviceCopy.Telemetry.Interval
-		if interval == "" {
-			interval = "20s"
+
+		if hasLegacyPoints {
+			workerCount++
+			deviceCopy := device
+			interval := deviceCopy.Telemetry.Interval
+			if interval == "" {
+				interval = "20s"
+			}
+			logClient.Infof(
+				"Registering telemetry worker: device=%s product=%s interval=%s points=%d connection_strategy=%s",
+				deviceCopy.Name,
+				deviceCopy.ProductCode,
+				interval,
+				len(deviceCopy.Telemetry.Points),
+				deviceCopy.ConnectionStrategy,
+			)
+			super.Start(deviceCopy.Name, func() error {
+				return runTelemetryWorker(driver, deviceCopy, sdk, logClient)
+			})
 		}
-		logClient.Infof(
-			"Registering telemetry worker: device=%s product=%s interval=%s points=%d connection_strategy=%s",
-			deviceCopy.Name,
-			deviceCopy.ProductCode,
-			interval,
-			len(deviceCopy.Telemetry.Points),
-			deviceCopy.ConnectionStrategy,
-		)
-		super.Start(deviceCopy.Name, func() error {
-			return runTelemetryWorker(driver, deviceCopy, sdk, logClient)
-		})
+
+		for _, group := range device.Telemetry.Groups {
+			if len(group.Points) == 0 {
+				continue
+			}
+			workerCount++
+			deviceCopy, groupCopy := device, group
+			interval := groupCopy.Interval
+			if interval == "" {
+				interval = deviceCopy.Telemetry.Interval
+			}
+			if interval == "" {
+				interval = "20s"
+			}
+			workerName := fmt.Sprintf("%s/%s", deviceCopy.Name, groupCopy.Name)
+			logClient.Infof(
+				"Registering telemetry group worker: device=%s group=%s product=%s interval=%s points=%d connection_strategy=%s",
+				deviceCopy.Name,
+				groupCopy.Name,
+				deviceCopy.ProductCode,
+				interval,
+				len(groupCopy.Points),
+				deviceCopy.ConnectionStrategy,
+			)
+			super.Start(workerName, func() error {
+				return runTelemetryGroupWorker(driver, deviceCopy, groupCopy, sdk, logClient)
+			})
+		}
 	}
 	if strings.TrimSpace(config.PropertyReport.Topic) != "" {
 		for _, device := range config.Devices {
@@ -419,6 +453,63 @@ func runTelemetryWorker(driver contracts.ProtocolDriver, device contracts.Device
 	}
 }
 
+func runTelemetryGroupWorker(driver contracts.ProtocolDriver, device contracts.DeviceConfig, group contracts.TelemetryGroup, sdk *DeviceSDK, logClient logger.LoggingClient) error {
+	cfg := effectiveGroupConfig(device.Telemetry, group)
+
+	interval := cfg.Interval
+	if interval == "" {
+		interval = "20s"
+	}
+
+	duration, err := time.ParseDuration(interval)
+	if err != nil {
+		return fmt.Errorf("invalid telemetry interval %s for device %s group %s: %w", interval, device.Name, group.Name, err)
+	}
+
+	reqs := make([]contracts.CommandRequest, 0, len(group.Points))
+	for _, point := range group.Points {
+		req, err := point.ToCommandRequest(point.NodeName)
+		if err != nil {
+			return fmt.Errorf("invalid telemetry point %s for device %s group %s: %w", point.Name, device.Name, group.Name, err)
+		}
+		reqs = append(reqs, req)
+	}
+
+	ticker := time.NewTicker(duration)
+	defer ticker.Stop()
+
+	state := telemetryState{
+		lastValues:    make(map[string]interface{}),
+		lastEmittedAt: make(map[string]int64),
+	}
+	for {
+		values, err := driver.HandleReadCommands(device.Name, rtconfig.ProtocolPropertiesFromConfig(device), reqs)
+		if err != nil {
+			logClient.Errorf("Telemetry read failed for device %s group %s: %v", device.Name, group.Name, err)
+		} else if shouldEmitTelemetry(cfg, values, state, time.Now()) {
+			updateTelemetryState(state, values, time.Now().UnixMilli())
+			sourceName := "telemetry"
+			if strings.TrimSpace(group.Name) != "" {
+				sourceName = group.Name
+			}
+			asyncValues := &contracts.AsyncValues{
+				TraceID:     outevent.NewTraceID(device.Name),
+				DeviceName:  device.Name,
+				SourceName:  sourceName,
+				CollectedAt: time.Now().UnixMilli(),
+				Values:      values,
+			}
+			select {
+			case sdk.asyncCh <- asyncValues:
+			default:
+				logClient.Warnf("Async channel full; dropping telemetry for %s group %s", device.Name, group.Name)
+			}
+		}
+
+		<-ticker.C
+	}
+}
+
 func runPropertyWorker(driver contracts.ProtocolDriver, device contracts.DeviceConfig, publisher mqtt.Publisher, logClient logger.LoggingClient) error {
 	duration, err := parsePropertyInterval(device.Property.Interval)
 	if err != nil {
@@ -506,14 +597,27 @@ func shouldEmitTelemetry(cfg contracts.TelemetryConfig, values []*contracts.Comm
 			return true
 		}
 
+		deadbandMatched := false
 		if pointCfg.Deadband > 0 {
 			changed, comparable := exceedsDeadband(lastValue, value.Value, pointCfg.Deadband)
 			if comparable {
+				deadbandMatched = true
 				if changed {
 					return true
 				}
-				continue
 			}
+		}
+		if pointCfg.DeadbandPercent > 0 {
+			changed, comparable := exceedsPercentDeadband(lastValue, value.Value, pointCfg.DeadbandPercent)
+			if comparable {
+				deadbandMatched = true
+				if changed {
+					return true
+				}
+			}
+		}
+		if deadbandMatched {
+			continue
 		}
 
 		onChange := cfg.OnChange
@@ -572,11 +676,44 @@ func telemetryHasFilterStrategy(cfg contracts.TelemetryConfig) bool {
 			return true
 		}
 	}
+	for _, group := range cfg.Groups {
+		if group.OnChange || len(group.WatchedFields) > 0 || strings.TrimSpace(group.HeartbeatInterval) != "" {
+			return true
+		}
+		for _, point := range group.Points {
+			if hasPointStrategy(point) {
+				return true
+			}
+		}
+	}
 	return false
 }
 
+func effectiveGroupConfig(device contracts.TelemetryConfig, group contracts.TelemetryGroup) contracts.TelemetryConfig {
+	cfg := contracts.TelemetryConfig{
+		Interval: group.Interval,
+		Points:   group.Points,
+	}
+
+	if cfg.Interval == "" {
+		cfg.Interval = device.Interval
+	}
+
+	if group.OnChange || (strings.TrimSpace(group.HeartbeatInterval) != "") || len(group.WatchedFields) > 0 {
+		cfg.OnChange = group.OnChange
+		cfg.HeartbeatInterval = group.HeartbeatInterval
+		cfg.WatchedFields = group.WatchedFields
+	} else {
+		cfg.OnChange = device.OnChange
+		cfg.HeartbeatInterval = device.HeartbeatInterval
+		cfg.WatchedFields = device.WatchedFields
+	}
+
+	return cfg
+}
+
 func hasPointStrategy(point contracts.PointConfig) bool {
-	return point.OnChange != nil || point.Deadband > 0 || strings.TrimSpace(point.HeartbeatInterval) != ""
+	return point.OnChange != nil || point.Deadband > 0 || point.DeadbandPercent > 0 || strings.TrimSpace(point.HeartbeatInterval) != ""
 }
 
 func watchedFieldSet(fields []string) map[string]struct{} {
@@ -756,6 +893,25 @@ func exceedsDeadband(previous interface{}, current interface{}, deadband float64
 		return false, false
 	}
 	return absFloat64(curr-prev) >= deadband, true
+}
+
+func exceedsPercentDeadband(previous interface{}, current interface{}, percent float64) (bool, bool) {
+	if percent <= 0 {
+		return false, false
+	}
+
+	prev, okPrev := numericValue(previous)
+	curr, okCurr := numericValue(current)
+	if !okPrev || !okCurr {
+		return false, false
+	}
+
+	if prev == 0 {
+		return curr != 0, true
+	}
+
+	pctChange := absFloat64((curr - prev) / prev * 100)
+	return pctChange >= percent, true
 }
 
 func numericValue(value interface{}) (float64, bool) {

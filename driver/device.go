@@ -61,13 +61,26 @@ type DeviceProfile struct {
 	Commands    []CommandConfig `yaml:"commands"`
 }
 
-// TelemetryConfig defines periodic telemetry collection for a device.
-type TelemetryConfig struct {
+// TelemetryGroup defines an independent polling group within telemetry.
+// Each group has its own interval, filter strategy, and points.
+// Group-level fields fall back to the parent TelemetryConfig when empty.
+type TelemetryGroup struct {
+	Name              string        `yaml:"name"`
 	Interval          string        `yaml:"interval"`
 	OnChange          bool          `yaml:"onChange"`
 	WatchedFields     []string      `yaml:"watchedFields"`
 	HeartbeatInterval string        `yaml:"heartbeatInterval"`
 	Points            []PointConfig `yaml:"points"`
+}
+
+// TelemetryConfig defines periodic telemetry collection for a device.
+type TelemetryConfig struct {
+	Interval          string           `yaml:"interval"`
+	OnChange          bool             `yaml:"onChange"`
+	WatchedFields     []string         `yaml:"watchedFields"`
+	HeartbeatInterval string           `yaml:"heartbeatInterval"`
+	Points            []PointConfig    `yaml:"points"`
+	Groups            []TelemetryGroup `yaml:"groups"`
 }
 
 // PropertyConfig defines remotely readable/writable properties for a device.
@@ -94,6 +107,7 @@ type PointConfig struct {
 	ReadWrite         string  `yaml:"readWrite"`
 	OnChange          *bool   `yaml:"onChange"`
 	Deadband          float64 `yaml:"deadband"`
+	DeadbandPercent   float64 `yaml:"deadbandPercent"`
 	HeartbeatInterval string  `yaml:"heartbeatInterval"`
 	KeepLatestOnly    bool    `yaml:"keepLatestOnly"`
 }

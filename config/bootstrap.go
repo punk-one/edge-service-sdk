@@ -319,7 +319,7 @@ func applyProfiles(devices []contracts.DeviceConfig, profiles map[string]contrac
 func mergeDeviceWithProfile(device contracts.DeviceConfig, profile contracts.DeviceProfile) contracts.DeviceConfig {
 	device = NormalizeDeviceConfig(device)
 	profile = NormalizeProfile(profile)
-	deviceHasTelemetryOverride := strings.TrimSpace(device.Telemetry.Interval) != "" || len(device.Telemetry.WatchedFields) > 0 || len(device.Telemetry.Points) > 0
+	deviceHasTelemetryOverride := strings.TrimSpace(device.Telemetry.Interval) != "" || len(device.Telemetry.WatchedFields) > 0 || len(device.Telemetry.Points) > 0 || len(device.Telemetry.Groups) > 0
 	deviceHasPropertyOverride := strings.TrimSpace(device.Property.Interval) != "" || len(device.Property.WatchedFields) > 0 || len(device.Property.Points) > 0 || len(device.Property.Structs) > 0
 	deviceHasCommandOverride := len(device.Commands) > 0
 
@@ -338,6 +338,9 @@ func mergeDeviceWithProfile(device contracts.DeviceConfig, profile contracts.Dev
 	}
 	if len(device.Telemetry.Points) == 0 && len(profile.Telemetry.Points) > 0 {
 		device.Telemetry.Points = clonePoints(profile.Telemetry.Points)
+	}
+	if len(device.Telemetry.Groups) == 0 && len(profile.Telemetry.Groups) > 0 {
+		device.Telemetry.Groups = cloneGroups(profile.Telemetry.Groups)
 	}
 	if !deviceHasTelemetryOverride {
 		device.Telemetry.OnChange = profile.Telemetry.OnChange
@@ -411,6 +414,11 @@ func NormalizeDeviceConfig(device contracts.DeviceConfig) contracts.DeviceConfig
 	for i := range device.Telemetry.Points {
 		device.Telemetry.Points[i].ValueType = contracts.NormalizedValueType(device.Telemetry.Points[i].ValueType)
 	}
+	for i := range device.Telemetry.Groups {
+		for j := range device.Telemetry.Groups[i].Points {
+			device.Telemetry.Groups[i].Points[j].ValueType = contracts.NormalizedValueType(device.Telemetry.Groups[i].Points[j].ValueType)
+		}
+	}
 	for i := range device.Property.Points {
 		device.Property.Points[i].ValueType = contracts.NormalizedValueType(device.Property.Points[i].ValueType)
 	}
@@ -432,6 +440,11 @@ func normalizeDeviceConfig(device contracts.DeviceConfig) contracts.DeviceConfig
 func NormalizeProfile(profile contracts.DeviceProfile) contracts.DeviceProfile {
 	for i := range profile.Telemetry.Points {
 		profile.Telemetry.Points[i].ValueType = contracts.NormalizedValueType(profile.Telemetry.Points[i].ValueType)
+	}
+	for i := range profile.Telemetry.Groups {
+		for j := range profile.Telemetry.Groups[i].Points {
+			profile.Telemetry.Groups[i].Points[j].ValueType = contracts.NormalizedValueType(profile.Telemetry.Groups[i].Points[j].ValueType)
+		}
 	}
 	for i := range profile.Property.Points {
 		profile.Property.Points[i].ValueType = contracts.NormalizedValueType(profile.Property.Points[i].ValueType)
@@ -457,6 +470,19 @@ func clonePoints(points []contracts.PointConfig) []contracts.PointConfig {
 	}
 	cloned := make([]contracts.PointConfig, len(points))
 	copy(cloned, points)
+	return cloned
+}
+
+func cloneGroups(groups []contracts.TelemetryGroup) []contracts.TelemetryGroup {
+	if len(groups) == 0 {
+		return nil
+	}
+	cloned := make([]contracts.TelemetryGroup, len(groups))
+	for i := range groups {
+		cloned[i] = groups[i]
+		cloned[i].Points = clonePoints(groups[i].Points)
+		cloned[i].WatchedFields = append([]string(nil), groups[i].WatchedFields...)
+	}
 	return cloned
 }
 

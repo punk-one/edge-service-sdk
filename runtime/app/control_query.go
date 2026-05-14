@@ -48,6 +48,7 @@ func buildTelemetryModelQuery(sdk *DeviceSDK) func(string) (map[string]interface
 			"watched_fields":     cloneStrings(device.Telemetry.WatchedFields),
 			"heartbeat_interval": strings.TrimSpace(device.Telemetry.HeartbeatInterval),
 			"points":             pointViews(device.Telemetry.Points),
+			"groups":             groupViews(device.Telemetry.Groups),
 		}, http.StatusOK
 	}
 }
@@ -604,8 +605,24 @@ func pointViews(points []contracts.PointConfig) []map[string]interface{} {
 			"read_write":         point.ReadWrite,
 			"on_change":          boolValue(point.OnChange),
 			"deadband":           point.Deadband,
+			"deadband_percent":   point.DeadbandPercent,
 			"heartbeat_interval": point.HeartbeatInterval,
 			"keep_latest_only":   point.KeepLatestOnly,
+		})
+	}
+	return items
+}
+
+func groupViews(groups []contracts.TelemetryGroup) []map[string]interface{} {
+	items := make([]map[string]interface{}, 0, len(groups))
+	for _, group := range groups {
+		items = append(items, map[string]interface{}{
+			"name":               group.Name,
+			"interval":           group.Interval,
+			"on_change":          group.OnChange,
+			"watched_fields":     cloneStrings(group.WatchedFields),
+			"heartbeat_interval": group.HeartbeatInterval,
+			"points":             pointViews(group.Points),
 		})
 	}
 	return items
