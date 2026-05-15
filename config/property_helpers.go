@@ -556,6 +556,15 @@ func structFieldNodeName(structDef contracts.PropertyStruct, field contracts.Pro
 		return "", fmt.Errorf("struct %s missing dbNumber", structDef.Name)
 	}
 	baseOffset := structDef.Address.BaseOffset + (index-structIndexBase(structDef))*structDef.Address.IndexStride + field.FieldOffset
+
+	if field.BitOffset != nil {
+		bit := *field.BitOffset
+		if bit < 0 || bit > 7 {
+			return "", fmt.Errorf("bitOffset %d on %s.%s out of range (0-7)", bit, structDef.Name, field.Name)
+		}
+		return fmt.Sprintf("DB%d.DBX%d.%d", structDef.Address.DBNumber, baseOffset, bit), nil
+	}
+
 	switch strings.ToLower(strings.TrimSpace(structDef.Address.Unit)) {
 	case "", "word":
 		return fmt.Sprintf("DB%d.DBW%d", structDef.Address.DBNumber, baseOffset), nil

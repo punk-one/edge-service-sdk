@@ -136,6 +136,7 @@ type PropertyStructField struct {
 	Name        string `yaml:"name"`
 	ValueType   string `yaml:"valueType"`
 	FieldOffset int    `yaml:"fieldOffset"`
+	BitOffset   *int   `yaml:"bitOffset"`
 	MaxLength   int    `yaml:"maxLength"`
 	ReadWrite   string `yaml:"readWrite"`
 }
