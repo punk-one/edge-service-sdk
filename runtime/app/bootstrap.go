@@ -260,61 +260,21 @@ func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver, reg
 	workerCount := 0
 	for _, device := range config.Devices {
 		device = rtconfig.NormalizeDeviceConfig(device)
-		hasLegacyPoints := len(device.Telemetry.Points) > 0
-		hasGroups := len(device.Telemetry.Groups) > 0
-
-		if !hasLegacyPoints && !hasGroups {
+		if len(device.Telemetry.Points) == 0 && len(device.Telemetry.Groups) == 0 {
 			logClient.Warnf("Skipping device %s: no telemetry points or groups", device.Name)
 			continue
 		}
-
-		if hasLegacyPoints {
-			workerCount++
-			deviceCopy := device
-			interval := deviceCopy.Telemetry.Interval
-			if interval == "" {
-				interval = "20s"
-			}
-			logClient.Infof(
-				"Registering telemetry worker: device=%s product=%s interval=%s points=%d connection_strategy=%s",
-				deviceCopy.Name,
-				deviceCopy.ProductCode,
-				interval,
-				len(deviceCopy.Telemetry.Points),
-				deviceCopy.ConnectionStrategy,
-			)
-			super.Start(deviceCopy.Name, func() error {
-				return runTelemetryWorker(driver, deviceCopy, sdk, logClient)
-			})
-		}
-
-		for _, group := range device.Telemetry.Groups {
-			if len(group.Points) == 0 {
-				continue
-			}
-			workerCount++
-			deviceCopy, groupCopy := device, group
-			interval := groupCopy.Interval
-			if interval == "" {
-				interval = deviceCopy.Telemetry.Interval
-			}
-			if interval == "" {
-				interval = "20s"
-			}
-			workerName := fmt.Sprintf("%s/%s", deviceCopy.Name, groupCopy.Name)
-			logClient.Infof(
-				"Registering telemetry group worker: device=%s group=%s product=%s interval=%s points=%d connection_strategy=%s",
-				deviceCopy.Name,
-				groupCopy.Name,
-				deviceCopy.ProductCode,
-				interval,
-				len(groupCopy.Points),
-				deviceCopy.ConnectionStrategy,
-			)
-			super.Start(workerName, func() error {
-				return runTelemetryGroupWorker(driver, deviceCopy, groupCopy, sdk, logClient)
-			})
-		}
+		workerCount++
+		deviceCopy := device
+		logClient.Infof(
+			"Registering merged telemetry worker: device=%s product=%s connection_strategy=%s",
+			deviceCopy.Name,
+			deviceCopy.ProductCode,
+			deviceCopy.ConnectionStrategy,
+		)
+		super.Start(deviceCopy.Name, func() error {
+			return runMergedTelemetryWorker(driver, deviceCopy, sdk, logClient)
+		})
 	}
 	if strings.TrimSpace(config.PropertyReport.Topic) != "" {
 		for _, device := range config.Devices {
@@ -406,108 +366,225 @@ func processAsyncValues(sdk *DeviceSDK, telemetrySink reliable.TelemetrySink, lo
 	}
 }
 
-func runTelemetryWorker(driver contracts.ProtocolDriver, device contracts.DeviceConfig, sdk *DeviceSDK, logClient logger.LoggingClient) error {
-	interval := device.Telemetry.Interval
-	if interval == "" {
-		interval = "20s"
-	}
-
-	duration, err := time.ParseDuration(interval)
+func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.DeviceConfig, sdk *DeviceSDK, logClient logger.LoggingClient) error {
+	gcdInterval, err := computeGCD(device.Telemetry)
 	if err != nil {
-		return fmt.Errorf("invalid telemetry interval %s for device %s: %w", interval, device.Name, err)
+		return fmt.Errorf("invalid telemetry interval for device %s: %w", device.Name, err)
 	}
 
-	reqs, err := rtconfig.BuildTelemetryRequests(device)
+	reqs, devicePointNames, groupPointNames, err := buildAllRequests(device)
 	if err != nil {
 		return fmt.Errorf("invalid telemetry points for device %s: %w", device.Name, err)
 	}
+	if len(reqs) == 0 {
+		return nil
+	}
 
-	ticker := time.NewTicker(duration)
+	hasDeviceLevel := len(devicePointNames) > 0
+	var deviceLevelState telemetryState
+	if hasDeviceLevel {
+		deviceLevelState = telemetryState{
+			lastValues:    make(map[string]interface{}),
+			lastEmittedAt: make(map[string]int64),
+		}
+	}
+
+	type groupWorkerState struct {
+		cfg   contracts.TelemetryConfig
+		names map[string]bool
+		state telemetryState
+	}
+	var groupStates []groupWorkerState
+	for _, group := range device.Telemetry.Groups {
+		if len(group.Points) == 0 {
+			continue
+		}
+		cfg := effectiveGroupConfig(device.Telemetry, group)
+		names := groupPointNames[group.Name]
+		interval := cfg.Interval
+		if interval == "" {
+			interval = "20s"
+		}
+		cfg.Interval = interval
+		groupStates = append(groupStates, groupWorkerState{
+			cfg:   cfg,
+			names: names,
+			state: telemetryState{
+				lastValues:    make(map[string]interface{}),
+				lastEmittedAt: make(map[string]int64),
+			},
+		})
+	}
+
+	deviceInterval := device.Telemetry.Interval
+	if deviceInterval == "" {
+		deviceInterval = "20s"
+	}
+
+	ticker := time.NewTicker(gcdInterval)
 	defer ticker.Stop()
 
-	state := telemetryState{
-		lastValues:    make(map[string]interface{}),
-		lastEmittedAt: make(map[string]int64),
-	}
+	tickCount := 0
 	for {
 		values, err := driver.HandleReadCommands(device.Name, rtconfig.ProtocolPropertiesFromConfig(device), reqs)
 		if err != nil {
 			logClient.Errorf("Telemetry read failed for device %s: %v", device.Name, err)
-		} else if shouldEmitTelemetry(device.Telemetry, values, state, time.Now()) {
-			updateTelemetryState(state, values, time.Now().UnixMilli())
-			asyncValues := &contracts.AsyncValues{
-				TraceID:     outevent.NewTraceID(device.Name),
-				DeviceName:  device.Name,
-				SourceName:  "telemetry",
-				CollectedAt: time.Now().UnixMilli(),
-				Values:      values,
+		} else {
+			var mergedValues []*contracts.CommandValue
+			now := time.Now()
+
+			if hasDeviceLevel && isDue(deviceInterval, gcdInterval, tickCount) {
+				deviceValues := filterValuesByNames(values, devicePointNames)
+				if shouldEmitTelemetry(device.Telemetry, deviceValues, deviceLevelState, now) {
+					updateTelemetryState(deviceLevelState, deviceValues, now.UnixMilli())
+					mergedValues = append(mergedValues, deviceValues...)
+				}
 			}
-			select {
-			case sdk.asyncCh <- asyncValues:
-			default:
-				logClient.Warnf("Async channel full; dropping telemetry for %s", device.Name)
+
+			for _, gs := range groupStates {
+				if isDue(gs.cfg.Interval, gcdInterval, tickCount) {
+					groupValues := filterValuesByNames(values, gs.names)
+					if shouldEmitTelemetry(gs.cfg, groupValues, gs.state, now) {
+						updateTelemetryState(gs.state, groupValues, now.UnixMilli())
+						mergedValues = append(mergedValues, groupValues...)
+					}
+				}
+			}
+
+			if len(mergedValues) > 0 {
+				asyncValues := &contracts.AsyncValues{
+					TraceID:     outevent.NewTraceID(device.Name),
+					DeviceName:  device.Name,
+					SourceName:  "telemetry",
+					CollectedAt: now.UnixMilli(),
+					Values:      mergedValues,
+				}
+				select {
+				case sdk.asyncCh <- asyncValues:
+				default:
+					logClient.Warnf("Async channel full; dropping telemetry for %s", device.Name)
+				}
 			}
 		}
 
 		<-ticker.C
+		tickCount++
 	}
 }
 
-func runTelemetryGroupWorker(driver contracts.ProtocolDriver, device contracts.DeviceConfig, group contracts.TelemetryGroup, sdk *DeviceSDK, logClient logger.LoggingClient) error {
-	cfg := effectiveGroupConfig(device.Telemetry, group)
-
-	interval := cfg.Interval
-	if interval == "" {
-		interval = "20s"
+// computeGCD calculates the greatest common divisor of all telemetry intervals.
+// Falls back to 20s if no intervals are configured.
+func computeGCD(tc contracts.TelemetryConfig) (time.Duration, error) {
+	var intervals []string
+	if tc.Interval != "" {
+		intervals = append(intervals, tc.Interval)
+	}
+	for _, group := range tc.Groups {
+		interval := group.Interval
+		if interval == "" {
+			interval = tc.Interval
+		}
+		if interval != "" {
+			intervals = append(intervals, interval)
+		}
+	}
+	if len(intervals) == 0 {
+		return 20 * time.Second, nil
 	}
 
-	duration, err := time.ParseDuration(interval)
+	var gcd time.Duration
+	for _, raw := range intervals {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return 0, err
+		}
+		if gcd == 0 {
+			gcd = d
+		} else {
+			gcd = gcdDuration(gcd, d)
+		}
+	}
+	return gcd, nil
+}
+
+// gcdDuration computes the GCD of two durations in nanosecond precision.
+func gcdDuration(a, b time.Duration) time.Duration {
+	na, nb := a.Nanoseconds(), b.Nanoseconds()
+	for nb != 0 {
+		na, nb = nb, na%nb
+	}
+	return time.Duration(na)
+}
+
+// isDue checks whether the current tick should emit for the given interval.
+func isDue(interval string, gcd time.Duration, tickCount int) bool {
+	d, err := time.ParseDuration(interval)
 	if err != nil {
-		return fmt.Errorf("invalid telemetry interval %s for device %s group %s: %w", interval, device.Name, group.Name, err)
+		return false
 	}
+	skip := int(d / gcd)
+	if skip <= 0 {
+		skip = 1
+	}
+	return tickCount%skip == 0
+}
 
-	reqs := make([]contracts.CommandRequest, 0, len(group.Points))
-	for _, point := range group.Points {
+// buildAllRequests builds deduplicated read requests for all telemetry points
+// (device-level and groups) and returns their names organized by origin.
+func buildAllRequests(device contracts.DeviceConfig) ([]contracts.CommandRequest, map[string]bool, map[string]map[string]bool, error) {
+	seen := make(map[string]bool)
+	var requests []contracts.CommandRequest
+	devicePointNames := make(map[string]bool)
+	groupPointNames := make(map[string]map[string]bool)
+
+	for _, point := range device.Telemetry.Points {
+		if seen[point.Name] {
+			continue
+		}
+		seen[point.Name] = true
 		req, err := point.ToCommandRequest(point.NodeName)
 		if err != nil {
-			return fmt.Errorf("invalid telemetry point %s for device %s group %s: %w", point.Name, device.Name, group.Name, err)
+			return nil, nil, nil, err
 		}
-		reqs = append(reqs, req)
+		requests = append(requests, req)
+		devicePointNames[point.Name] = true
 	}
 
-	ticker := time.NewTicker(duration)
-	defer ticker.Stop()
-
-	state := telemetryState{
-		lastValues:    make(map[string]interface{}),
-		lastEmittedAt: make(map[string]int64),
-	}
-	for {
-		values, err := driver.HandleReadCommands(device.Name, rtconfig.ProtocolPropertiesFromConfig(device), reqs)
-		if err != nil {
-			logClient.Errorf("Telemetry read failed for device %s group %s: %v", device.Name, group.Name, err)
-		} else if shouldEmitTelemetry(cfg, values, state, time.Now()) {
-			updateTelemetryState(state, values, time.Now().UnixMilli())
-			sourceName := "telemetry"
-			if strings.TrimSpace(group.Name) != "" {
-				sourceName = group.Name
+	for _, group := range device.Telemetry.Groups {
+		names := make(map[string]bool)
+		for _, point := range group.Points {
+			names[point.Name] = true
+			if seen[point.Name] {
+				continue
 			}
-			asyncValues := &contracts.AsyncValues{
-				TraceID:     outevent.NewTraceID(device.Name),
-				DeviceName:  device.Name,
-				SourceName:  sourceName,
-				CollectedAt: time.Now().UnixMilli(),
-				Values:      values,
+			seen[point.Name] = true
+			req, err := point.ToCommandRequest(point.NodeName)
+			if err != nil {
+				return nil, nil, nil, err
 			}
-			select {
-			case sdk.asyncCh <- asyncValues:
-			default:
-				logClient.Warnf("Async channel full; dropping telemetry for %s group %s", device.Name, group.Name)
-			}
+			requests = append(requests, req)
 		}
-
-		<-ticker.C
+		if len(names) > 0 {
+			groupPointNames[group.Name] = names
+		}
 	}
+
+	return requests, devicePointNames, groupPointNames, nil
+}
+
+// filterValuesByNames filters a batch read result to only include values whose
+// DeviceResourceName is in the given set.
+func filterValuesByNames(values []*contracts.CommandValue, names map[string]bool) []*contracts.CommandValue {
+	if len(names) == 0 {
+		return nil
+	}
+	filtered := make([]*contracts.CommandValue, 0, len(names))
+	for _, v := range values {
+		if names[v.DeviceResourceName] {
+			filtered = append(filtered, v)
+		}
+	}
+	return filtered
 }
 
 func runPropertyWorker(driver contracts.ProtocolDriver, device contracts.DeviceConfig, publisher mqtt.Publisher, logClient logger.LoggingClient) error {
