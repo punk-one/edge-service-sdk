@@ -372,12 +372,9 @@ func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.
 		return fmt.Errorf("invalid telemetry interval for device %s: %w", device.Name, err)
 	}
 
-	reqs, devicePointNames, groupPointNames, err := buildAllRequests(device)
+	_, devicePointNames, groupPointNames, err := buildAllRequests(device)
 	if err != nil {
 		return fmt.Errorf("invalid telemetry points for device %s: %w", device.Name, err)
-	}
-	if len(reqs) == 0 {
-		return nil
 	}
 
 	hasDeviceLevel := len(devicePointNames) > 0
@@ -392,6 +389,7 @@ func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.
 	type groupWorkerState struct {
 		cfg   contracts.TelemetryConfig
 		names map[string]bool
+		reqs  []contracts.CommandRequest
 		state telemetryState
 	}
 	var groupStates []groupWorkerState
@@ -406,9 +404,14 @@ func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.
 			interval = "20s"
 		}
 		cfg.Interval = interval
+		groupReqs, err := buildGroupRequests(group)
+		if err != nil {
+			return fmt.Errorf("invalid group %s telemetry points: %w", group.Name, err)
+		}
 		groupStates = append(groupStates, groupWorkerState{
 			cfg:   cfg,
 			names: names,
+			reqs:  groupReqs,
 			state: telemetryState{
 				lastValues:    make(map[string]interface{}),
 				lastEmittedAt: make(map[string]int64),
@@ -421,54 +424,89 @@ func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.
 		deviceInterval = "20s"
 	}
 
+	// Build device-level read requests
+	var deviceReqs []contracts.CommandRequest
+	if hasDeviceLevel {
+		for _, point := range device.Telemetry.Points {
+			req, err := point.ToCommandRequest(point.NodeName)
+			if err != nil {
+				return fmt.Errorf("invalid device telemetry point %s: %w", point.Name, err)
+			}
+			deviceReqs = append(deviceReqs, req)
+		}
+	}
+
+	if !hasDeviceLevel && len(groupStates) == 0 {
+		return nil
+	}
+
+	startTime := time.Now()
 	ticker := time.NewTicker(gcdInterval)
 	defer ticker.Stop()
+	isFirstTick := true
 
-	tickCount := 0
 	for {
-		values, err := driver.HandleReadCommands(device.Name, rtconfig.ProtocolPropertiesFromConfig(device), reqs)
-		if err != nil {
-			logClient.Errorf("Telemetry read failed for device %s: %v", device.Name, err)
-		} else {
-			var mergedValues []*contracts.CommandValue
-			now := time.Now()
+		now := time.Now()
+		elapsed := now.Sub(startTime)
 
-			if hasDeviceLevel && isDue(deviceInterval, gcdInterval, tickCount) {
-				deviceValues := filterValuesByNames(values, devicePointNames)
-				if shouldEmitTelemetry(device.Telemetry, deviceValues, deviceLevelState, now) {
-					updateTelemetryState(deviceLevelState, deviceValues, now.UnixMilli())
-					mergedValues = append(mergedValues, deviceValues...)
-				}
+		// Phase 1: 收集到期 group 的读请求
+		var dueReqs []contracts.CommandRequest
+
+		if hasDeviceLevel && (isFirstTick || isDueWallClock(deviceInterval, gcdInterval, elapsed, false)) {
+			dueReqs = append(dueReqs, deviceReqs...)
+		}
+		for i := range groupStates {
+			if isFirstTick || isDueWallClock(groupStates[i].cfg.Interval, gcdInterval, elapsed, false) {
+				dueReqs = append(dueReqs, groupStates[i].reqs...)
 			}
+		}
 
-			for _, gs := range groupStates {
-				if isDue(gs.cfg.Interval, gcdInterval, tickCount) {
-					groupValues := filterValuesByNames(values, gs.names)
-					if shouldEmitTelemetry(gs.cfg, groupValues, gs.state, now) {
-						updateTelemetryState(gs.state, groupValues, now.UnixMilli())
-						mergedValues = append(mergedValues, groupValues...)
+		// Phase 2: 读
+		if len(dueReqs) > 0 {
+			values, err := driver.HandleReadCommands(device.Name, rtconfig.ProtocolPropertiesFromConfig(device), dueReqs)
+			if err != nil {
+				logClient.Errorf("Telemetry read failed for device %s: %v", device.Name, err)
+			} else {
+				// Phase 3: 评估上报
+				var mergedValues []*contracts.CommandValue
+
+				if hasDeviceLevel && (isFirstTick || isDueWallClock(deviceInterval, gcdInterval, elapsed, false)) {
+					deviceValues := filterValuesByNames(values, devicePointNames)
+					if shouldEmitTelemetry(device.Telemetry, deviceValues, deviceLevelState, now) {
+						updateTelemetryState(deviceLevelState, deviceValues, now.UnixMilli())
+						mergedValues = append(mergedValues, deviceValues...)
 					}
 				}
-			}
-
-			if len(mergedValues) > 0 {
-				asyncValues := &contracts.AsyncValues{
-					TraceID:     outevent.NewTraceID(device.Name),
-					DeviceName:  device.Name,
-					SourceName:  "telemetry",
-					CollectedAt: now.UnixMilli(),
-					Values:      mergedValues,
+				for i := range groupStates {
+					if isFirstTick || isDueWallClock(groupStates[i].cfg.Interval, gcdInterval, elapsed, false) {
+						groupValues := filterValuesByNames(values, groupStates[i].names)
+						if shouldEmitTelemetry(groupStates[i].cfg, groupValues, groupStates[i].state, now) {
+							updateTelemetryState(groupStates[i].state, groupValues, now.UnixMilli())
+							mergedValues = append(mergedValues, groupValues...)
+						}
+					}
 				}
-				select {
-				case sdk.asyncCh <- asyncValues:
-				default:
-					logClient.Warnf("Async channel full; dropping telemetry for %s", device.Name)
+
+				// Phase 4: 发送
+				if len(mergedValues) > 0 {
+					asyncValues := &contracts.AsyncValues{
+						TraceID:     outevent.NewTraceID(device.Name),
+						DeviceName:  device.Name,
+						SourceName:  "telemetry",
+						CollectedAt: now.UnixMilli(),
+						Values:      mergedValues,
+					}
+					select {
+					case sdk.asyncCh <- asyncValues:
+					default:
+						logClient.Warnf("Async channel full; dropping telemetry for %s", device.Name)
+					}
 				}
 			}
 		}
 
+		isFirstTick = false
 		<-ticker.C
-		tickCount++
 	}
 }
 
@@ -527,6 +565,33 @@ func isDue(interval string, gcd time.Duration, tickCount int) bool {
 		skip = 1
 	}
 	return tickCount%skip == 0
+}
+
+// isDueWallClock 用 wall clock elapsed 判断 interval 边界是否被跨越。
+func isDueWallClock(interval string, gcd time.Duration, elapsed time.Duration, isFirstTick bool) bool {
+	if isFirstTick {
+		return true
+	}
+	d, err := time.ParseDuration(interval)
+	if err != nil || d <= 0 {
+		return false
+	}
+	currentSlot := elapsed.Nanoseconds() / d.Nanoseconds()
+	prevSlot := (elapsed - gcd).Nanoseconds() / d.Nanoseconds()
+	return currentSlot != prevSlot
+}
+
+// buildGroupRequests builds read requests for all points in a telemetry group.
+func buildGroupRequests(group contracts.TelemetryGroup) ([]contracts.CommandRequest, error) {
+	reqs := make([]contracts.CommandRequest, 0, len(group.Points))
+	for _, point := range group.Points {
+		req, err := point.ToCommandRequest(point.NodeName)
+		if err != nil {
+			return nil, err
+		}
+		reqs = append(reqs, req)
+	}
+	return reqs, nil
 }
 
 // buildAllRequests builds deduplicated read requests for all telemetry points

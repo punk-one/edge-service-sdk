@@ -201,3 +201,71 @@ func TestFilterValuesByNames_FiltersCorrectly(t *testing.T) {
 		t.Fatalf("second result = %s, want pressure", result[1].DeviceResourceName)
 	}
 }
+
+func TestIsDueWallClock_FirstTick(t *testing.T) {
+	if !isDueWallClock("20s", 1*time.Second, 0, true) {
+		t.Fatal("isDueWallClock should return true when isFirstTick=true")
+	}
+	if !isDueWallClock("5s", 1*time.Second, 0, true) {
+		t.Fatal("isDueWallClock should return true when isFirstTick=true")
+	}
+	if !isDueWallClock("60s", 5*time.Second, 0, true) {
+		t.Fatal("isDueWallClock should return true when isFirstTick=true")
+	}
+}
+
+func TestIsDueWallClock_BoundaryCrossed(t *testing.T) {
+	// interval=5s, gcd=1s
+	// At elapsed=5s: currentSlot=5/5=1, prevSlot=4/5=0 → crossed → due
+	if !isDueWallClock("5s", 1*time.Second, 5*time.Second, false) {
+		t.Fatal("isDueWallClock at elapsed=5s should detect boundary for 5s interval")
+	}
+	// At elapsed=6s: currentSlot=6/5=1, prevSlot=5/5=1 → same → not due
+	if isDueWallClock("5s", 1*time.Second, 6*time.Second, false) {
+		t.Fatal("isDueWallClock at elapsed=6s should NOT be due for 5s interval")
+	}
+	// At elapsed=10s: currentSlot=10/5=2, prevSlot=9/5=1 → crossed → due
+	if !isDueWallClock("5s", 1*time.Second, 10*time.Second, false) {
+		t.Fatal("isDueWallClock at elapsed=10s should detect boundary for 5s interval")
+	}
+}
+
+func TestIsDueWallClock_20sIntervalWith1sGCD(t *testing.T) {
+	// interval=20s, gcd=1s
+	// elapsed 1..19s: currentSlot = 0, prevSlot = 0 → not due
+	for e := 1; e < 20; e++ {
+		if isDueWallClock("20s", 1*time.Second, time.Duration(e)*time.Second, false) {
+			t.Fatalf("isDueWallClock at elapsed=%ds should NOT be due for 20s interval", e)
+		}
+	}
+	// elapsed=20s: currentSlot=20/20=1, prevSlot=19/20=0 → crossed → due
+	if !isDueWallClock("20s", 1*time.Second, 20*time.Second, false) {
+		t.Fatal("isDueWallClock at elapsed=20s should be due for 20s interval")
+	}
+}
+
+func TestIsDueWallClock_NoDrift(t *testing.T) {
+	// Simulate drift: if elapsed=54s with 1s GCD (tickCount only reached 54 in 60 wall seconds)
+	// 20s interval: currentSlot=54/20=2, prevSlot=53/20=2 → same → not due
+	// With wall clock: at wall elapsed=60s, currentSlot=60/20=3 → due
+	// This verifies that even if tickCount drifts, wall clock still correctly fires
+	if isDueWallClock("20s", 1*time.Second, 54*time.Second, false) {
+		t.Fatal("isDueWallClock at drifted elapsed=54s should NOT be due for 20s interval (still in slot 2)")
+	}
+	if !isDueWallClock("20s", 1*time.Second, 60*time.Second, false) {
+		t.Fatal("isDueWallClock at elapsed=60s should be due for 20s interval (crossed into slot 3)")
+	}
+	// At the correct boundary (elapsed=40s): currentSlot=40/20=2, prevSlot=39/20=1 → due
+	if !isDueWallClock("20s", 1*time.Second, 40*time.Second, false) {
+		t.Fatal("isDueWallClock at elapsed=40s should be due for 20s interval (crossed into slot 2)")
+	}
+}
+
+func TestIsDueWallClock_InvalidInterval(t *testing.T) {
+	if isDueWallClock("invalid", 1*time.Second, 5*time.Second, false) {
+		t.Fatal("isDueWallClock should return false for invalid interval")
+	}
+	if isDueWallClock("", 1*time.Second, 5*time.Second, false) {
+		t.Fatal("isDueWallClock should return false for empty interval")
+	}
+}
