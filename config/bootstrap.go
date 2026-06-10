@@ -407,6 +407,13 @@ func normalizeConfig(config Config) Config {
 }
 
 func NormalizeDeviceConfig(device contracts.DeviceConfig) contracts.DeviceConfig {
+	device.Name = strings.TrimSpace(device.Name)
+	device.SubName = strings.TrimSpace(device.SubName)
+	if device.SubName != "" {
+		device.InternalName = device.Name + "-" + device.SubName
+	} else {
+		device.InternalName = device.Name
+	}
 	device.ConnectionStrategy = strings.ToLower(strings.TrimSpace(device.ConnectionStrategy))
 	if device.ConnectionStrategy == "" {
 		device.ConnectionStrategy = "persistent"

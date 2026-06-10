@@ -594,7 +594,7 @@ func (c *runtimeCommandContext) GetProperties(names []string) (map[string]interf
 	if err != nil {
 		return nil, err
 	}
-	values, err := c.service.driver.HandleReadCommands(c.device.Name, rtconfig.ProtocolPropertiesFromConfig(c.device), commandReqs)
+	values, err := c.service.driver.HandleReadCommands(c.device.InternalName, rtconfig.ProtocolPropertiesFromConfig(c.device), commandReqs)
 	if err != nil {
 		return nil, err
 	}
@@ -606,7 +606,7 @@ func (c *runtimeCommandContext) SetProperties(values map[string]interface{}) err
 	if err != nil {
 		return err
 	}
-	return c.service.driver.HandleWriteCommands(c.device.Name, rtconfig.ProtocolPropertiesFromConfig(c.device), commandReqs, params)
+	return c.service.driver.HandleWriteCommands(c.device.InternalName, rtconfig.ProtocolPropertiesFromConfig(c.device), commandReqs, params)
 }
 
 func (c *runtimeCommandContext) ReadTelemetry(names []string) (map[string]interface{}, error) {
@@ -614,7 +614,7 @@ func (c *runtimeCommandContext) ReadTelemetry(names []string) (map[string]interf
 	if err != nil {
 		return nil, err
 	}
-	values, err := c.service.driver.HandleReadCommands(c.device.Name, rtconfig.ProtocolPropertiesFromConfig(c.device), commandReqs)
+	values, err := c.service.driver.HandleReadCommands(c.device.InternalName, rtconfig.ProtocolPropertiesFromConfig(c.device), commandReqs)
 	if err != nil {
 		return nil, err
 	}

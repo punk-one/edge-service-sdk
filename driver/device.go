@@ -40,6 +40,8 @@ func (a AdminState) String() string {
 // DeviceConfig represents device configuration loaded from YAML
 type DeviceConfig struct {
 	Name               string                 `yaml:"name"`
+	SubName            string                 `yaml:"subName"`
+	InternalName       string                 `yaml:"-"`
 	ProfileName        string                 `yaml:"profileName"`
 	ProductCode        string                 `yaml:"productCode"`
 	Description        string                 `yaml:"description"`

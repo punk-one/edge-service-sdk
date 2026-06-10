@@ -103,7 +103,7 @@ func (s *Service) ExecuteGet(req rtapi.PropertyRequest, expectedProductCode stri
 		return result, httpStatusForCode(result.Code)
 	}
 
-	values, err := s.driver.HandleReadCommands(device.Name, cfg.ProtocolPropertiesFromConfig(device), commandReqs)
+	values, err := s.driver.HandleReadCommands(device.InternalName, cfg.ProtocolPropertiesFromConfig(device), commandReqs)
 	if err != nil {
 		result := newControlResult(normalized.TraceID, ctl.CodeDriverError, err.Error(), nil)
 		s.record(normalized.DeviceCode, device.ProductCode, normalized.TraceID, result, propertyOperationGet)
@@ -147,7 +147,7 @@ func (s *Service) ExecuteSet(req rtapi.PropertyRequest, expectedProductCode stri
 		return result, httpStatusForCode(result.Code)
 	}
 
-	if err := s.driver.HandleWriteCommands(device.Name, cfg.ProtocolPropertiesFromConfig(device), commandReqs, params); err != nil {
+	if err := s.driver.HandleWriteCommands(device.InternalName, cfg.ProtocolPropertiesFromConfig(device), commandReqs, params); err != nil {
 		result := newControlResult(normalized.TraceID, ctl.CodeDriverError, err.Error(), nil)
 		s.record(normalized.DeviceCode, device.ProductCode, normalized.TraceID, result, propertyOperationSet)
 		return result, httpStatusForCode(result.Code)
@@ -560,7 +560,7 @@ func (s *Service) executePendingPropertySet(pending rtcontrol.PendingProperty, p
 		result := newControlResult(req.TraceID, ctl.CodeBadRequest, err.Error(), nil)
 		return enrichPropertyFailure(result, newPropertyProgressEvent("write", "failed", 10, propertyNames, nil, taskStart, writeStart))
 	}
-	if err := s.driver.HandleWriteCommands(device.Name, cfg.ProtocolPropertiesFromConfig(device), commandReqs, params); err != nil {
+	if err := s.driver.HandleWriteCommands(device.InternalName, cfg.ProtocolPropertiesFromConfig(device), commandReqs, params); err != nil {
 		result := newControlResult(req.TraceID, ctl.CodeDriverError, err.Error(), nil)
 		return enrichPropertyFailure(result, newPropertyProgressEvent("write", "failed", 10, propertyNames, nil, taskStart, writeStart))
 	}
@@ -611,7 +611,7 @@ func (s *Service) executePendingPropertyGet(pending rtcontrol.PendingProperty, p
 		result := newControlResult(req.TraceID, ctl.CodeBadRequest, err.Error(), nil)
 		return enrichPropertyFailure(result, newPropertyProgressEvent("read", "failed", 10, propertyNames, nil, taskStart, readStart))
 	}
-	values, err := s.driver.HandleReadCommands(device.Name, cfg.ProtocolPropertiesFromConfig(device), commandReqs)
+	values, err := s.driver.HandleReadCommands(device.InternalName, cfg.ProtocolPropertiesFromConfig(device), commandReqs)
 	if err != nil {
 		result := newControlResult(req.TraceID, ctl.CodeDriverError, err.Error(), nil)
 		return enrichPropertyFailure(result, newPropertyProgressEvent("read", "failed", 10, propertyNames, nil, taskStart, readStart))
@@ -638,7 +638,7 @@ func (s *Service) executePropertySetReadback(productCode string, req rtapi.Prope
 		post.Message = err.Error()
 		return post
 	}
-	values, err := s.driver.HandleReadCommands(device.Name, cfg.ProtocolPropertiesFromConfig(device), commandReqs)
+	values, err := s.driver.HandleReadCommands(device.InternalName, cfg.ProtocolPropertiesFromConfig(device), commandReqs)
 	if err != nil {
 		post.Code = ctl.CodeDriverError
 		post.Message = err.Error()

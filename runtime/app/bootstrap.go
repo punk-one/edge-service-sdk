@@ -30,6 +30,7 @@ type DeviceSDK struct {
 	devices        []contracts.Device
 	deviceConfigs  map[string]contracts.DeviceConfig
 	productDevices map[string][]contracts.DeviceConfig
+	nameIndex      map[string]string
 	statusTracker  *rtstatus.Tracker
 }
 
@@ -47,16 +48,20 @@ func NewDeviceSDK(config rtconfig.Config, logClient logger.LoggingClient, tracke
 	devices := make([]contracts.Device, 0, len(config.Devices))
 	deviceConfigs := make(map[string]contracts.DeviceConfig, len(config.Devices))
 	productDevices := make(map[string][]contracts.DeviceConfig)
+	nameIndex := make(map[string]string)
 
 	for _, deviceConfig := range config.Devices {
 		deviceConfig = rtconfig.NormalizeDeviceConfig(deviceConfig)
-		deviceConfigs[deviceConfig.Name] = deviceConfig
+		deviceConfigs[deviceConfig.InternalName] = deviceConfig
 		productDevices[deviceConfig.ProductCode] = append(productDevices[deviceConfig.ProductCode], deviceConfig)
+		if deviceConfig.InternalName != deviceConfig.Name {
+			nameIndex[deviceConfig.Name] = deviceConfig.InternalName
+		}
 		if tracker != nil {
-			tracker.RegisterDevice(deviceConfig.Name)
+			tracker.RegisterDevice(deviceConfig.InternalName)
 		}
 		devices = append(devices, contracts.Device{
-			Name:        deviceConfig.Name,
+			Name:        deviceConfig.InternalName,
 			ProductCode: deviceConfig.ProductCode,
 			Protocols:   rtconfig.ProtocolPropertiesFromConfig(deviceConfig),
 		})
@@ -68,6 +73,7 @@ func NewDeviceSDK(config rtconfig.Config, logClient logger.LoggingClient, tracke
 		devices:        devices,
 		deviceConfigs:  deviceConfigs,
 		productDevices: productDevices,
+		nameIndex:      nameIndex,
 		statusTracker:  tracker,
 	}
 }
@@ -86,6 +92,13 @@ func (s *DeviceSDK) Devices() []contracts.Device {
 
 func (s *DeviceSDK) DeviceConfigByName(name string) (contracts.DeviceConfig, bool) {
 	device, ok := s.deviceConfigs[name]
+	if ok {
+		return device, true
+	}
+	if resolved, exists := s.nameIndex[name]; exists {
+		device, ok = s.deviceConfigs[resolved]
+		return device, ok
+	}
 	return device, ok
 }
 
@@ -261,18 +274,18 @@ func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver, reg
 	for _, device := range config.Devices {
 		device = rtconfig.NormalizeDeviceConfig(device)
 		if len(device.Telemetry.Points) == 0 && len(device.Telemetry.Groups) == 0 {
-			logClient.Warnf("Skipping device %s: no telemetry points or groups", device.Name)
+			logClient.Warnf("Skipping device %s: no telemetry points or groups", device.InternalName)
 			continue
 		}
 		workerCount++
 		deviceCopy := device
 		logClient.Infof(
 			"Registering merged telemetry worker: device=%s product=%s connection_strategy=%s",
-			deviceCopy.Name,
+			deviceCopy.InternalName,
 			deviceCopy.ProductCode,
 			deviceCopy.ConnectionStrategy,
 		)
-		super.Start(deviceCopy.Name, func() error {
+		super.Start(deviceCopy.InternalName, func() error {
 			return runMergedTelemetryWorker(driver, deviceCopy, sdk, logClient)
 		})
 	}
@@ -281,7 +294,7 @@ func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver, reg
 			device = rtconfig.NormalizeDeviceConfig(device)
 			reqs, _, err := rtconfig.BuildAutoPropertyReadRequests(device)
 			if err != nil {
-				logClient.Warnf("Skipping property worker for device %s: invalid property config: %v", device.Name, err)
+				logClient.Warnf("Skipping property worker for device %s: invalid property config: %v", device.InternalName, err)
 				continue
 			}
 			if len(reqs) == 0 || !propertyAutoReportingEnabled(device.Property) {
@@ -290,12 +303,12 @@ func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver, reg
 			deviceCopy := device
 			logClient.Infof(
 				"Registering property worker: device=%s product=%s interval=%s points=%d",
-				deviceCopy.Name,
+				deviceCopy.InternalName,
 				deviceCopy.ProductCode,
 				strings.TrimSpace(deviceCopy.Property.Interval),
 				len(reqs),
 			)
-			super.Start(deviceCopy.Name+"-property", func() error {
+			super.Start(deviceCopy.InternalName+"-property", func() error {
 				return runPropertyWorker(driver, deviceCopy, publisher, logClient)
 			})
 		}
@@ -369,12 +382,12 @@ func processAsyncValues(sdk *DeviceSDK, telemetrySink reliable.TelemetrySink, lo
 func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.DeviceConfig, sdk *DeviceSDK, logClient logger.LoggingClient) error {
 	gcdInterval, err := computeGCD(device.Telemetry)
 	if err != nil {
-		return fmt.Errorf("invalid telemetry interval for device %s: %w", device.Name, err)
+		return fmt.Errorf("invalid telemetry interval for device %s: %w", device.InternalName, err)
 	}
 
 	_, devicePointNames, groupPointNames, err := buildAllRequests(device)
 	if err != nil {
-		return fmt.Errorf("invalid telemetry points for device %s: %w", device.Name, err)
+		return fmt.Errorf("invalid telemetry points for device %s: %w", device.InternalName, err)
 	}
 
 	hasDeviceLevel := len(devicePointNames) > 0
@@ -463,9 +476,9 @@ func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.
 
 		// Phase 2: 读
 		if len(dueReqs) > 0 {
-			values, err := driver.HandleReadCommands(device.Name, rtconfig.ProtocolPropertiesFromConfig(device), dueReqs)
+			values, err := driver.HandleReadCommands(device.InternalName, rtconfig.ProtocolPropertiesFromConfig(device), dueReqs)
 			if err != nil {
-				logClient.Errorf("Telemetry read failed for device %s: %v", device.Name, err)
+				logClient.Errorf("Telemetry read failed for device %s: %v", device.InternalName, err)
 			} else {
 				// Phase 3: 评估上报
 				var mergedValues []*contracts.CommandValue
@@ -490,8 +503,8 @@ func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.
 				// Phase 4: 发送
 				if len(mergedValues) > 0 {
 					asyncValues := &contracts.AsyncValues{
-						TraceID:     outevent.NewTraceID(device.Name),
-						DeviceName:  device.Name,
+						TraceID:     outevent.NewTraceID(device.InternalName),
+						DeviceName:  device.InternalName,
 						SourceName:  "telemetry",
 						CollectedAt: now.UnixMilli(),
 						Values:      mergedValues,
@@ -499,7 +512,7 @@ func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.
 					select {
 					case sdk.asyncCh <- asyncValues:
 					default:
-						logClient.Warnf("Async channel full; dropping telemetry for %s", device.Name)
+						logClient.Warnf("Async channel full; dropping telemetry for %s", device.InternalName)
 					}
 				}
 			}
@@ -655,12 +668,12 @@ func filterValuesByNames(values []*contracts.CommandValue, names map[string]bool
 func runPropertyWorker(driver contracts.ProtocolDriver, device contracts.DeviceConfig, publisher mqtt.Publisher, logClient logger.LoggingClient) error {
 	duration, err := parsePropertyInterval(device.Property.Interval)
 	if err != nil {
-		return fmt.Errorf("invalid property interval %s for device %s: %w", device.Property.Interval, device.Name, err)
+		return fmt.Errorf("invalid property interval %s for device %s: %w", device.Property.Interval, device.InternalName, err)
 	}
 
 	reqs, bindings, err := rtconfig.BuildAutoPropertyReadRequests(device)
 	if err != nil {
-		return fmt.Errorf("invalid property points for device %s: %w", device.Name, err)
+		return fmt.Errorf("invalid property points for device %s: %w", device.InternalName, err)
 	}
 	if len(reqs) == 0 {
 		return nil
@@ -674,9 +687,9 @@ func runPropertyWorker(driver contracts.ProtocolDriver, device contracts.DeviceC
 		lastEmittedAt: make(map[string]int64),
 	}
 	for {
-		values, err := driver.HandleReadCommands(device.Name, rtconfig.ProtocolPropertiesFromConfig(device), reqs)
+		values, err := driver.HandleReadCommands(device.InternalName, rtconfig.ProtocolPropertiesFromConfig(device), reqs)
 		if err != nil {
-			logClient.Errorf("Property read failed for device %s: %v", device.Name, err)
+			logClient.Errorf("Property read failed for device %s: %v", device.InternalName, err)
 		} else if shouldEmitProperty(device.Property, values, state, time.Now()) {
 			now := time.Now().UnixMilli()
 			updateTelemetryState(state, values, now)

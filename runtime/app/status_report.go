@@ -185,7 +185,7 @@ func (p *deviceStatusPublisher) publishHeartbeat(states []rtstatus.DeviceState, 
 
 func (p *deviceStatusPublisher) publishDeviceStatus(device contracts.DeviceConfig, deviceCode string, data statusPayloadData, now int64) error {
 	message := statusMessage{
-		DeviceCode: deviceCode,
+		DeviceCode: device.Name,
 		Time:       now,
 		Data:       data,
 	}
