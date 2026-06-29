@@ -523,3 +523,274 @@ func TestBuildPropertyReadRequestsBackwardCompat(t *testing.T) {
 		t.Fatalf("unexpected binding path: %v", bindings[0].Path)
 	}
 }
+
+func testArrayKindDeviceConfig() contracts.DeviceConfig {
+	return contracts.DeviceConfig{
+		Name:        "acm007",
+		ProductCode: "acm",
+		Property: contracts.PropertyConfig{
+			Points: []contracts.PointConfig{
+				{
+					Name:      "status_text",
+					ValueType: "String",
+					NodeName:  "DB200.DBB0",
+					MaxLength: 20,
+				},
+			},
+			Structs: []contracts.PropertyStruct{
+				{
+					Name:      "Name",
+					Kind:      "array",
+					IndexBase: 1,
+					MaxItems:  7,
+					Address: contracts.PropertyStructAddress{
+						DBNumber:    200,
+						BaseOffset:  9040,
+						IndexStride: 20,
+						Unit:        "byte",
+					},
+					Fields: []contracts.PropertyStructField{
+						{Name: "v", ValueType: "String", FieldOffset: 0, MaxLength: 18},
+					},
+				},
+				{
+					Name:      "Temps",
+					Kind:      "array",
+					IndexBase: 1,
+					MaxItems:  4,
+					Address: contracts.PropertyStructAddress{
+						DBNumber:    200,
+						BaseOffset:  100,
+						IndexStride: 4,
+						Unit:        "dword",
+					},
+					Fields: []contracts.PropertyStructField{
+						{Name: "v", ValueType: "Float32", FieldOffset: 0},
+					},
+				},
+				{
+					Name:      "Counters",
+					Kind:      "array",
+					IndexBase: 1,
+					MaxItems:  3,
+					Address: contracts.PropertyStructAddress{
+						DBNumber:    200,
+						BaseOffset:  50,
+						IndexStride: 2,
+						Unit:        "word",
+					},
+					Fields: []contracts.PropertyStructField{
+						{Name: "v", ValueType: "Int16", FieldOffset: 0},
+					},
+				},
+				{
+					Name:      "Alarms",
+					Kind:      "array",
+					IndexBase: 1,
+					MaxItems:  8,
+					Address: contracts.PropertyStructAddress{
+						DBNumber:    200,
+						BaseOffset:  150,
+						IndexStride: 1,
+						Unit:        "byte",
+					},
+					Fields: []contracts.PropertyStructField{
+						{Name: "v", ValueType: "Bool", FieldOffset: 0, BitOffset: intPtr(0)},
+					},
+				},
+			},
+		},
+	}
+}
+
+func intPtr(i int) *int { return &i }
+
+func TestBuildPropertyWriteRequestsArrayKind(t *testing.T) {
+	device := testArrayKindDeviceConfig()
+
+	// Test String array write with flat scalar value
+	reqs, params, err := BuildPropertyWriteRequests(device, map[string]interface{}{
+		"Name[2]": "轮型2",
+	})
+	if err != nil {
+		t.Fatalf("BuildPropertyWriteRequests() error = %v", err)
+	}
+	if len(reqs) != 1 || len(params) != 1 {
+		t.Fatalf("expected 1 request and param, got %d and %d", len(reqs), len(params))
+	}
+	if params[0].Value != "轮型2" {
+		t.Fatalf("expected param value '轮型2', got %v", params[0].Value)
+	}
+
+	// Test Int16 array write
+	reqs, params, err = BuildPropertyWriteRequests(device, map[string]interface{}{
+		"Counters[1]": int16(100),
+	})
+	if err != nil {
+		t.Fatalf("BuildPropertyWriteRequests() error = %v", err)
+	}
+	if len(reqs) != 1 || len(params) != 1 {
+		t.Fatalf("expected 1 request and param, got %d and %d", len(reqs), len(params))
+	}
+
+	// Test Float32 array write
+	reqs, params, err = BuildPropertyWriteRequests(device, map[string]interface{}{
+		"Temps[1]": float32(25.5),
+	})
+	if err != nil {
+		t.Fatalf("BuildPropertyWriteRequests() error = %v", err)
+	}
+	if len(reqs) != 1 || len(params) != 1 {
+		t.Fatalf("expected 1 request and param, got %d and %d", len(reqs), len(params))
+	}
+
+	// Test Bool array write
+	reqs, params, err = BuildPropertyWriteRequests(device, map[string]interface{}{
+		"Alarms[1]": true,
+	})
+	if err != nil {
+		t.Fatalf("BuildPropertyWriteRequests() error = %v", err)
+	}
+	if len(reqs) != 1 || len(params) != 1 {
+		t.Fatalf("expected 1 request and param, got %d and %d", len(reqs), len(params))
+	}
+}
+
+func TestBuildPropertyReadRequestsArrayKind(t *testing.T) {
+	device := testArrayKindDeviceConfig()
+
+	reqs, bindings, err := BuildPropertyReadRequests(device, map[string]interface{}{
+		"Name": map[string]interface{}{
+			"2": true,
+			"5": true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildPropertyReadRequests() error = %v", err)
+	}
+	if len(reqs) != 2 || len(bindings) != 2 {
+		t.Fatalf("expected 2 read requests and bindings, got %d and %d", len(reqs), len(bindings))
+	}
+	// Verify 2-element binding path (not 3)
+	for _, binding := range bindings {
+		if len(binding.Path) != 2 || binding.Path[0] != "Name" {
+			t.Fatalf("expected 2-element binding path [Name, indexKey], got %v", binding.Path)
+		}
+	}
+
+	// Verify response structure is 2-level
+	values := []*contracts.CommandValue{
+		{DeviceResourceName: "Name.2.v", Type: "String", Value: "轮型2"},
+		{DeviceResourceName: "Name.5.v", Type: "String", Value: "轮型5"},
+	}
+	response := BuildPropertyResponse(values, bindings)
+	name := response["Name"].(map[string]interface{})
+	if name["2"] != "轮型2" {
+		t.Fatalf("expected Name[2] = '轮型2', got %v", name["2"])
+	}
+	if name["5"] != "轮型5" {
+		t.Fatalf("expected Name[5] = '轮型5', got %v", name["5"])
+	}
+}
+
+func TestBuildAutoPropertyReadRequestsArrayKind(t *testing.T) {
+	device := testArrayKindDeviceConfig()
+	// Enable auto-report on Name struct
+	for i := range device.Property.Structs {
+		if device.Property.Structs[i].Name == "Name" {
+			device.Property.Structs[i].AutoReport = true
+		}
+	}
+
+	reqs, bindings, err := BuildAutoPropertyReadRequests(device)
+	if err != nil {
+		t.Fatalf("BuildAutoPropertyReadRequests() error = %v", err)
+	}
+	// 1 status_text point + 7 Name indices = 8 total
+	if len(reqs) != 8 || len(bindings) != 8 {
+		t.Fatalf("expected 8 read requests and bindings, got %d and %d", len(reqs), len(bindings))
+	}
+	// Verify Name bindings have 2-element paths
+	nameCount := 0
+	for _, binding := range bindings {
+		if binding.Path[0] == "Name" {
+			nameCount++
+			if len(binding.Path) != 2 {
+				t.Fatalf("expected 2-element path for Name binding, got %v", binding.Path)
+			}
+		}
+	}
+	if nameCount != 7 {
+		t.Fatalf("expected 7 Name bindings, got %d", nameCount)
+	}
+}
+
+func TestBuildPropertyReadSelectionArrayKind(t *testing.T) {
+	device := testArrayKindDeviceConfig()
+
+	// Full selection
+	selection, err := BuildPropertyReadSelectionFromNames(device, []string{"Name"})
+	if err != nil {
+		t.Fatalf("BuildPropertyReadSelectionFromNames() error = %v", err)
+	}
+	name, ok := selection["Name"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected Name to be map, got %T", selection["Name"])
+	}
+	if len(name) != 7 {
+		t.Fatalf("expected 7 Name indices, got %d", len(name))
+	}
+	// Each index should be true, not empty map
+	if name["1"] != true {
+		t.Fatalf("expected Name[1] selection to be true, got %#v", name["1"])
+	}
+
+	// Single index selection
+	selection, err = BuildPropertyReadSelectionFromNames(device, []string{"Name[3]"})
+	if err != nil {
+		t.Fatalf("BuildPropertyReadSelectionFromNames() error = %v", err)
+	}
+	name = selection["Name"].(map[string]interface{})
+	if len(name) != 1 || name["3"] != true {
+		t.Fatalf("expected Name[3] = true, got %#v", name)
+	}
+
+	// Range selection
+	selection, err = BuildPropertyReadSelectionFromNames(device, []string{"Name[1-3]"})
+	if err != nil {
+		t.Fatalf("BuildPropertyReadSelectionFromNames() error = %v", err)
+	}
+	name = selection["Name"].(map[string]interface{})
+	if len(name) != 3 {
+		t.Fatalf("expected 3 Name indices, got %d", len(name))
+	}
+	for _, idx := range []string{"1", "2", "3"} {
+		if name[idx] != true {
+			t.Fatalf("expected Name[%s] = true, got %#v", idx, name[idx])
+		}
+	}
+}
+
+func TestBuildPropertyWriteRequestsArrayKindBackwardCompat(t *testing.T) {
+	device := testArrayKindDeviceConfig()
+
+	// Full-object write format should also work for array kind
+	reqs, params, err := BuildPropertyWriteRequests(device, map[string]interface{}{
+		"Name": map[string]interface{}{
+			"1": "轮型1",
+			"2": "轮型2",
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildPropertyWriteRequests() error = %v", err)
+	}
+	if len(reqs) != 2 || len(params) != 2 {
+		t.Fatalf("expected 2 requests and params, got %d and %d", len(reqs), len(params))
+	}
+	if params[0].Value != "轮型1" {
+		t.Fatalf("expected '轮型1', got %v", params[0].Value)
+	}
+	if params[1].Value != "轮型2" {
+		t.Fatalf("expected '轮型2', got %v", params[1].Value)
+	}
+}

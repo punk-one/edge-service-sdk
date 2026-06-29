@@ -197,13 +197,26 @@ func BuildAutoPropertyReadRequests(device contracts.DeviceConfig) ([]contracts.C
 		for offset := 0; offset < structDef.MaxItems; offset++ {
 			index := structIndexBase(structDef) + offset
 			indexKey := strconv.Itoa(index)
-			for _, field := range structDef.Fields {
-				req, binding, err := buildStructFieldRead(structDef, field, index, indexKey)
+			if structDef.Kind == "array" {
+				if len(structDef.Fields) == 0 {
+					continue
+				}
+				field := structDef.Fields[0]
+				req, _, err := buildStructFieldRead(structDef, field, index, indexKey)
 				if err != nil {
 					return nil, nil, err
 				}
 				reqs = append(reqs, req)
-				bindings = append(bindings, binding)
+				bindings = append(bindings, PropertyBinding{Path: []string{structDef.Name, indexKey}})
+			} else {
+				for _, field := range structDef.Fields {
+					req, binding, err := buildStructFieldRead(structDef, field, index, indexKey)
+					if err != nil {
+						return nil, nil, err
+					}
+					reqs = append(reqs, req)
+					bindings = append(bindings, binding)
+				}
 			}
 		}
 	}
@@ -435,6 +448,20 @@ func buildStructWriteRequests(structDef contracts.PropertyStruct, items map[stri
 			return nil, nil, err
 		}
 
+		if structDef.Kind == "array" {
+			if len(structDef.Fields) == 0 {
+				return nil, nil, fmt.Errorf("struct %s[%s] kind=array requires at least one field", structDef.Name, indexKey)
+			}
+			field := structDef.Fields[0]
+			req, value, err := buildStructFieldWrite(structDef, field, index, indexKey, rawFields)
+			if err != nil {
+				return nil, nil, err
+			}
+			reqs = append(reqs, req)
+			params = append(params, value)
+			continue
+		}
+
 		fields, ok := rawFields.(map[string]interface{})
 		if !ok {
 			return nil, nil, fmt.Errorf("struct %s[%s] expects object payload", structDef.Name, indexKey)
@@ -467,6 +494,23 @@ func buildStructReadRequests(structDef contracts.PropertyStruct, items map[strin
 		index, err := parseStructIndex(structDef, indexKey)
 		if err != nil {
 			return nil, nil, err
+		}
+
+		if structDef.Kind == "array" {
+			if !readSelectionEnabled(rawFields) {
+				return nil, nil, fmt.Errorf("struct %s[%s] read selector must be true or empty object", structDef.Name, indexKey)
+			}
+			if len(structDef.Fields) == 0 {
+				return nil, nil, fmt.Errorf("struct %s[%s] kind=array requires at least one field", structDef.Name, indexKey)
+			}
+			field := structDef.Fields[0]
+			req, _, err := buildStructFieldRead(structDef, field, index, indexKey)
+			if err != nil {
+				return nil, nil, err
+			}
+			reqs = append(reqs, req)
+			bindings = append(bindings, PropertyBinding{Path: []string{structDef.Name, indexKey}})
+			continue
 		}
 
 		fields, ok := rawFields.(map[string]interface{})
@@ -740,7 +784,11 @@ func buildStructSelection(structDef contracts.PropertyStruct) (map[string]interf
 	items := make(map[string]interface{}, structDef.MaxItems)
 	base := structIndexBase(structDef)
 	for offset := 0; offset < structDef.MaxItems; offset++ {
-		items[strconv.Itoa(base+offset)] = map[string]interface{}{}
+		if structDef.Kind == "array" {
+			items[strconv.Itoa(base+offset)] = true
+		} else {
+			items[strconv.Itoa(base+offset)] = map[string]interface{}{}
+		}
 	}
 	return items, nil
 }
@@ -840,7 +888,11 @@ func buildStructSelectionForIndices(structDef contracts.PropertyStruct, indices 
 	}
 	items := make(map[string]interface{}, len(indices))
 	for _, idx := range indices {
-		items[strconv.Itoa(idx)] = map[string]interface{}{}
+		if structDef.Kind == "array" {
+			items[strconv.Itoa(idx)] = true
+		} else {
+			items[strconv.Itoa(idx)] = map[string]interface{}{}
+		}
 	}
 	return items, nil
 }
