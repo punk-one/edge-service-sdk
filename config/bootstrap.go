@@ -319,7 +319,7 @@ func applyProfiles(devices []contracts.DeviceConfig, profiles map[string]contrac
 func mergeDeviceWithProfile(device contracts.DeviceConfig, profile contracts.DeviceProfile) contracts.DeviceConfig {
 	device = NormalizeDeviceConfig(device)
 	profile = NormalizeProfile(profile)
-	deviceHasTelemetryOverride := strings.TrimSpace(device.Telemetry.Interval) != "" || len(device.Telemetry.WatchedFields) > 0 || len(device.Telemetry.Points) > 0 || len(device.Telemetry.Groups) > 0
+	deviceHasTelemetryOverride := strings.TrimSpace(device.Telemetry.Interval) != "" || len(device.Telemetry.WatchedFields) > 0 || len(device.Telemetry.Points) > 0 || len(device.Telemetry.Groups) > 0 || len(device.Telemetry.Structs) > 0
 	deviceHasPropertyOverride := strings.TrimSpace(device.Property.Interval) != "" || len(device.Property.WatchedFields) > 0 || len(device.Property.Points) > 0 || len(device.Property.Structs) > 0
 	deviceHasCommandOverride := len(device.Commands) > 0
 
@@ -341,6 +341,9 @@ func mergeDeviceWithProfile(device contracts.DeviceConfig, profile contracts.Dev
 	}
 	if len(device.Telemetry.Groups) == 0 && len(profile.Telemetry.Groups) > 0 {
 		device.Telemetry.Groups = cloneGroups(profile.Telemetry.Groups)
+	}
+	if len(device.Telemetry.Structs) == 0 && len(profile.Telemetry.Structs) > 0 {
+		device.Telemetry.Structs = cloneStructs(profile.Telemetry.Structs)
 	}
 	if !deviceHasTelemetryOverride {
 		device.Telemetry.OnChange = profile.Telemetry.OnChange
@@ -430,9 +433,7 @@ func NormalizeDeviceConfig(device contracts.DeviceConfig) contracts.DeviceConfig
 		device.Property.Points[i].ValueType = contracts.NormalizedValueType(device.Property.Points[i].ValueType)
 	}
 	for i := range device.Property.Structs {
-		for j := range device.Property.Structs[i].Fields {
-			device.Property.Structs[i].Fields[j].ValueType = contracts.NormalizedValueType(device.Property.Structs[i].Fields[j].ValueType)
-		}
+		normalizeFields(device.Property.Structs[i].Fields)
 	}
 	for i := range device.Commands {
 		device.Commands[i].Identifier = strings.TrimSpace(device.Commands[i].Identifier)
@@ -489,6 +490,7 @@ func cloneGroups(groups []contracts.TelemetryGroup) []contracts.TelemetryGroup {
 		cloned[i] = groups[i]
 		cloned[i].Points = clonePoints(groups[i].Points)
 		cloned[i].WatchedFields = append([]string(nil), groups[i].WatchedFields...)
+		cloned[i].Structs = cloneStructs(groups[i].Structs)
 	}
 	return cloned
 }
@@ -500,9 +502,33 @@ func cloneStructs(items []contracts.PropertyStruct) []contracts.PropertyStruct {
 	cloned := make([]contracts.PropertyStruct, len(items))
 	for i := range items {
 		cloned[i] = items[i]
-		cloned[i].Fields = append([]contracts.PropertyStructField(nil), items[i].Fields...)
+		cloned[i].Fields = cloneFields(items[i].Fields)
 	}
 	return cloned
+}
+
+func cloneFields(fields []contracts.PropertyStructField) []contracts.PropertyStructField {
+	if len(fields) == 0 {
+		return nil
+	}
+	cloned := make([]contracts.PropertyStructField, len(fields))
+	for i := range fields {
+		cloned[i] = fields[i]
+		if len(fields[i].Fields) > 0 {
+			cloned[i].Fields = cloneFields(fields[i].Fields)
+		}
+	}
+	return cloned
+}
+
+func normalizeFields(fields []contracts.PropertyStructField) {
+	for i := range fields {
+		if fields[i].IsScalar() {
+			fields[i].ValueType = contracts.NormalizedValueType(fields[i].ValueType)
+		} else {
+			normalizeFields(fields[i].Fields)
+		}
+	}
 }
 
 func cloneCommands(items []contracts.CommandConfig) []contracts.CommandConfig {

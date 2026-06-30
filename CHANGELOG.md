@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.7.5
+
+- Added `kind: struct` support for standalone structs (no index) with multi-field nested structures.
+- Added recursive `PropertyStructField` with `Kind`, `Fields`, `MaxItems`, `IndexStride` for nesting struct/array sub-types (max 2 array levels).
+- Added `IsScalar()`, `IsStruct()`, `IsArray()` helper methods on `PropertyStructField`.
+- Unified `struct_array` and `array` (multi-field) into a single code path; `struct_array` retains full backward compatibility.
+- Added cumulative offset address calculation via `structFieldNodeNameWithOffset` for nested struct/array fields.
+- Added `flattenStructFields` with depth limit (2 array levels) for config-driven field expansion.
+- Rewrote `buildStructWriteRequests` as input-driven recursive traversal — only fields present in the input generate PLC write operations.
+- Added `buildStructWriteFields`, `buildNestedArrayWrite` for recursive write handling.
+- Rewrote `buildStructReadRequests` to support `kind: struct` and nested fields.
+- Added `buildStructReadFields`, `buildNestedArrayRead` for recursive read handling.
+- Added `buildStructFieldSelection` for recursive selection map generation.
+- Updated `BuildAutoPropertyReadRequests` to support `kind: struct`.
+- Added `Structs []PropertyStruct` to `TelemetryConfig` and `TelemetryGroup` for telemetry struct support.
+- Added `BuildTelemetryStructReadRequests` for auto-report telemetry struct read request generation.
+- Integrated telemetry struct reads into `runMergedTelemetryWorker` — struct values assembled via `BuildPropertyResponse` and emitted as Object `CommandValue`.
+- Updated `normalizeFields`, `cloneFields`, `cloneGroups`, `cloneStructs` for recursive field handling.
+- Updated `mergeDeviceWithProfile` to merge `Telemetry.Structs`.
+
 ## v0.6.7
 
 - Added `name[index]` support for property get: `BuildPropertyReadSelectionFromNames` now accepts `properties: ["wheels[1]", "wheels[1,3,5]", "wheels[1-10]"]` to read specific struct array indices instead of all items.

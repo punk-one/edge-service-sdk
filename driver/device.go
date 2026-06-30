@@ -67,12 +67,13 @@ type DeviceProfile struct {
 // Each group has its own interval, filter strategy, and points.
 // Group-level fields fall back to the parent TelemetryConfig when empty.
 type TelemetryGroup struct {
-	Name              string        `yaml:"name"`
-	Interval          string        `yaml:"interval"`
-	OnChange          bool          `yaml:"onChange"`
-	WatchedFields     []string      `yaml:"watchedFields"`
-	HeartbeatInterval string        `yaml:"heartbeatInterval"`
-	Points            []PointConfig `yaml:"points"`
+	Name              string           `yaml:"name"`
+	Interval          string           `yaml:"interval"`
+	OnChange          bool             `yaml:"onChange"`
+	WatchedFields     []string         `yaml:"watchedFields"`
+	HeartbeatInterval string           `yaml:"heartbeatInterval"`
+	Points            []PointConfig    `yaml:"points"`
+	Structs           []PropertyStruct `yaml:"structs"`
 }
 
 // TelemetryConfig defines periodic telemetry collection for a device.
@@ -83,6 +84,7 @@ type TelemetryConfig struct {
 	HeartbeatInterval string           `yaml:"heartbeatInterval"`
 	Points            []PointConfig    `yaml:"points"`
 	Groups            []TelemetryGroup `yaml:"groups"`
+	Structs           []PropertyStruct `yaml:"structs"`
 }
 
 // PropertyConfig defines remotely readable/writable properties for a device.
@@ -141,7 +143,25 @@ type PropertyStructField struct {
 	BitOffset   *int   `yaml:"bitOffset"`
 	MaxLength   int    `yaml:"maxLength"`
 	ReadWrite   string `yaml:"readWrite"`
+	// Kind specifies the field's structural type: "struct" or "array".
+	// Empty means the field is a scalar (ValueType is used).
+	Kind string `yaml:"kind,omitempty"`
+	// Fields contains sub-fields when Kind is "struct" or "array" (struct element).
+	Fields []PropertyStructField `yaml:"fields,omitempty"`
+	// MaxItems limits the number of elements when Kind is "array".
+	MaxItems int `yaml:"maxItems,omitempty"`
+	// IndexStride is the byte stride between array elements when Kind is "array".
+	IndexStride int `yaml:"indexStride,omitempty"`
 }
+
+// IsScalar reports whether this field is a scalar (no sub-structure).
+func (f PropertyStructField) IsScalar() bool { return f.Kind == "" }
+
+// IsStruct reports whether this field is a standalone struct.
+func (f PropertyStructField) IsStruct() bool { return f.Kind == "struct" }
+
+// IsArray reports whether this field is an array.
+func (f PropertyStructField) IsArray() bool { return f.Kind == "array" }
 
 // CommandConfig declares one remotely callable command supported by a device/profile.
 type CommandConfig struct {

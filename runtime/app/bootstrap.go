@@ -8,6 +8,7 @@ import (
 
 	rtauth "github.com/punk-one/edge-service-sdk/auth"
 	cmdapi "github.com/punk-one/edge-service-sdk/command"
+	appconfig "github.com/punk-one/edge-service-sdk/config"
 	contracts "github.com/punk-one/edge-service-sdk/driver"
 	logger "github.com/punk-one/edge-service-sdk/logging"
 	httpserver "github.com/punk-one/edge-service-sdk/ops/http"
@@ -390,7 +391,13 @@ func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.
 		return fmt.Errorf("invalid telemetry points for device %s: %w", device.InternalName, err)
 	}
 
-	hasDeviceLevel := len(devicePointNames) > 0
+	// Build telemetry struct read requests (device-level and group-level).
+	deviceStructReqs, deviceStructBindings, err := appconfig.BuildTelemetryStructReadRequests(device.Telemetry.Structs)
+	if err != nil {
+		return fmt.Errorf("invalid device telemetry structs for device %s: %w", device.InternalName, err)
+	}
+
+	hasDeviceLevel := len(devicePointNames) > 0 || len(deviceStructReqs) > 0
 	var deviceLevelState telemetryState
 	if hasDeviceLevel {
 		deviceLevelState = telemetryState{
@@ -400,14 +407,16 @@ func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.
 	}
 
 	type groupWorkerState struct {
-		cfg   contracts.TelemetryConfig
-		names map[string]bool
-		reqs  []contracts.CommandRequest
-		state telemetryState
+		cfg            contracts.TelemetryConfig
+		names          map[string]bool
+		reqs           []contracts.CommandRequest
+		structReqs     []contracts.CommandRequest
+		structBindings []appconfig.PropertyBinding
+		state          telemetryState
 	}
 	var groupStates []groupWorkerState
 	for _, group := range device.Telemetry.Groups {
-		if len(group.Points) == 0 {
+		if len(group.Points) == 0 && len(group.Structs) == 0 {
 			continue
 		}
 		cfg := effectiveGroupConfig(device.Telemetry, group)
@@ -421,10 +430,16 @@ func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.
 		if err != nil {
 			return fmt.Errorf("invalid group %s telemetry points: %w", group.Name, err)
 		}
+		groupStructReqs, groupStructBindings, err := appconfig.BuildTelemetryStructReadRequests(group.Structs)
+		if err != nil {
+			return fmt.Errorf("invalid group %s telemetry structs: %w", group.Name, err)
+		}
 		groupStates = append(groupStates, groupWorkerState{
-			cfg:   cfg,
-			names: names,
-			reqs:  groupReqs,
+			cfg:            cfg,
+			names:          names,
+			reqs:           groupReqs,
+			structReqs:     groupStructReqs,
+			structBindings: groupStructBindings,
 			state: telemetryState{
 				lastValues:    make(map[string]interface{}),
 				lastEmittedAt: make(map[string]int64),
@@ -439,7 +454,7 @@ func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.
 
 	// Build device-level read requests
 	var deviceReqs []contracts.CommandRequest
-	if hasDeviceLevel {
+	if len(devicePointNames) > 0 {
 		for _, point := range device.Telemetry.Points {
 			req, err := point.ToCommandRequest(point.NodeName)
 			if err != nil {
@@ -464,13 +479,20 @@ func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.
 
 		// Phase 1: 收集到期 group 的读请求
 		var dueReqs []contracts.CommandRequest
+		deviceStructReqCount := 0
+		groupStructReqCounts := make([]int, len(groupStates))
 
 		if hasDeviceLevel && (isFirstTick || isDueWallClock(deviceInterval, gcdInterval, elapsed, false)) {
 			dueReqs = append(dueReqs, deviceReqs...)
+			dueReqs = append(dueReqs, deviceStructReqs...)
+			deviceStructReqCount = len(deviceStructReqs)
 		}
+		groupStructReqCounts = make([]int, len(groupStates))
 		for i := range groupStates {
 			if isFirstTick || isDueWallClock(groupStates[i].cfg.Interval, gcdInterval, elapsed, false) {
 				dueReqs = append(dueReqs, groupStates[i].reqs...)
+				dueReqs = append(dueReqs, groupStates[i].structReqs...)
+				groupStructReqCounts[i] = len(groupStates[i].structReqs)
 			}
 		}
 
@@ -483,19 +505,60 @@ func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.
 				// Phase 3: 评估上报
 				var mergedValues []*contracts.CommandValue
 
+				// Process device-level values
 				if hasDeviceLevel && (isFirstTick || isDueWallClock(deviceInterval, gcdInterval, elapsed, false)) {
-					deviceValues := filterValuesByNames(values, devicePointNames)
+					devicePointCount := len(deviceReqs)
+					pointValues := values[:devicePointCount]
+					structValues := values[devicePointCount : devicePointCount+deviceStructReqCount]
+					remaining := values[devicePointCount+deviceStructReqCount:]
+
+					deviceValues := filterValuesByNames(pointValues, devicePointNames)
 					if shouldEmitTelemetry(device.Telemetry, deviceValues, deviceLevelState, now) {
 						updateTelemetryState(deviceLevelState, deviceValues, now.UnixMilli())
 						mergedValues = append(mergedValues, deviceValues...)
 					}
+
+					// Assemble device-level struct values
+					if len(structValues) > 0 && len(deviceStructBindings) > 0 {
+						structMaps := appconfig.BuildPropertyResponse(structValues, deviceStructBindings)
+						for structName, structVal := range structMaps {
+							cv, err := contracts.NewCommandValue(structName, "Object", structVal)
+							if err != nil {
+								logClient.Warnf("Failed to create struct command value %s: %v", structName, err)
+								continue
+							}
+							mergedValues = append(mergedValues, cv)
+						}
+					}
+
+					values = remaining
 				}
+
+				// Process group-level values
 				for i := range groupStates {
 					if isFirstTick || isDueWallClock(groupStates[i].cfg.Interval, gcdInterval, elapsed, false) {
-						groupValues := filterValuesByNames(values, groupStates[i].names)
+						groupPointCount := len(groupStates[i].reqs)
+						pointValues := values[:groupPointCount]
+						structValues := values[groupPointCount : groupPointCount+groupStructReqCounts[i]]
+						values = values[groupPointCount+groupStructReqCounts[i]:]
+
+						groupValues := filterValuesByNames(pointValues, groupStates[i].names)
 						if shouldEmitTelemetry(groupStates[i].cfg, groupValues, groupStates[i].state, now) {
 							updateTelemetryState(groupStates[i].state, groupValues, now.UnixMilli())
 							mergedValues = append(mergedValues, groupValues...)
+						}
+
+						// Assemble group-level struct values
+						if len(structValues) > 0 && len(groupStates[i].structBindings) > 0 {
+							structMaps := appconfig.BuildPropertyResponse(structValues, groupStates[i].structBindings)
+							for structName, structVal := range structMaps {
+								cv, err := contracts.NewCommandValue(structName, "Object", structVal)
+								if err != nil {
+									logClient.Warnf("Failed to create group struct command value %s: %v", structName, err)
+									continue
+								}
+								mergedValues = append(mergedValues, cv)
+							}
 						}
 					}
 				}
@@ -696,7 +759,7 @@ func runPropertyWorker(driver contracts.ProtocolDriver, device contracts.DeviceC
 			_ = publisher.PublishPropertyReport(device, map[string]interface{}{
 				"device_code": device.Name,
 				"time":        now,
-				"data":        rtconfig.BuildPropertyResponse(values, bindings),
+				"data":        appconfig.BuildPropertyResponse(values, bindings),
 			})
 		}
 

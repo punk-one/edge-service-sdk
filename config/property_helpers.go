@@ -20,6 +20,13 @@ type PropertyBinding struct {
 
 type propertyBinding = PropertyBinding
 
+// leafField represents a flattened leaf field with its accumulated path and offset.
+type leafField struct {
+	Field        contracts.PropertyStructField
+	PathPrefix   []string // path segments from root to this leaf
+	OffsetPrefix int      // cumulative byte offset from root
+}
+
 func ParsePropertyRequest(payload []byte) (rtapi.PropertyRequest, error) {
 	var req rtapi.PropertyRequest
 	if err := json.Unmarshal(payload, &req); err != nil {
@@ -29,6 +36,66 @@ func ParsePropertyRequest(payload []byte) (rtapi.PropertyRequest, error) {
 		req.Data = make(map[string]interface{})
 	}
 	return req, nil
+}
+
+// flattenStructFields recursively expands nested struct/array fields into leaf fields.
+// arrayDepth tracks the current nesting level of arrays; exceeding 2 returns an error.
+func flattenStructFields(
+	fields []contracts.PropertyStructField,
+	pathPrefix []string,
+	offsetPrefix int,
+	arrayDepth int,
+) ([]leafField, error) {
+	var leaves []leafField
+
+	for _, field := range fields {
+		switch {
+		case field.IsScalar():
+			leaves = append(leaves, leafField{
+				Field:        field,
+				PathPrefix:   append(append([]string(nil), pathPrefix...), field.Name),
+				OffsetPrefix: offsetPrefix + field.FieldOffset,
+			})
+
+		case field.IsStruct():
+			sub, err := flattenStructFields(field.Fields,
+				append(append([]string(nil), pathPrefix...), field.Name),
+				offsetPrefix+field.FieldOffset,
+				arrayDepth,
+			)
+			if err != nil {
+				return nil, err
+			}
+			leaves = append(leaves, sub...)
+
+		case field.IsArray():
+			if arrayDepth >= 2 {
+				return nil, fmt.Errorf("field %s: array nesting exceeds maximum depth of 2", field.Name)
+			}
+			if field.MaxItems <= 0 {
+				continue
+			}
+			base := 1 // default index base for nested arrays
+			for offset := 0; offset < field.MaxItems; offset++ {
+				index := base + offset
+				indexKey := strconv.Itoa(index)
+				sub, err := flattenStructFields(field.Fields,
+					append(append([]string(nil), pathPrefix...), field.Name, indexKey),
+					offsetPrefix+field.FieldOffset+offset*field.IndexStride,
+					arrayDepth+1,
+				)
+				if err != nil {
+					return nil, err
+				}
+				leaves = append(leaves, sub...)
+			}
+
+		default:
+			return nil, fmt.Errorf("field %s: unsupported kind %q", field.Name, field.Kind)
+		}
+	}
+
+	return leaves, nil
 }
 
 func ProtocolPropertiesFromConfig(device contracts.DeviceConfig) map[string]contracts.ProtocolProperties {
@@ -191,33 +258,56 @@ func BuildAutoPropertyReadRequests(device contracts.DeviceConfig) ([]contracts.C
 	}
 
 	for _, structDef := range device.Property.Structs {
-		if !structDef.AutoReport || structDef.MaxItems <= 0 {
+		if !structDef.AutoReport {
 			continue
 		}
-		for offset := 0; offset < structDef.MaxItems; offset++ {
-			index := structIndexBase(structDef) + offset
-			indexKey := strconv.Itoa(index)
-			if structDef.Kind == "array" {
-				if len(structDef.Fields) == 0 {
-					continue
-				}
-				field := structDef.Fields[0]
-				req, _, err := buildStructFieldRead(structDef, field, index, indexKey)
-				if err != nil {
-					return nil, nil, err
-				}
-				reqs = append(reqs, req)
-				bindings = append(bindings, PropertyBinding{Path: []string{structDef.Name, indexKey}})
-			} else {
-				for _, field := range structDef.Fields {
-					req, binding, err := buildStructFieldRead(structDef, field, index, indexKey)
+
+		effectiveKind := structDef.Kind
+		if effectiveKind == "struct_array" {
+			effectiveKind = "array"
+		}
+
+		switch effectiveKind {
+		case "struct":
+			if len(structDef.Fields) == 0 {
+				continue
+			}
+			subReqs, subBindings, err := buildStructReadFields(structDef, structDef.Fields, nil, []string{structDef.Name}, 0)
+			if err != nil {
+				return nil, nil, err
+			}
+			reqs = append(reqs, subReqs...)
+			bindings = append(bindings, subBindings...)
+
+		case "array":
+			if structDef.MaxItems <= 0 {
+				continue
+			}
+			for offset := 0; offset < structDef.MaxItems; offset++ {
+				index := structIndexBase(structDef) + offset
+				indexKey := strconv.Itoa(index)
+				indexOffset := (index - structIndexBase(structDef)) * structDef.Address.IndexStride
+
+				if len(structDef.Fields) == 1 && structDef.Fields[0].IsScalar() {
+					field := structDef.Fields[0]
+					req, err := buildStructFieldReadWithOffset(structDef, field, indexOffset)
 					if err != nil {
 						return nil, nil, err
 					}
 					reqs = append(reqs, req)
-					bindings = append(bindings, binding)
+					bindings = append(bindings, PropertyBinding{Path: []string{structDef.Name, indexKey}})
+				} else {
+					subReqs, subBindings, err := buildStructReadFields(structDef, structDef.Fields, nil, []string{structDef.Name, indexKey}, indexOffset)
+					if err != nil {
+						return nil, nil, err
+					}
+					reqs = append(reqs, subReqs...)
+					bindings = append(bindings, subBindings...)
 				}
 			}
+
+		default:
+			return nil, nil, fmt.Errorf("unsupported struct kind %q for %s", structDef.Kind, structDef.Name)
 		}
 	}
 
@@ -438,47 +528,145 @@ func findPropertyStruct(device contracts.DeviceConfig, name string) (contracts.P
 }
 
 func buildStructWriteRequests(structDef contracts.PropertyStruct, items map[string]interface{}) ([]contracts.CommandRequest, []*contracts.CommandValue, error) {
+	effectiveKind := structDef.Kind
+	if effectiveKind == "struct_array" {
+		effectiveKind = "array"
+	}
+
+	switch effectiveKind {
+	case "struct":
+		return buildStructWriteFields(structDef, structDef.Fields, items, 0)
+
+	case "array":
+		var reqs []contracts.CommandRequest
+		var params []*contracts.CommandValue
+
+		for _, indexKey := range sortedStructIndexKeys(items) {
+			rawFields := items[indexKey]
+			index, err := parseStructIndex(structDef, indexKey)
+			if err != nil {
+				return nil, nil, err
+			}
+			indexOffset := (index - structIndexBase(structDef)) * structDef.Address.IndexStride
+
+			// Determine if this is a scalar array (single scalar field) or struct array (multi-field).
+			if len(structDef.Fields) == 1 && structDef.Fields[0].IsScalar() {
+				field := structDef.Fields[0]
+				req, value, err := buildStructFieldWriteWithOffset(structDef, field, indexKey, indexOffset, rawFields)
+				if err != nil {
+					return nil, nil, err
+				}
+				reqs = append(reqs, req)
+				params = append(params, value)
+			} else {
+				fields, ok := rawFields.(map[string]interface{})
+				if !ok {
+					return nil, nil, fmt.Errorf("struct %s[%s] expects object payload", structDef.Name, indexKey)
+				}
+				subReqs, subParams, err := buildStructWriteFields(structDef, structDef.Fields, fields, indexOffset)
+				if err != nil {
+					return nil, nil, err
+				}
+				reqs = append(reqs, subReqs...)
+				params = append(params, subParams...)
+			}
+		}
+
+		return reqs, params, nil
+
+	default:
+		return nil, nil, fmt.Errorf("unsupported struct kind %q for %s", structDef.Kind, structDef.Name)
+	}
+}
+
+// buildStructWriteFields processes a map of field-name -> value for write, recursively
+// handling nested struct and array fields. cumulativeOffset is the byte offset from ancestors.
+func buildStructWriteFields(structDef contracts.PropertyStruct, fields []contracts.PropertyStructField, input map[string]interface{}, cumulativeOffset int) ([]contracts.CommandRequest, []*contracts.CommandValue, error) {
 	var reqs []contracts.CommandRequest
 	var params []*contracts.CommandValue
 
-	for _, indexKey := range sortedStructIndexKeys(items) {
-		rawFields := items[indexKey]
-		index, err := parseStructIndex(structDef, indexKey)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		if structDef.Kind == "array" {
-			if len(structDef.Fields) == 0 {
-				return nil, nil, fmt.Errorf("struct %s[%s] kind=array requires at least one field", structDef.Name, indexKey)
-			}
-			field := structDef.Fields[0]
-			req, value, err := buildStructFieldWrite(structDef, field, index, indexKey, rawFields)
-			if err != nil {
-				return nil, nil, err
-			}
-			reqs = append(reqs, req)
-			params = append(params, value)
-			continue
-		}
-
-		fields, ok := rawFields.(map[string]interface{})
+	for _, fieldName := range sortedKeys(input) {
+		raw := input[fieldName]
+		field, ok := findStructFieldByList(fields, fieldName)
 		if !ok {
-			return nil, nil, fmt.Errorf("struct %s[%s] expects object payload", structDef.Name, indexKey)
+			return nil, nil, fmt.Errorf("unknown struct field %q on %s", fieldName, structDef.Name)
 		}
 
-		for _, fieldName := range sortedKeys(fields) {
-			raw := fields[fieldName]
-			field, ok := findStructField(structDef, fieldName)
-			if !ok {
-				return nil, nil, fmt.Errorf("unknown struct field %q on %s", fieldName, structDef.Name)
-			}
-			req, value, err := buildStructFieldWrite(structDef, field, index, indexKey, raw)
+		switch {
+		case field.IsScalar():
+			req, value, err := buildStructFieldWriteWithOffset(structDef, field, fieldName, cumulativeOffset, raw)
 			if err != nil {
 				return nil, nil, err
 			}
 			reqs = append(reqs, req)
 			params = append(params, value)
+
+		case field.IsStruct():
+			subInput, ok := raw.(map[string]interface{})
+			if !ok {
+				return nil, nil, fmt.Errorf("struct field %s.%s expects object payload", structDef.Name, fieldName)
+			}
+			subReqs, subParams, err := buildStructWriteFields(structDef, field.Fields, subInput, cumulativeOffset+field.FieldOffset)
+			if err != nil {
+				return nil, nil, err
+			}
+			reqs = append(reqs, subReqs...)
+			params = append(params, subParams...)
+
+		case field.IsArray():
+			subInput, ok := raw.(map[string]interface{})
+			if !ok {
+				return nil, nil, fmt.Errorf("array field %s.%s expects object payload with index keys", structDef.Name, fieldName)
+			}
+			subReqs, subParams, err := buildNestedArrayWrite(structDef, field, subInput, cumulativeOffset+field.FieldOffset)
+			if err != nil {
+				return nil, nil, err
+			}
+			reqs = append(reqs, subReqs...)
+			params = append(params, subParams...)
+
+		default:
+			return nil, nil, fmt.Errorf("field %s.%s: unsupported kind %q", structDef.Name, fieldName, field.Kind)
+		}
+	}
+
+	return reqs, params, nil
+}
+
+// buildNestedArrayWrite handles writes to a nested array field (input-driven).
+func buildNestedArrayWrite(structDef contracts.PropertyStruct, field contracts.PropertyStructField, input map[string]interface{}, cumulativeOffset int) ([]contracts.CommandRequest, []*contracts.CommandValue, error) {
+	var reqs []contracts.CommandRequest
+	var params []*contracts.CommandValue
+
+	for _, indexKey := range sortedStructIndexKeys(input) {
+		raw := input[indexKey]
+		index, err := strconv.Atoi(indexKey)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid nested array index %q on %s.%s", indexKey, structDef.Name, field.Name)
+		}
+		indexOffset := cumulativeOffset + index*field.IndexStride
+
+		if len(field.Fields) == 1 && field.Fields[0].IsScalar() {
+			// scalar element
+			subField := field.Fields[0]
+			req, value, err := buildStructFieldWriteWithOffset(structDef, subField, indexKey, indexOffset, raw)
+			if err != nil {
+				return nil, nil, err
+			}
+			reqs = append(reqs, req)
+			params = append(params, value)
+		} else {
+			// struct element
+			subInput, ok := raw.(map[string]interface{})
+			if !ok {
+				return nil, nil, fmt.Errorf("nested array %s.%s[%s] expects object payload", structDef.Name, field.Name, indexKey)
+			}
+			subReqs, subParams, err := buildStructWriteFields(structDef, field.Fields, subInput, indexOffset)
+			if err != nil {
+				return nil, nil, err
+			}
+			reqs = append(reqs, subReqs...)
+			params = append(params, subParams...)
 		}
 	}
 
@@ -486,79 +674,281 @@ func buildStructWriteRequests(structDef contracts.PropertyStruct, items map[stri
 }
 
 func buildStructReadRequests(structDef contracts.PropertyStruct, items map[string]interface{}) ([]contracts.CommandRequest, []PropertyBinding, error) {
-	var reqs []contracts.CommandRequest
-	var bindings []PropertyBinding
+	effectiveKind := structDef.Kind
+	if effectiveKind == "struct_array" {
+		effectiveKind = "array"
+	}
 
-	for _, indexKey := range sortedStructIndexKeys(items) {
-		rawFields := items[indexKey]
-		index, err := parseStructIndex(structDef, indexKey)
-		if err != nil {
-			return nil, nil, err
-		}
+	switch effectiveKind {
+	case "struct":
+		// items maps field names to selections
+		return buildStructReadFields(structDef, structDef.Fields, items, []string{structDef.Name}, 0)
 
-		if structDef.Kind == "array" {
-			if !readSelectionEnabled(rawFields) {
-				return nil, nil, fmt.Errorf("struct %s[%s] read selector must be true or empty object", structDef.Name, indexKey)
-			}
-			if len(structDef.Fields) == 0 {
-				return nil, nil, fmt.Errorf("struct %s[%s] kind=array requires at least one field", structDef.Name, indexKey)
-			}
-			field := structDef.Fields[0]
-			req, _, err := buildStructFieldRead(structDef, field, index, indexKey)
+	case "array":
+		var reqs []contracts.CommandRequest
+		var bindings []PropertyBinding
+
+		for _, indexKey := range sortedStructIndexKeys(items) {
+			rawFields := items[indexKey]
+			index, err := parseStructIndex(structDef, indexKey)
 			if err != nil {
 				return nil, nil, err
 			}
-			reqs = append(reqs, req)
-			bindings = append(bindings, PropertyBinding{Path: []string{structDef.Name, indexKey}})
-			continue
-		}
+			indexOffset := (index - structIndexBase(structDef)) * structDef.Address.IndexStride
 
-		fields, ok := rawFields.(map[string]interface{})
-		if !ok {
-			return nil, nil, fmt.Errorf("struct %s[%s] expects object payload", structDef.Name, indexKey)
-		}
-
-		if len(fields) == 0 {
-			for _, field := range structDef.Fields {
-				req, binding, err := buildStructFieldRead(structDef, field, index, indexKey)
+			// Scalar array: single scalar field
+			if len(structDef.Fields) == 1 && structDef.Fields[0].IsScalar() {
+				if !readSelectionEnabled(rawFields) {
+					return nil, nil, fmt.Errorf("struct %s[%s] read selector must be true or empty object", structDef.Name, indexKey)
+				}
+				field := structDef.Fields[0]
+				req, err := buildStructFieldReadWithOffset(structDef, field, indexOffset)
 				if err != nil {
 					return nil, nil, err
 				}
 				reqs = append(reqs, req)
-				bindings = append(bindings, binding)
+				bindings = append(bindings, PropertyBinding{Path: []string{structDef.Name, indexKey}})
+				continue
 			}
-			continue
+
+			// Struct array
+			fields, ok := rawFields.(map[string]interface{})
+			if !ok {
+				return nil, nil, fmt.Errorf("struct %s[%s] expects object payload", structDef.Name, indexKey)
+			}
+
+			// Empty selection = all fields
+			if len(fields) == 0 {
+				for _, field := range structDef.Fields {
+					if field.IsScalar() {
+						req, err := buildStructFieldReadWithOffset(structDef, field, indexOffset)
+						if err != nil {
+							return nil, nil, err
+						}
+						reqs = append(reqs, req)
+						bindings = append(bindings, PropertyBinding{Path: []string{structDef.Name, indexKey, field.Name}})
+					} else {
+						subReqs, subBindings, err := buildStructReadFields(structDef, field.Fields, nil, []string{structDef.Name, indexKey, field.Name}, indexOffset+field.FieldOffset)
+						if err != nil {
+							return nil, nil, err
+						}
+						reqs = append(reqs, subReqs...)
+						bindings = append(bindings, subBindings...)
+					}
+				}
+				continue
+			}
+
+			// Specific field selections
+			for _, fieldName := range sortedKeys(fields) {
+				selector := fields[fieldName]
+				field, ok := findStructFieldByList(structDef.Fields, fieldName)
+				if !ok {
+					return nil, nil, fmt.Errorf("unknown struct field %q on %s", fieldName, structDef.Name)
+				}
+
+				if field.IsScalar() {
+					if !readSelectionEnabled(selector) {
+						return nil, nil, fmt.Errorf("struct field selector %s.%s must be true or empty object", structDef.Name, fieldName)
+					}
+					req, err := buildStructFieldReadWithOffset(structDef, field, indexOffset)
+					if err != nil {
+						return nil, nil, err
+					}
+					reqs = append(reqs, req)
+					bindings = append(bindings, PropertyBinding{Path: []string{structDef.Name, indexKey, fieldName}})
+				} else {
+					subSelection, ok := selector.(map[string]interface{})
+					if !ok {
+						return nil, nil, fmt.Errorf("struct field selector %s.%s must be an object", structDef.Name, fieldName)
+					}
+					subReqs, subBindings, err := buildStructReadFields(structDef, field.Fields, subSelection, []string{structDef.Name, indexKey, fieldName}, indexOffset+field.FieldOffset)
+					if err != nil {
+						return nil, nil, err
+					}
+					reqs = append(reqs, subReqs...)
+					bindings = append(bindings, subBindings...)
+				}
+			}
 		}
 
-		for _, fieldName := range sortedKeys(fields) {
-			selector := fields[fieldName]
+		return reqs, bindings, nil
+
+	default:
+		return nil, nil, fmt.Errorf("unsupported struct kind %q for %s", structDef.Kind, structDef.Name)
+	}
+}
+
+// buildStructReadFields processes read requests for a set of fields (config-driven).
+// cumulativeOffset is the byte offset from ancestors.
+// If selection is nil or empty, all scalar sub-fields are expanded.
+func buildStructReadFields(structDef contracts.PropertyStruct, fields []contracts.PropertyStructField, selection map[string]interface{}, pathPrefix []string, cumulativeOffset int) ([]contracts.CommandRequest, []PropertyBinding, error) {
+	var reqs []contracts.CommandRequest
+	var bindings []PropertyBinding
+
+	// Empty/nil selection = read all fields
+	if len(selection) == 0 {
+		for _, field := range fields {
+			switch {
+			case field.IsScalar():
+				req, err := buildStructFieldReadWithOffset(structDef, field, cumulativeOffset)
+				if err != nil {
+					return nil, nil, err
+				}
+				reqs = append(reqs, req)
+				bindings = append(bindings, PropertyBinding{Path: append(append([]string(nil), pathPrefix...), field.Name)})
+
+			case field.IsStruct():
+				subReqs, subBindings, err := buildStructReadFields(structDef, field.Fields, nil,
+					append(append([]string(nil), pathPrefix...), field.Name),
+					cumulativeOffset+field.FieldOffset)
+				if err != nil {
+					return nil, nil, err
+				}
+				reqs = append(reqs, subReqs...)
+				bindings = append(bindings, subBindings...)
+
+			case field.IsArray():
+				subReqs, subBindings, err := buildNestedArrayRead(structDef, field, nil,
+					append(append([]string(nil), pathPrefix...), field.Name),
+					cumulativeOffset+field.FieldOffset)
+				if err != nil {
+					return nil, nil, err
+				}
+				reqs = append(reqs, subReqs...)
+				bindings = append(bindings, subBindings...)
+			}
+		}
+		return reqs, bindings, nil
+	}
+
+	// Specific field selections
+	for _, fieldName := range sortedKeys(selection) {
+		selector := selection[fieldName]
+		field, ok := findStructFieldByList(fields, fieldName)
+		if !ok {
+			return nil, nil, fmt.Errorf("unknown struct field %q on %s", fieldName, structDef.Name)
+		}
+
+		switch {
+		case field.IsScalar():
 			if !readSelectionEnabled(selector) {
 				return nil, nil, fmt.Errorf("struct field selector %s.%s must be true or empty object", structDef.Name, fieldName)
 			}
-			field, ok := findStructField(structDef, fieldName)
-			if !ok {
-				return nil, nil, fmt.Errorf("unknown struct field %q on %s", fieldName, structDef.Name)
-			}
-			req, binding, err := buildStructFieldRead(structDef, field, index, indexKey)
+			req, err := buildStructFieldReadWithOffset(structDef, field, cumulativeOffset)
 			if err != nil {
 				return nil, nil, err
 			}
 			reqs = append(reqs, req)
-			bindings = append(bindings, binding)
+			bindings = append(bindings, PropertyBinding{Path: append(append([]string(nil), pathPrefix...), fieldName)})
+
+		case field.IsStruct():
+			subSelection, ok := selector.(map[string]interface{})
+			if !ok && selector != nil {
+				return nil, nil, fmt.Errorf("struct field selector %s.%s must be an object", structDef.Name, fieldName)
+			}
+			if !ok {
+				subSelection = nil
+			}
+			subReqs, subBindings, err := buildStructReadFields(structDef, field.Fields, subSelection,
+				append(append([]string(nil), pathPrefix...), fieldName),
+				cumulativeOffset+field.FieldOffset)
+			if err != nil {
+				return nil, nil, err
+			}
+			reqs = append(reqs, subReqs...)
+			bindings = append(bindings, subBindings...)
+
+		case field.IsArray():
+			subSelection, ok := selector.(map[string]interface{})
+			if !ok && selector != nil {
+				return nil, nil, fmt.Errorf("array field selector %s.%s must be an object", structDef.Name, fieldName)
+			}
+			if !ok {
+				subSelection = nil
+			}
+			subReqs, subBindings, err := buildNestedArrayRead(structDef, field, subSelection,
+				append(append([]string(nil), pathPrefix...), fieldName),
+				cumulativeOffset+field.FieldOffset)
+			if err != nil {
+				return nil, nil, err
+			}
+			reqs = append(reqs, subReqs...)
+			bindings = append(bindings, subBindings...)
 		}
 	}
 
 	return reqs, bindings, nil
 }
 
-func buildStructFieldWrite(structDef contracts.PropertyStruct, field contracts.PropertyStructField, index int, indexKey string, raw interface{}) (contracts.CommandRequest, *contracts.CommandValue, error) {
-	nodeName, err := structFieldNodeName(structDef, field, index)
+// buildNestedArrayRead handles reads for a nested array field (config-driven).
+func buildNestedArrayRead(structDef contracts.PropertyStruct, field contracts.PropertyStructField, selection map[string]interface{}, pathPrefix []string, cumulativeOffset int) ([]contracts.CommandRequest, []PropertyBinding, error) {
+	var reqs []contracts.CommandRequest
+	var bindings []PropertyBinding
+
+	// Determine which indices to read
+	var indices []string
+	if len(selection) > 0 {
+		indices = sortedStructIndexKeys(selection)
+	} else {
+		for offset := 0; offset < field.MaxItems; offset++ {
+			indices = append(indices, strconv.Itoa(1+offset))
+		}
+	}
+
+	scalarElem := len(field.Fields) == 1 && field.Fields[0].IsScalar()
+
+	for _, indexKey := range indices {
+		index, err := strconv.Atoi(indexKey)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid nested array index %q on %s", indexKey, structDef.Name)
+		}
+		elemOffset := cumulativeOffset + index*field.IndexStride
+
+		if scalarElem {
+			subField := field.Fields[0]
+			if len(selection) > 0 {
+				if !readSelectionEnabled(selection[indexKey]) {
+					return nil, nil, fmt.Errorf("nested array %s[%s] read selector must be true or empty object", field.Name, indexKey)
+				}
+			}
+			req, err := buildStructFieldReadWithOffset(structDef, subField, elemOffset)
+			if err != nil {
+				return nil, nil, err
+			}
+			reqs = append(reqs, req)
+			bindings = append(bindings, PropertyBinding{Path: append(append([]string(nil), pathPrefix...), indexKey)})
+		} else {
+			var subSelection map[string]interface{}
+			if len(selection) > 0 {
+				var ok bool
+				subSelection, ok = selection[indexKey].(map[string]interface{})
+				if !ok {
+					return nil, nil, fmt.Errorf("nested array %s[%s] selector must be an object", field.Name, indexKey)
+				}
+			}
+			subReqs, subBindings, err := buildStructReadFields(structDef, field.Fields, subSelection,
+				append(append([]string(nil), pathPrefix...), indexKey),
+				elemOffset)
+			if err != nil {
+				return nil, nil, err
+			}
+			reqs = append(reqs, subReqs...)
+			bindings = append(bindings, subBindings...)
+		}
+	}
+
+	return reqs, bindings, nil
+}
+
+func buildStructFieldWriteWithOffset(structDef contracts.PropertyStruct, field contracts.PropertyStructField, leafName string, cumulativeOffset int, raw interface{}) (contracts.CommandRequest, *contracts.CommandValue, error) {
+	nodeName, err := structFieldNodeNameWithOffset(structDef, field, cumulativeOffset)
 	if err != nil {
 		return contracts.CommandRequest{}, nil, err
 	}
 
 	point := contracts.PointConfig{
-		Name:      fmt.Sprintf("%s.%s.%s", structDef.Name, indexKey, field.Name),
+		Name:      fmt.Sprintf("%s.%s", structDef.Name, leafName),
 		ValueType: field.ValueType,
 		MaxLength: field.MaxLength,
 		ReadWrite: field.ReadWrite,
@@ -575,14 +965,14 @@ func buildStructFieldWrite(structDef contracts.PropertyStruct, field contracts.P
 	return req, value, nil
 }
 
-func buildStructFieldRead(structDef contracts.PropertyStruct, field contracts.PropertyStructField, index int, indexKey string) (contracts.CommandRequest, PropertyBinding, error) {
-	nodeName, err := structFieldNodeName(structDef, field, index)
+func buildStructFieldReadWithOffset(structDef contracts.PropertyStruct, field contracts.PropertyStructField, cumulativeOffset int) (contracts.CommandRequest, error) {
+	nodeName, err := structFieldNodeNameWithOffset(structDef, field, cumulativeOffset)
 	if err != nil {
-		return contracts.CommandRequest{}, PropertyBinding{}, err
+		return contracts.CommandRequest{}, err
 	}
 
 	point := contracts.PointConfig{
-		Name:      fmt.Sprintf("%s.%s.%s", structDef.Name, indexKey, field.Name),
+		Name:      fmt.Sprintf("%s.%s", structDef.Name, field.Name),
 		ValueType: field.ValueType,
 		MaxLength: field.MaxLength,
 		ReadWrite: field.ReadWrite,
@@ -590,16 +980,35 @@ func buildStructFieldRead(structDef contracts.PropertyStruct, field contracts.Pr
 
 	req, err := point.ToCommandRequest(nodeName)
 	if err != nil {
+		return contracts.CommandRequest{}, err
+	}
+	return req, nil
+}
+
+func buildStructFieldWrite(structDef contracts.PropertyStruct, field contracts.PropertyStructField, index int, indexKey string, raw interface{}) (contracts.CommandRequest, *contracts.CommandValue, error) {
+	cumulativeOffset := (index - structIndexBase(structDef)) * structDef.Address.IndexStride
+	return buildStructFieldWriteWithOffset(structDef, field, indexKey, cumulativeOffset, raw)
+}
+
+func buildStructFieldRead(structDef contracts.PropertyStruct, field contracts.PropertyStructField, index int, indexKey string) (contracts.CommandRequest, PropertyBinding, error) {
+	cumulativeOffset := (index - structIndexBase(structDef)) * structDef.Address.IndexStride
+	req, err := buildStructFieldReadWithOffset(structDef, field, cumulativeOffset)
+	if err != nil {
 		return contracts.CommandRequest{}, PropertyBinding{}, err
 	}
 	return req, PropertyBinding{Path: []string{structDef.Name, indexKey, field.Name}}, nil
 }
 
 func structFieldNodeName(structDef contracts.PropertyStruct, field contracts.PropertyStructField, index int) (string, error) {
+	cumulativeOffset := (index - structIndexBase(structDef)) * structDef.Address.IndexStride
+	return structFieldNodeNameWithOffset(structDef, field, cumulativeOffset)
+}
+
+func structFieldNodeNameWithOffset(structDef contracts.PropertyStruct, field contracts.PropertyStructField, cumulativeOffset int) (string, error) {
 	if structDef.Address.DBNumber < 0 {
 		return "", fmt.Errorf("struct %s missing dbNumber", structDef.Name)
 	}
-	baseOffset := structDef.Address.BaseOffset + (index-structIndexBase(structDef))*structDef.Address.IndexStride + field.FieldOffset
+	baseOffset := structDef.Address.BaseOffset + cumulativeOffset + field.FieldOffset
 
 	if field.BitOffset != nil {
 		bit := *field.BitOffset
@@ -644,7 +1053,11 @@ func parseStructIndex(structDef contracts.PropertyStruct, raw string) (int, erro
 }
 
 func findStructField(structDef contracts.PropertyStruct, name string) (contracts.PropertyStructField, bool) {
-	for _, field := range structDef.Fields {
+	return findStructFieldByList(structDef.Fields, name)
+}
+
+func findStructFieldByList(fields []contracts.PropertyStructField, name string) (contracts.PropertyStructField, bool) {
+	for _, field := range fields {
 		if field.Name == name {
 			return field, true
 		}
@@ -778,19 +1191,59 @@ func sortedStructIndexKeys(items map[string]interface{}) []string {
 }
 
 func buildStructSelection(structDef contracts.PropertyStruct) (map[string]interface{}, error) {
-	if structDef.MaxItems <= 0 {
-		return nil, fmt.Errorf("property struct %q requires maxItems > 0 for full selection", structDef.Name)
+	effectiveKind := structDef.Kind
+	if effectiveKind == "struct_array" {
+		effectiveKind = "array"
 	}
-	items := make(map[string]interface{}, structDef.MaxItems)
-	base := structIndexBase(structDef)
-	for offset := 0; offset < structDef.MaxItems; offset++ {
-		if structDef.Kind == "array" {
-			items[strconv.Itoa(base+offset)] = true
-		} else {
-			items[strconv.Itoa(base+offset)] = map[string]interface{}{}
+
+	switch effectiveKind {
+	case "struct":
+		return buildStructFieldSelection(structDef.Fields), nil
+
+	case "array":
+		if structDef.MaxItems <= 0 {
+			return nil, fmt.Errorf("property struct %q requires maxItems > 0 for full selection", structDef.Name)
+		}
+		items := make(map[string]interface{}, structDef.MaxItems)
+		base := structIndexBase(structDef)
+		for offset := 0; offset < structDef.MaxItems; offset++ {
+			if len(structDef.Fields) == 1 && structDef.Fields[0].IsScalar() {
+				items[strconv.Itoa(base+offset)] = true
+			} else {
+				items[strconv.Itoa(base+offset)] = buildStructFieldSelection(structDef.Fields)
+			}
+		}
+		return items, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported struct kind %q for %s", structDef.Kind, structDef.Name)
+	}
+}
+
+// buildStructFieldSelection builds a selection map for nested fields.
+func buildStructFieldSelection(fields []contracts.PropertyStructField) map[string]interface{} {
+	sel := make(map[string]interface{}, len(fields))
+	for _, field := range fields {
+		switch {
+		case field.IsScalar():
+			sel[field.Name] = true
+		case field.IsStruct():
+			sel[field.Name] = buildStructFieldSelection(field.Fields)
+		case field.IsArray():
+			if field.MaxItems > 0 {
+				items := make(map[string]interface{}, field.MaxItems)
+				for offset := 0; offset < field.MaxItems; offset++ {
+					if len(field.Fields) == 1 && field.Fields[0].IsScalar() {
+						items[strconv.Itoa(1+offset)] = true
+					} else {
+						items[strconv.Itoa(1+offset)] = buildStructFieldSelection(field.Fields)
+					}
+				}
+				sel[field.Name] = items
+			}
 		}
 	}
-	return items, nil
+	return sel
 }
 
 func parseIndexList(inner string) ([]int, error) {
@@ -874,6 +1327,16 @@ func parseStructNameWithIndices(raw string) (structName string, indices []int, e
 }
 
 func buildStructSelectionForIndices(structDef contracts.PropertyStruct, indices []int) (map[string]interface{}, error) {
+	effectiveKind := structDef.Kind
+	if effectiveKind == "struct_array" {
+		effectiveKind = "array"
+	}
+
+	if effectiveKind == "struct" {
+		// kind: struct has no indices; return field selection
+		return buildStructFieldSelection(structDef.Fields), nil
+	}
+
 	if len(indices) == 0 {
 		return nil, fmt.Errorf("property struct %q requires at least one index", structDef.Name)
 	}
@@ -888,10 +1351,10 @@ func buildStructSelectionForIndices(structDef contracts.PropertyStruct, indices 
 	}
 	items := make(map[string]interface{}, len(indices))
 	for _, idx := range indices {
-		if structDef.Kind == "array" {
+		if len(structDef.Fields) == 1 && structDef.Fields[0].IsScalar() {
 			items[strconv.Itoa(idx)] = true
 		} else {
-			items[strconv.Itoa(idx)] = map[string]interface{}{}
+			items[strconv.Itoa(idx)] = buildStructFieldSelection(structDef.Fields)
 		}
 	}
 	return items, nil

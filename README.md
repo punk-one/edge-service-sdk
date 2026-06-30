@@ -17,6 +17,17 @@ It extracts the common runtime, control, and transport capabilities out of proto
 - control job persistence, result history, diagnostics, export, and MQTT query handling
 - dependency checks, worker supervision, and shared logging contracts
 
+## What's New In v0.7.5
+
+- **`kind: struct`** — standalone struct type (no index), supports multi-field nested structures: `PropertyStructField` now has recursive `Kind`, `Fields`, `MaxItems`, `IndexStride` for nesting
+- **Nested arrays** — `kind: array` fields support multi-field struct elements and nested `array`/`struct` sub-types (max 2 array levels)
+- **Unified array path** — `struct_array` internally maps to `array` (multi-field), full backward compatibility with existing configs
+- **Recursive address calculation** — cumulative offset accumulation through nested struct/array levels for correct PLC address generation
+- **Telemetry struct support** — `TelemetryConfig.Structs` and `TelemetryGroup.Structs` reuse `PropertyStruct`, auto-reported structs emit nested JSON objects
+- **Input-driven writes** — property write path processes only fields present in the input, supporting partial updates on nested structures
+- Added `flattenStructFields`, `buildStructWriteFields`, `buildStructReadFields`, `buildNestedArrayRead`, `buildNestedArrayWrite`, `buildStructFieldSelection`, `BuildTelemetryStructReadRequests`
+- Added `IsScalar()`, `IsStruct()`, `IsArray()` helper methods on `PropertyStructField`
+
 ## What's New In v0.6.7
 
 - property get/set now supports `name[index]` format for struct arrays: `BuildPropertyReadSelectionFromNames` accepts `wheels[1]`, `wheels[1,3,5]`, `wheels[1-10]` to read specific indices
@@ -140,4 +151,4 @@ MQTT runtime capabilities include telemetry/property/status publishing, property
 
 ## Version
 
-This repository is being published as `v0.6.7`.
+This repository is being published as `v0.7.5`.

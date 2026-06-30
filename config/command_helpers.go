@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	contracts "github.com/punk-one/edge-service-sdk/driver"
@@ -67,5 +68,67 @@ func BuildTelemetryReadRequestsFromNames(device contracts.DeviceConfig, names []
 	if len(reqs) == 0 {
 		return nil, nil, fmt.Errorf("no telemetry points resolved")
 	}
+	return reqs, bindings, nil
+}
+
+// BuildTelemetryStructReadRequests generates read requests for all auto-report telemetry structs.
+func BuildTelemetryStructReadRequests(structs []contracts.PropertyStruct) ([]contracts.CommandRequest, []PropertyBinding, error) {
+	var reqs []contracts.CommandRequest
+	var bindings []PropertyBinding
+
+	for _, structDef := range structs {
+		if !structDef.AutoReport {
+			continue
+		}
+
+		effectiveKind := structDef.Kind
+		if effectiveKind == "struct_array" {
+			effectiveKind = "array"
+		}
+
+		switch effectiveKind {
+		case "struct":
+			if len(structDef.Fields) == 0 {
+				continue
+			}
+			subReqs, subBindings, err := buildStructReadFields(structDef, structDef.Fields, nil, []string{structDef.Name}, 0)
+			if err != nil {
+				return nil, nil, err
+			}
+			reqs = append(reqs, subReqs...)
+			bindings = append(bindings, subBindings...)
+
+		case "array":
+			if structDef.MaxItems <= 0 {
+				continue
+			}
+			for offset := 0; offset < structDef.MaxItems; offset++ {
+				index := structIndexBase(structDef) + offset
+				indexKey := strconv.Itoa(index)
+				indexOffset := (index - structIndexBase(structDef)) * structDef.Address.IndexStride
+
+				if len(structDef.Fields) == 1 && structDef.Fields[0].IsScalar() {
+					field := structDef.Fields[0]
+					req, err := buildStructFieldReadWithOffset(structDef, field, indexOffset)
+					if err != nil {
+						return nil, nil, err
+					}
+					reqs = append(reqs, req)
+					bindings = append(bindings, PropertyBinding{Path: []string{structDef.Name, indexKey}})
+				} else {
+					subReqs, subBindings, err := buildStructReadFields(structDef, structDef.Fields, nil, []string{structDef.Name, indexKey}, indexOffset)
+					if err != nil {
+						return nil, nil, err
+					}
+					reqs = append(reqs, subReqs...)
+					bindings = append(bindings, subBindings...)
+				}
+			}
+
+		default:
+			return nil, nil, fmt.Errorf("unsupported telemetry struct kind %q for %s", structDef.Kind, structDef.Name)
+		}
+	}
+
 	return reqs, bindings, nil
 }
