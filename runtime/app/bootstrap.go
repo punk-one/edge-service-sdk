@@ -508,9 +508,15 @@ func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.
 				// Process device-level values
 				if hasDeviceLevel && (isFirstTick || isDueWallClock(deviceInterval, gcdInterval, elapsed, false)) {
 					devicePointCount := len(deviceReqs)
-					pointValues := values[:devicePointCount]
-					structValues := values[devicePointCount : devicePointCount+deviceStructReqCount]
-					remaining := values[devicePointCount+deviceStructReqCount:]
+					pointValues := values[:min(devicePointCount, len(values))]
+					structStart := min(devicePointCount, len(values))
+					structEnd := min(devicePointCount+deviceStructReqCount, len(values))
+					structValues := values[structStart:structEnd]
+					remaining := values[min(structEnd, len(values)):]
+					if len(pointValues) < devicePointCount || len(structValues) < deviceStructReqCount {
+						logClient.Warnf("Device %s: read returned fewer values (%d) than expected (points=%d, structs=%d)",
+							device.InternalName, len(values), devicePointCount, deviceStructReqCount)
+					}
 
 					deviceValues := filterValuesByNames(pointValues, devicePointNames)
 					if shouldEmitTelemetry(device.Telemetry, deviceValues, deviceLevelState, now) {
@@ -538,9 +544,15 @@ func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.
 				for i := range groupStates {
 					if isFirstTick || isDueWallClock(groupStates[i].cfg.Interval, gcdInterval, elapsed, false) {
 						groupPointCount := len(groupStates[i].reqs)
-						pointValues := values[:groupPointCount]
-						structValues := values[groupPointCount : groupPointCount+groupStructReqCounts[i]]
-						values = values[groupPointCount+groupStructReqCounts[i]:]
+						pointValues := values[:min(groupPointCount, len(values))]
+						structStart := min(groupPointCount, len(values))
+						structEnd := min(groupPointCount+groupStructReqCounts[i], len(values))
+						structValues := values[structStart:structEnd]
+						values = values[min(structEnd, len(values)):]
+						if len(pointValues) < groupPointCount || len(structValues) < groupStructReqCounts[i] {
+							logClient.Warnf("Device %s group %s: read returned fewer values (%d) than expected",
+								device.InternalName, groupStates[i].cfg.Interval, len(values))
+						}
 
 						groupValues := filterValuesByNames(pointValues, groupStates[i].names)
 						if shouldEmitTelemetry(groupStates[i].cfg, groupValues, groupStates[i].state, now) {
@@ -721,6 +733,9 @@ func filterValuesByNames(values []*contracts.CommandValue, names map[string]bool
 	}
 	filtered := make([]*contracts.CommandValue, 0, len(names))
 	for _, v := range values {
+		if v == nil {
+			continue // skip nil placeholders
+		}
 		if names[v.DeviceResourceName] {
 			filtered = append(filtered, v)
 		}
