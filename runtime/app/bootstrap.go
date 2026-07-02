@@ -885,6 +885,9 @@ func shouldEmitTelemetry(cfg contracts.TelemetryConfig, values []*contracts.Comm
 func snapshotFromValues(values []*contracts.CommandValue) map[string]interface{} {
 	snapshot := make(map[string]interface{}, len(values))
 	for _, value := range values {
+		if value == nil {
+			continue
+		}
 		snapshot[value.DeviceResourceName] = value.Value
 	}
 	return snapshot
@@ -895,6 +898,9 @@ func updateTelemetryState(state telemetryState, values []*contracts.CommandValue
 		delete(state.lastValues, key)
 	}
 	for _, value := range values {
+		if value == nil {
+			continue
+		}
 		state.lastValues[value.DeviceResourceName] = value.Value
 		state.lastEmittedAt[value.DeviceResourceName] = emittedAt
 	}

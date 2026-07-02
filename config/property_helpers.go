@@ -317,8 +317,8 @@ func BuildAutoPropertyReadRequests(device contracts.DeviceConfig) ([]contracts.C
 func BuildPropertyResponse(values []*contracts.CommandValue, bindings []PropertyBinding) map[string]interface{} {
 	result := make(map[string]interface{})
 	for i, binding := range bindings {
-		if i >= len(values) {
-			break
+		if i >= len(values) || values[i] == nil {
+			continue
 		}
 		setNestedValue(result, binding.Path, values[i].Value)
 	}
