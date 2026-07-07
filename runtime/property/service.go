@@ -238,6 +238,9 @@ func (s *Service) handlePropertySet(productCode string, payload []byte) {
 	if !s.propertyResultEnabled {
 		return
 	}
+	if response.Code == ctl.CodeNotFound {
+		return
+	}
 	switch response.Code {
 	case ctl.CodeSuccess:
 		s.schedulePropertySetResult(productCode, req, response)
@@ -259,6 +262,9 @@ func (s *Service) handlePropertyGet(productCode string, payload []byte) {
 
 	response, _ := s.ExecuteGet(req, productCode)
 	if !s.propertyResultEnabled {
+		return
+	}
+	if response.Code == ctl.CodeNotFound {
 		return
 	}
 	s.publishPropertyResult(productCode, resolvedDeviceCode(req.DeviceCode, req.DeviceCode), response)

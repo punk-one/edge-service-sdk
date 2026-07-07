@@ -158,6 +158,9 @@ func (s *Service) handleCommandCall(productCode string, identifier string, paylo
 	if !s.commandResultEnabled {
 		return
 	}
+	if result.Code == ctl.CodeNotFound {
+		return
+	}
 	deviceCode := strings.TrimSpace(req.DeviceCode)
 	if deviceCode == "" {
 		return
