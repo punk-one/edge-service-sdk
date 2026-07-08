@@ -146,6 +146,9 @@ type PropertyStructField struct {
 	// Kind specifies the field's structural type: "struct" or "array".
 	// Empty means the field is a scalar (ValueType is used).
 	Kind string `yaml:"kind,omitempty"`
+	// IndexBase specifies the base index for array elements. nil means 1-based default.
+	// Set to 0 for 0-based, 1 for 1-based indexing.
+	IndexBase *int `yaml:"indexBase,omitempty"`
 	// Fields contains sub-fields when Kind is "struct" or "array" (struct element).
 	Fields []PropertyStructField `yaml:"fields,omitempty"`
 	// MaxItems limits the number of elements when Kind is "array".

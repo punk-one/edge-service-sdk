@@ -75,7 +75,7 @@ func flattenStructFields(
 			if field.MaxItems <= 0 {
 				continue
 			}
-			base := 1 // default index base for nested arrays
+			base := nestedFieldIndexBase(field)
 			for offset := 0; offset < field.MaxItems; offset++ {
 				index := base + offset
 				indexKey := strconv.Itoa(index)
@@ -644,7 +644,8 @@ func buildNestedArrayWrite(structDef contracts.PropertyStruct, field contracts.P
 		if err != nil {
 			return nil, nil, fmt.Errorf("invalid nested array index %q on %s.%s", indexKey, structDef.Name, field.Name)
 		}
-		indexOffset := cumulativeOffset + index*field.IndexStride
+		fieldBase := nestedFieldIndexBase(field)
+		indexOffset := cumulativeOffset + (index-fieldBase)*field.IndexStride
 
 		if len(field.Fields) == 1 && field.Fields[0].IsScalar() {
 			// scalar element
@@ -888,11 +889,12 @@ func buildNestedArrayRead(structDef contracts.PropertyStruct, field contracts.Pr
 
 	// Determine which indices to read
 	var indices []string
+	fieldBase := nestedFieldIndexBase(field)
 	if len(selection) > 0 {
 		indices = sortedStructIndexKeys(selection)
 	} else {
 		for offset := 0; offset < field.MaxItems; offset++ {
-			indices = append(indices, strconv.Itoa(1+offset))
+			indices = append(indices, strconv.Itoa(fieldBase+offset))
 		}
 	}
 
@@ -903,7 +905,7 @@ func buildNestedArrayRead(structDef contracts.PropertyStruct, field contracts.Pr
 		if err != nil {
 			return nil, nil, fmt.Errorf("invalid nested array index %q on %s", indexKey, structDef.Name)
 		}
-		elemOffset := cumulativeOffset + index*field.IndexStride
+		elemOffset := cumulativeOffset + (index-fieldBase)*field.IndexStride
 
 		if scalarElem {
 			subField := field.Fields[0]
@@ -1004,6 +1006,22 @@ func structFieldNodeName(structDef contracts.PropertyStruct, field contracts.Pro
 	return structFieldNodeNameWithOffset(structDef, field, cumulativeOffset)
 }
 
+// valueTypeToByteSize 返回值类型对应的字节大小，用于选择 S7 地址前缀。
+func valueTypeToByteSize(valueType string) int {
+	switch contracts.NormalizedValueType(valueType) {
+	case "Bool", "Uint8", "Int8":
+		return 1
+	case "Uint16", "Int16":
+		return 2
+	case "Float32", "Uint32", "Int32":
+		return 4
+	case "Float64", "Uint64", "Int64":
+		return 8
+	default:
+		return 0 // 未知类型（如 String），回退到 unit 行为
+	}
+}
+
 func structFieldNodeNameWithOffset(structDef contracts.PropertyStruct, field contracts.PropertyStructField, cumulativeOffset int) (string, error) {
 	if structDef.Address.DBNumber < 0 {
 		return "", fmt.Errorf("struct %s missing dbNumber", structDef.Name)
@@ -1018,21 +1036,44 @@ func structFieldNodeNameWithOffset(structDef contracts.PropertyStruct, field con
 		return fmt.Sprintf("DB%d.DBX%d.%d", structDef.Address.DBNumber, baseOffset, bit), nil
 	}
 
-	switch strings.ToLower(strings.TrimSpace(structDef.Address.Unit)) {
-	case "", "word":
-		return fmt.Sprintf("DB%d.DBW%d", structDef.Address.DBNumber, baseOffset), nil
-	case "byte":
+	// 根据 valueType 字节大小选择地址前缀，不再依赖 address.Unit
+	switch valueTypeToByteSize(field.ValueType) {
+	case 1:
 		return fmt.Sprintf("DB%d.DBB%d", structDef.Address.DBNumber, baseOffset), nil
-	case "dword":
+	case 2:
+		return fmt.Sprintf("DB%d.DBW%d", structDef.Address.DBNumber, baseOffset), nil
+	case 4, 8:
 		return fmt.Sprintf("DB%d.DBD%d", structDef.Address.DBNumber, baseOffset), nil
 	default:
-		return "", fmt.Errorf("unsupported struct unit %q on %s", structDef.Address.Unit, structDef.Name)
+		// 未知类型（如 String），回退到原有 address.Unit 逻辑
+		switch strings.ToLower(strings.TrimSpace(structDef.Address.Unit)) {
+		case "", "word":
+			return fmt.Sprintf("DB%d.DBW%d", structDef.Address.DBNumber, baseOffset), nil
+		case "byte":
+			return fmt.Sprintf("DB%d.DBB%d", structDef.Address.DBNumber, baseOffset), nil
+		case "dword":
+			return fmt.Sprintf("DB%d.DBD%d", structDef.Address.DBNumber, baseOffset), nil
+		default:
+			return "", fmt.Errorf("unsupported struct unit %q on %s", structDef.Address.Unit, structDef.Name)
+		}
 	}
 }
 
 func structIndexBase(structDef contracts.PropertyStruct) int {
 	if structDef.IndexBase > 0 {
 		return structDef.IndexBase
+	}
+	return 1
+}
+
+// nestedFieldIndexBase returns the effective index base for a nested array field.
+// nil (not set) defaults to 1; explicit 0 or 1 uses the configured value.
+func nestedFieldIndexBase(field contracts.PropertyStructField) int {
+	if field.IndexBase != nil {
+		base := *field.IndexBase
+		if base == 0 || base == 1 {
+			return base
+		}
 	}
 	return 1
 }
@@ -1231,12 +1272,13 @@ func buildStructFieldSelection(fields []contracts.PropertyStructField) map[strin
 			sel[field.Name] = buildStructFieldSelection(field.Fields)
 		case field.IsArray():
 			if field.MaxItems > 0 {
+				fieldBase := nestedFieldIndexBase(field)
 				items := make(map[string]interface{}, field.MaxItems)
 				for offset := 0; offset < field.MaxItems; offset++ {
 					if len(field.Fields) == 1 && field.Fields[0].IsScalar() {
-						items[strconv.Itoa(1+offset)] = true
+						items[strconv.Itoa(fieldBase+offset)] = true
 					} else {
-						items[strconv.Itoa(1+offset)] = buildStructFieldSelection(field.Fields)
+						items[strconv.Itoa(fieldBase+offset)] = buildStructFieldSelection(field.Fields)
 					}
 				}
 				sel[field.Name] = items
