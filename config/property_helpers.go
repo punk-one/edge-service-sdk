@@ -763,12 +763,21 @@ func buildStructReadRequests(structDef contracts.PropertyStruct, items map[strin
 					if !ok {
 						return nil, nil, fmt.Errorf("struct field selector %s.%s must be an object", structDef.Name, fieldName)
 					}
-					subReqs, subBindings, err := buildStructReadFields(structDef, field.Fields, subSelection, []string{structDef.Name, indexKey, fieldName}, indexOffset+field.FieldOffset)
-					if err != nil {
-						return nil, nil, err
+					if field.IsArray() {
+						subReqs, subBindings, err := buildNestedArrayRead(structDef, field, subSelection, []string{structDef.Name, indexKey, fieldName}, indexOffset+field.FieldOffset)
+						if err != nil {
+							return nil, nil, err
+						}
+						reqs = append(reqs, subReqs...)
+						bindings = append(bindings, subBindings...)
+					} else {
+						subReqs, subBindings, err := buildStructReadFields(structDef, field.Fields, subSelection, []string{structDef.Name, indexKey, fieldName}, indexOffset+field.FieldOffset)
+						if err != nil {
+							return nil, nil, err
+						}
+						reqs = append(reqs, subReqs...)
+						bindings = append(bindings, subBindings...)
 					}
-					reqs = append(reqs, subReqs...)
-					bindings = append(bindings, subBindings...)
 				}
 			}
 		}
