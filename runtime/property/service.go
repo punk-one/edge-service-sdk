@@ -1,6 +1,7 @@
 package property
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -47,6 +48,8 @@ type propertyProgressEvent struct {
 	Data            map[string]interface{}
 }
 
+var ErrDeviceNotFound = errors.New("device_code does not match any configured device")
+
 const (
 	propertyOperationGet = "get"
 	propertyOperationSet = "set"
@@ -82,7 +85,9 @@ func (s *Service) ExecuteGet(req rtapi.PropertyRequest, expectedProductCode stri
 	if err != nil {
 		response.Code = statusCode
 		response.Message = err.Error()
-		s.record(normalized.DeviceCode, expectedProductCode, normalized.TraceID, response, propertyOperationGet)
+		if !errors.Is(err, ErrDeviceNotFound) {
+			s.record(normalized.DeviceCode, expectedProductCode, normalized.TraceID, response, propertyOperationGet)
+		}
 		return response, statusCode
 	}
 	if shouldAsyncPropertyGet(normalized) {
@@ -133,7 +138,9 @@ func (s *Service) ExecuteSet(req rtapi.PropertyRequest, expectedProductCode stri
 	if err != nil {
 		response.Code = statusCode
 		response.Message = err.Error()
-		s.record(normalized.DeviceCode, expectedProductCode, normalized.TraceID, response, propertyOperationSet)
+		if !errors.Is(err, ErrDeviceNotFound) {
+			s.record(normalized.DeviceCode, expectedProductCode, normalized.TraceID, response, propertyOperationSet)
+		}
 		return response, statusCode
 	}
 	if shouldAsyncPropertySet(normalized) {
@@ -214,7 +221,7 @@ func (s *Service) resolvePropertyDevice(req rtapi.PropertyRequest, expectedProdu
 	}
 	device, ok := s.catalog.DeviceConfigByName(req.DeviceCode)
 	if !ok {
-		return contracts.DeviceConfig{}, req, 404, fmt.Errorf("device_code does not match any configured device")
+		return contracts.DeviceConfig{}, req, 404, fmt.Errorf("%w: %s", ErrDeviceNotFound, req.DeviceCode)
 	}
 	if expectedProductCode != "" && device.ProductCode != expectedProductCode {
 		return contracts.DeviceConfig{}, req, 400, fmt.Errorf("device_code does not match the subscribed topic")
@@ -239,6 +246,9 @@ func (s *Service) handlePropertySet(productCode string, payload []byte) {
 		return
 	}
 	if response.Code == ctl.CodeNotFound {
+		if s.logger != nil {
+			s.logger.Debugf("Device %s not found in this instance, discarding property set", req.DeviceCode)
+		}
 		return
 	}
 	switch response.Code {
@@ -265,6 +275,9 @@ func (s *Service) handlePropertyGet(productCode string, payload []byte) {
 		return
 	}
 	if response.Code == ctl.CodeNotFound {
+		if s.logger != nil {
+			s.logger.Debugf("Device %s not found in this instance, discarding property get", req.DeviceCode)
+		}
 		return
 	}
 	s.publishPropertyResult(productCode, resolvedDeviceCode(req.DeviceCode, req.DeviceCode), response)
@@ -535,6 +548,9 @@ func (s *Service) runAsyncProperty(pending rtcontrol.PendingProperty) {
 		}
 	}
 	if !applied || !rtcontrol.IsFinalCode(result.Code) {
+		return
+	}
+	if result.Code == ctl.CodeNotFound {
 		return
 	}
 	s.publishPropertyResult(pending.ProductCode, pending.DeviceCode, result)

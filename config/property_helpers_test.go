@@ -2,6 +2,7 @@ package config
 
 import (
 	"strconv"
+	"strings"
 	"testing"
 
 	contracts "github.com/punk-one/edge-service-sdk/driver"
@@ -16,12 +17,14 @@ func testDeviceConfig() contracts.DeviceConfig {
 				{
 					Name:      "status_text",
 					ValueType: "String",
+					ReadWrite: "RW",
 					NodeName:  "DB200.DBB0",
 					MaxLength: 20,
 				},
 				{
 					Name:             "a",
 					ValueType:        "Int16",
+					ReadWrite:        "RW",
 					NodeNameTemplate: "DB200.DBW{index}",
 				},
 			},
@@ -38,8 +41,8 @@ func testDeviceConfig() contracts.DeviceConfig {
 						Unit:        "word",
 					},
 					Fields: []contracts.PropertyStructField{
-						{Name: "diameter", ValueType: "Int16", FieldOffset: 0},
-						{Name: "height", ValueType: "Int16", FieldOffset: 2},
+						{Name: "diameter", ValueType: "Int16", FieldOffset: 0, ReadWrite: "RW"},
+						{Name: "height", ValueType: "Int16", FieldOffset: 2, ReadWrite: "RW"},
 					},
 				},
 			},
@@ -550,7 +553,7 @@ func testArrayKindDeviceConfig() contracts.DeviceConfig {
 						Unit:        "byte",
 					},
 					Fields: []contracts.PropertyStructField{
-						{Name: "v", ValueType: "String", FieldOffset: 0, MaxLength: 18},
+						{Name: "v", ValueType: "String", FieldOffset: 0, MaxLength: 18, ReadWrite: "RW"},
 					},
 				},
 				{
@@ -565,7 +568,7 @@ func testArrayKindDeviceConfig() contracts.DeviceConfig {
 						Unit:        "dword",
 					},
 					Fields: []contracts.PropertyStructField{
-						{Name: "v", ValueType: "Float32", FieldOffset: 0},
+						{Name: "v", ValueType: "Float32", FieldOffset: 0, ReadWrite: "RW"},
 					},
 				},
 				{
@@ -580,7 +583,7 @@ func testArrayKindDeviceConfig() contracts.DeviceConfig {
 						Unit:        "word",
 					},
 					Fields: []contracts.PropertyStructField{
-						{Name: "v", ValueType: "Int16", FieldOffset: 0},
+						{Name: "v", ValueType: "Int16", FieldOffset: 0, ReadWrite: "RW"},
 					},
 				},
 				{
@@ -595,7 +598,7 @@ func testArrayKindDeviceConfig() contracts.DeviceConfig {
 						Unit:        "byte",
 					},
 					Fields: []contracts.PropertyStructField{
-						{Name: "v", ValueType: "Bool", FieldOffset: 0, BitOffset: intPtr(0)},
+						{Name: "v", ValueType: "Bool", FieldOffset: 0, BitOffset: intPtr(0), ReadWrite: "RW"},
 					},
 				},
 			},
@@ -792,5 +795,116 @@ func TestBuildPropertyWriteRequestsArrayKindBackwardCompat(t *testing.T) {
 	}
 	if params[1].Value != "轮型2" {
 		t.Fatalf("expected '轮型2', got %v", params[1].Value)
+	}
+}
+
+func TestBuildPropertyWriteRequestsRejectsReadOnlyPoint(t *testing.T) {
+	device := contracts.DeviceConfig{
+		Name:        "test-device",
+		ProductCode: "test",
+		Property: contracts.PropertyConfig{
+			Points: []contracts.PointConfig{
+				{
+					Name:      "writable_point",
+					ValueType: "Int16",
+					ReadWrite: "RW",
+					NodeName:  "DB200.DBW0",
+				},
+				{
+					Name:      "readonly_point",
+					ValueType: "Int16",
+					ReadWrite: "R",
+					NodeName:  "DB200.DBW2",
+				},
+			},
+		},
+	}
+
+	// Writing only the writable point should succeed
+	reqs, params, err := BuildPropertyWriteRequests(device, map[string]interface{}{
+		"writable_point": int16(42),
+	})
+	if err != nil {
+		t.Fatalf("expected write to RW point to succeed, got error: %v", err)
+	}
+	if len(reqs) != 1 || len(params) != 1 {
+		t.Fatalf("expected 1 request and param, got %d and %d", len(reqs), len(params))
+	}
+
+	// Writing the read-only point should be rejected
+	_, _, err = BuildPropertyWriteRequests(device, map[string]interface{}{
+		"readonly_point": int16(99),
+	})
+	if err == nil {
+		t.Fatal("expected error for write to R point, got nil")
+	}
+	if !strings.Contains(err.Error(), "readonly_point") || !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+
+	// Writing both RW and R points should be rejected
+	_, _, err = BuildPropertyWriteRequests(device, map[string]interface{}{
+		"writable_point": int16(42),
+		"readonly_point": int16(99),
+	})
+	if err == nil {
+		t.Fatal("expected error when mixing RW and R points in one request")
+	}
+}
+
+func TestBuildPropertyWriteRequestsRejectsReadOnlyStructField(t *testing.T) {
+	device := contracts.DeviceConfig{
+		Name:        "test-device",
+		ProductCode: "test",
+		Property: contracts.PropertyConfig{
+			Structs: []contracts.PropertyStruct{
+				{
+					Name:      "Data",
+					Kind:      "struct_array",
+					IndexBase: 1,
+					MaxItems:  10,
+					Address: contracts.PropertyStructAddress{
+						DBNumber:    200,
+						BaseOffset:  0,
+						IndexStride: 4,
+						Unit:        "word",
+					},
+					Fields: []contracts.PropertyStructField{
+						{Name: "writable", ValueType: "Int16", FieldOffset: 0, ReadWrite: "RW"},
+						{Name: "readonly", ValueType: "Int16", FieldOffset: 2, ReadWrite: "R"},
+					},
+				},
+			},
+		},
+	}
+
+	// Writing only the writable struct field should succeed
+	reqs, params, err := BuildPropertyWriteRequests(device, map[string]interface{}{
+		"Data": map[string]interface{}{
+			"1": map[string]interface{}{
+				"writable": int16(10),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected write to RW struct field to succeed, got error: %v", err)
+	}
+	if len(reqs) != 1 || len(params) != 1 {
+		t.Fatalf("expected 1 request and param, got %d and %d", len(reqs), len(params))
+	}
+
+	// Writing the read-only struct field should be rejected
+	_, _, err = BuildPropertyWriteRequests(device, map[string]interface{}{
+		"Data": map[string]interface{}{
+			"1": map[string]interface{}{
+				"readonly": int16(99),
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for write to R struct field, got nil")
+	}
+	if !strings.Contains(err.Error(), "readonly") || !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("unexpected error message: %v", err)
 	}
 }

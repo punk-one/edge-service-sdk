@@ -173,7 +173,22 @@ func BuildPropertyWriteRequests(device contracts.DeviceConfig, data map[string]i
 		return nil, nil, fmt.Errorf("no writable property fields resolved")
 	}
 
+	if err := ValidateWritable(reqs); err != nil {
+		return nil, nil, err
+	}
+
 	return reqs, params, nil
+}
+
+// ValidateWritable 检查所有请求点位是否可写，遇到 readWrite=R 的立即返回 error。
+// 在 BuildPropertyWriteRequests 返回前调用，确保 R 点位不会送到 driver。
+func ValidateWritable(reqs []contracts.CommandRequest) error {
+	for _, req := range reqs {
+		if req.Properties.ReadWrite == "R" {
+			return fmt.Errorf("point %q is read-only (readWrite=R), write rejected", req.DeviceResourceName)
+		}
+	}
+	return nil
 }
 
 func BuildPropertyReadRequests(device contracts.DeviceConfig, data map[string]interface{}) ([]contracts.CommandRequest, []PropertyBinding, error) {
