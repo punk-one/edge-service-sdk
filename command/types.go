@@ -19,9 +19,10 @@ type CommandResponse = ctl.Result
 
 // CommandParam describes one command input or output parameter.
 type CommandParam struct {
-	Identifier string `json:"identifier"`
-	ValueType  string `json:"value_type"`
-	Required   bool   `json:"required,omitempty"`
+	Identifier  string `json:"identifier"`
+	ValueType   string `json:"value_type"`
+	Required    bool   `json:"required,omitempty"`
+	Description string `json:"description,omitempty"`
 }
 
 // CommandDescriptor is the static metadata exposed for one registered command.

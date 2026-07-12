@@ -166,9 +166,26 @@ func (f PropertyStructField) IsStruct() bool { return f.Kind == "struct" }
 // IsArray reports whether this field is an array.
 func (f PropertyStructField) IsArray() bool { return f.Kind == "array" }
 
+// SchemaField describes one field in a command's input or output schema.
+type SchemaField struct {
+	Name        string `yaml:"name"`
+	ValueType   string `yaml:"valueType"`
+	Required    bool   `yaml:"required"`
+	Description string `yaml:"description,omitempty"`
+}
+
 // CommandConfig declares one remotely callable command supported by a device/profile.
 type CommandConfig struct {
-	Identifier string `yaml:"identifier"`
+	Identifier   string       `yaml:"identifier"`
+	Enabled      *bool        `yaml:"enabled,omitempty"`
+	InputSchema  []SchemaField `yaml:"inputSchema,omitempty"`
+	OutputSchema []SchemaField `yaml:"outputSchema,omitempty"`
+}
+
+// IsEnabled reports whether this command is enabled.
+// A nil Enabled pointer means the command is enabled by default.
+func (c CommandConfig) IsEnabled() bool {
+	return c.Enabled == nil || *c.Enabled
 }
 
 // ResourceProperties represents resource properties

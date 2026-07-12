@@ -437,6 +437,12 @@ func NormalizeDeviceConfig(device contracts.DeviceConfig) contracts.DeviceConfig
 	}
 	for i := range device.Commands {
 		device.Commands[i].Identifier = strings.TrimSpace(device.Commands[i].Identifier)
+		for j := range device.Commands[i].InputSchema {
+			device.Commands[i].InputSchema[j].ValueType = contracts.NormalizedValueType(device.Commands[i].InputSchema[j].ValueType)
+		}
+		for j := range device.Commands[i].OutputSchema {
+			device.Commands[i].OutputSchema[j].ValueType = contracts.NormalizedValueType(device.Commands[i].OutputSchema[j].ValueType)
+		}
 	}
 	return device
 }
@@ -464,6 +470,12 @@ func NormalizeProfile(profile contracts.DeviceProfile) contracts.DeviceProfile {
 	}
 	for i := range profile.Commands {
 		profile.Commands[i].Identifier = strings.TrimSpace(profile.Commands[i].Identifier)
+		for j := range profile.Commands[i].InputSchema {
+			profile.Commands[i].InputSchema[j].ValueType = contracts.NormalizedValueType(profile.Commands[i].InputSchema[j].ValueType)
+		}
+		for j := range profile.Commands[i].OutputSchema {
+			profile.Commands[i].OutputSchema[j].ValueType = contracts.NormalizedValueType(profile.Commands[i].OutputSchema[j].ValueType)
+		}
 	}
 	return profile
 }
