@@ -158,6 +158,8 @@ func (p *MQTTPublisher) formatTelemetry(event outevent.TelemetryEvent, data map[
 		})
 	case "influx":
 		return p.convertToInfluxFormat(event, data, replayed)
+	case "compact":
+		return p.convertToCompactFormat(event, data, replayed, sendAt)
 	case "telemetry":
 		return p.convertToTelemetryFormat(event, data, replayed, sendAt)
 	case "rule", "":
@@ -219,6 +221,16 @@ func (p *MQTTPublisher) convertToTelemetryFormat(event outevent.TelemetryEvent, 
 		"isReplayed": replayed,
 		"deviceName": event.DeviceName,
 		"data":       deviceData,
+	})
+}
+
+func (p *MQTTPublisher) convertToCompactFormat(event outevent.TelemetryEvent, data map[string]interface{}, replayed bool, sendAt int64) ([]byte, error) {
+	deviceData := make(map[string]interface{}, len(data))
+	for key, value := range data {
+		deviceData[key] = actualValue(value)
+	}
+	return json.Marshal(map[string]interface{}{
+		event.DeviceName: deviceData,
 	})
 }
 
