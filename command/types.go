@@ -25,13 +25,24 @@ type CommandParam struct {
 	Description string `json:"description,omitempty"`
 }
 
+// SchemaField describes one field in a command's input or output schema.
+type SchemaField struct {
+	Identifier  string `json:"identifier"`
+	ValueType   string `json:"value_type"`
+	Required    bool   `json:"required,omitempty"`
+	Description string `json:"description,omitempty"`
+}
+
 // CommandDescriptor is the static metadata exposed for one registered command.
 type CommandDescriptor struct {
-	Identifier   string         `json:"identifier"`
-	Name         string         `json:"name"`
-	Mode         string         `json:"mode"`
-	InputParams  []CommandParam `json:"input_params,omitempty"`
-	OutputParams []CommandParam `json:"output_params,omitempty"`
+	Identifier    string         `json:"identifier"`
+	Name          string         `json:"name"`
+	Mode          string         `json:"mode"`
+	Enable        bool           `json:"enable"`
+	InputParams   []CommandParam `json:"input_params,omitempty"`
+	OutputParams  []CommandParam `json:"output_params,omitempty"`
+	InputSchema   []SchemaField  `json:"input_schema,omitempty"`
+	OutputSchema  []SchemaField  `json:"output_schema,omitempty"`
 }
 
 // ProgressPayload is persisted as result.data.progress for processing events.
@@ -219,16 +230,35 @@ func normalizeDescriptor(desc CommandDescriptor) (CommandDescriptor, error) {
 			return CommandDescriptor{}, fmt.Errorf("command %q has empty output parameter identifier", desc.Identifier)
 		}
 	}
+	desc.InputSchema = cloneSchemaFields(desc.InputSchema)
+	desc.OutputSchema = cloneSchemaFields(desc.OutputSchema)
+	for i := range desc.InputSchema {
+		desc.InputSchema[i].Identifier = strings.TrimSpace(desc.InputSchema[i].Identifier)
+		desc.InputSchema[i].ValueType = strings.TrimSpace(desc.InputSchema[i].ValueType)
+		if desc.InputSchema[i].Identifier == "" {
+			return CommandDescriptor{}, fmt.Errorf("command %q has empty input schema field identifier", desc.Identifier)
+		}
+	}
+	for i := range desc.OutputSchema {
+		desc.OutputSchema[i].Identifier = strings.TrimSpace(desc.OutputSchema[i].Identifier)
+		desc.OutputSchema[i].ValueType = strings.TrimSpace(desc.OutputSchema[i].ValueType)
+		if desc.OutputSchema[i].Identifier == "" {
+			return CommandDescriptor{}, fmt.Errorf("command %q has empty output schema field identifier", desc.Identifier)
+		}
+	}
 	return desc, nil
 }
 
 func cloneDescriptor(desc CommandDescriptor) CommandDescriptor {
 	return CommandDescriptor{
-		Identifier:   desc.Identifier,
-		Name:         desc.Name,
-		Mode:         desc.Mode,
-		InputParams:  cloneParams(desc.InputParams),
-		OutputParams: cloneParams(desc.OutputParams),
+		Identifier:    desc.Identifier,
+		Name:          desc.Name,
+		Mode:          desc.Mode,
+		Enable:        desc.Enable,
+		InputParams:   cloneParams(desc.InputParams),
+		OutputParams:  cloneParams(desc.OutputParams),
+		InputSchema:   cloneSchemaFields(desc.InputSchema),
+		OutputSchema:  cloneSchemaFields(desc.OutputSchema),
 	}
 }
 
@@ -237,6 +267,15 @@ func cloneParams(items []CommandParam) []CommandParam {
 		return nil
 	}
 	cloned := make([]CommandParam, len(items))
+	copy(cloned, items)
+	return cloned
+}
+
+func cloneSchemaFields(items []SchemaField) []SchemaField {
+	if len(items) == 0 {
+		return nil
+	}
+	cloned := make([]SchemaField, len(items))
 	copy(cloned, items)
 	return cloned
 }

@@ -87,6 +87,11 @@ func (s *Service) Execute(identifier string, req cmdapi.CommandRequest, expected
 		s.record(normalized.DeviceCode, device.ProductCode, desc.Identifier, normalized.TraceID, result)
 		return result, httpStatusForCode(result.Code)
 	}
+	if err := validateInputSchema(desc.InputSchema, normalized.Data); err != nil {
+		result := newControlResult(normalized.TraceID, ctl.CodeBadRequest, err.Error(), nil)
+		s.record(normalized.DeviceCode, device.ProductCode, desc.Identifier, normalized.TraceID, result)
+		return result, httpStatusForCode(result.Code)
+	}
 
 	switch desc.Mode {
 	case "async":
@@ -367,6 +372,9 @@ func (s *Service) executePendingCommand(pending rtcontrol.PendingCommand) cmdapi
 	if err := validateInputParams(desc.InputParams, pending.Request.Data); err != nil {
 		return newControlResult(pending.TraceID, ctl.CodeBadRequest, err.Error(), nil)
 	}
+	if err := validateInputSchema(desc.InputSchema, pending.Request.Data); err != nil {
+		return newControlResult(pending.TraceID, ctl.CodeBadRequest, err.Error(), nil)
+	}
 	resultData, cmdErr := s.executeRegisteredCommand(device, desc, cmd, cmdapi.CommandRequest(pending.Request), func(progress cmdapi.ProgressPayload) {
 		s.recordProgress(pending, progress)
 	})
@@ -528,6 +536,22 @@ func validateInputParams(params []cmdapi.CommandParam, data map[string]interface
 		value, ok := data[param.Identifier]
 		if !ok || value == nil {
 			return fmt.Errorf("command input %q is required", param.Identifier)
+		}
+	}
+	return nil
+}
+
+func validateInputSchema(schema []cmdapi.SchemaField, data map[string]interface{}) error {
+	if data == nil {
+		data = map[string]interface{}{}
+	}
+	for _, field := range schema {
+		if !field.Required {
+			continue
+		}
+		value, ok := data[field.Identifier]
+		if !ok || value == nil {
+			return fmt.Errorf("command input %q is required", field.Identifier)
 		}
 	}
 	return nil

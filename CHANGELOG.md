@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.8.5
+
+- Added `SchemaField` type to `command` package for structured input/output schema definitions.
+- Added `Enable bool`, `InputSchema []SchemaField`, `OutputSchema []SchemaField` fields to `CommandDescriptor`.
+- Updated `normalizeDescriptor` and `cloneDescriptor` to handle new `SchemaField` fields.
+- Added `validateInputSchema` in `runtime/command` service for required field validation alongside `validateInputParams`.
+
 ## v0.7.5
 
 - Added `kind: struct` support for standalone structs (no index) with multi-field nested structures.
