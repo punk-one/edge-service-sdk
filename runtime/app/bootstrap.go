@@ -10,6 +10,7 @@ import (
 	cmdapi "github.com/punk-one/edge-service-sdk/command"
 	appconfig "github.com/punk-one/edge-service-sdk/config"
 	contracts "github.com/punk-one/edge-service-sdk/driver"
+	"github.com/punk-one/edge-service-sdk/file"
 	logger "github.com/punk-one/edge-service-sdk/logging"
 	httpserver "github.com/punk-one/edge-service-sdk/ops/http"
 	rtstatus "github.com/punk-one/edge-service-sdk/ops/status"
@@ -257,7 +258,8 @@ func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver, reg
 		logClient.Warnf("Failed to resume pending property tasks: %v", err)
 	}
 
-	commandService := rtcommand.NewService(sdk, driver, publisher, controlStore, logClient, registry)
+	fileClient := file.NewClient()
+	commandService := rtcommand.NewService(sdk, driver, publisher, controlStore, logClient, registry, fileClient)
 	commandService.RegisterMQTTHandlers(config)
 	if err := commandService.ResumePending(); err != nil {
 		logClient.Warnf("Failed to resume pending commands: %v", err)

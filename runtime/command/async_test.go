@@ -28,7 +28,7 @@ func TestExecuteAsyncCommandReturnsAcceptedAndPublishesFinalResult(t *testing.T)
 		},
 	})
 	publisher := &commandTestPublisher{}
-	service := NewService(&commandTestCatalog{device: device}, &commandTestDriver{}, publisher, store, nil, registry)
+	service := NewService(&commandTestCatalog{device: device}, &commandTestDriver{}, publisher, store, nil, registry, nil)
 	service.commandResultEnabled = true
 
 	result, statusCode := service.Execute("program_install", cmdapi.CommandRequest{TraceID: "trace-async-1", DeviceCode: "qhl0001", Data: map[string]interface{}{}}, "")
@@ -95,7 +95,7 @@ func TestExecuteWithCompletedTraceReturnsStoredResult(t *testing.T) {
 		},
 	})
 	publisher := &commandTestPublisher{}
-	service := NewService(&commandTestCatalog{device: device}, &commandTestDriver{}, publisher, store, nil, registry)
+	service := NewService(&commandTestCatalog{device: device}, &commandTestDriver{}, publisher, store, nil, registry, nil)
 	service.commandResultEnabled = true
 
 	first, statusCode := service.Execute("program_install", cmdapi.CommandRequest{TraceID: "trace-dup", DeviceCode: "qhl0001", Data: map[string]interface{}{}}, "")
@@ -143,7 +143,7 @@ func TestResumePendingAsyncCommand(t *testing.T) {
 		},
 	})
 	publisher := &commandTestPublisher{}
-	service := NewService(&commandTestCatalog{device: device}, &commandTestDriver{}, publisher, store, nil, registry)
+	service := NewService(&commandTestCatalog{device: device}, &commandTestDriver{}, publisher, store, nil, registry, nil)
 	service.commandResultEnabled = true
 
 	if err := service.ResumePending(); err != nil {

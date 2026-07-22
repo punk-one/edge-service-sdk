@@ -235,7 +235,7 @@ func TestHTTPCommandCallAcceptedThenPublishesCommandResult(t *testing.T) {
 		},
 	})
 	publisher := &flowPublisher{}
-	service := rtcommand.NewService(catalog, &controlFlowDriver{}, publisher, store, nil, registry)
+	service := rtcommand.NewService(catalog, &controlFlowDriver{}, publisher, store, nil, registry, nil)
 	service.RegisterMQTTHandlers(cfg.Config{CommandCall: mqtt.TopicConfig{Topic: "v1/gateway/{productCode}/command/call/{identifier}"}, CommandResult: mqtt.TopicConfig{Topic: "v1/gateway/{productCode}/command/result"}})
 
 	server := New(Config{

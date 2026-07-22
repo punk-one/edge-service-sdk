@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/punk-one/edge-service-sdk/file"
 	ctl "github.com/punk-one/edge-service-sdk/control"
 	logger "github.com/punk-one/edge-service-sdk/logging"
 )
@@ -103,6 +104,8 @@ type CommandContext interface {
 	DeviceCode() string
 	Metadata() *ctl.Metadata
 	Logger() logger.LoggingClient
+
+	FileClient() file.Client
 
 	GetProperties(names []string) (map[string]interface{}, error)
 	SetProperties(values map[string]interface{}) error

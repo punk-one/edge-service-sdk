@@ -181,7 +181,7 @@ func TestExecuteRegisteredCommandUsesTelemetryHelper(t *testing.T) {
 		},
 	})
 	driver := &commandTestDriver{readValues: []*contracts.CommandValue{{DeviceResourceName: "in_production", Type: "Bool", Value: true}}}
-	service := NewService(&commandTestCatalog{device: device}, driver, &commandTestPublisher{}, nil, nil, registry)
+	service := NewService(&commandTestCatalog{device: device}, driver, &commandTestPublisher{}, nil, nil, registry, nil)
 
 	result, statusCode := service.Execute("read_line_snapshot", cmdapi.CommandRequest{TraceID: "trace-telemetry", DeviceCode: "qhl0001", Data: map[string]interface{}{}}, "")
 	if statusCode != 200 {
@@ -225,7 +225,7 @@ func TestExecuteRegisteredCommandUsesPropertyHelpers(t *testing.T) {
 		},
 	})
 	driver := &commandTestDriver{readValues: []*contracts.CommandValue{{DeviceResourceName: "flux_conv_speed_setpoint", Type: "Float32", Value: float32(12.5)}}}
-	service := NewService(&commandTestCatalog{device: device}, driver, &commandTestPublisher{}, nil, nil, registry)
+	service := NewService(&commandTestCatalog{device: device}, driver, &commandTestPublisher{}, nil, nil, registry, nil)
 
 	result, statusCode := service.Execute("set_flux_conv_speed", cmdapi.CommandRequest{TraceID: "trace-set", DeviceCode: "qhl0001", Data: map[string]interface{}{"flux_conv_speed_setpoint": 12.5}}, "")
 	if statusCode != 200 || result.Code != ctl.CodeSuccess {
@@ -254,7 +254,7 @@ func TestExecuteRejectsMissingRequiredInput(t *testing.T) {
 			}},
 		},
 	})
-	service := NewService(&commandTestCatalog{device: testDevice("qhl0001", "qhl", "set_flux_conv_speed")}, &commandTestDriver{}, &commandTestPublisher{}, nil, nil, registry)
+	service := NewService(&commandTestCatalog{device: testDevice("qhl0001", "qhl", "set_flux_conv_speed")}, &commandTestDriver{}, &commandTestPublisher{}, nil, nil, registry, nil)
 
 	result, statusCode := service.Execute("set_flux_conv_speed", cmdapi.CommandRequest{TraceID: "trace-missing", DeviceCode: "qhl0001", Data: map[string]interface{}{}}, "")
 	if statusCode != 400 || result.Code != ctl.CodeBadRequest {
@@ -264,7 +264,7 @@ func TestExecuteRejectsMissingRequiredInput(t *testing.T) {
 
 func TestExecuteRejectsExpiredRequest(t *testing.T) {
 	registry := newTestRegistry(stubCommand{desc: cmdapi.CommandDescriptor{Identifier: "start_machine", Mode: "sync"}})
-	service := NewService(&commandTestCatalog{device: testDevice("qhl0001", "qhl", "start_machine")}, &commandTestDriver{}, &commandTestPublisher{}, nil, nil, registry)
+	service := NewService(&commandTestCatalog{device: testDevice("qhl0001", "qhl", "start_machine")}, &commandTestDriver{}, &commandTestPublisher{}, nil, nil, registry, nil)
 
 	result, statusCode := service.Execute("start_machine", cmdapi.CommandRequest{
 		TraceID:    "trace-expired",
@@ -278,7 +278,7 @@ func TestExecuteRejectsExpiredRequest(t *testing.T) {
 }
 
 func TestExecuteReturnsUnsupportedForUnknownCommand(t *testing.T) {
-	service := NewService(&commandTestCatalog{device: testDevice("qhl0001", "qhl")}, &commandTestDriver{}, &commandTestPublisher{}, nil, nil, cmdapi.NewRegistry())
+	service := NewService(&commandTestCatalog{device: testDevice("qhl0001", "qhl")}, &commandTestDriver{}, &commandTestPublisher{}, nil, nil, cmdapi.NewRegistry(), nil)
 
 	result, statusCode := service.Execute("unknown", cmdapi.CommandRequest{TraceID: "trace-unknown", DeviceCode: "qhl0001", Data: map[string]interface{}{}}, "")
 	if statusCode != 405 || result.Code != ctl.CodeNotSupported {
@@ -288,7 +288,7 @@ func TestExecuteReturnsUnsupportedForUnknownCommand(t *testing.T) {
 
 func TestExecuteReturnsUnsupportedForCommandNotBoundToDevice(t *testing.T) {
 	registry := newTestRegistry(stubCommand{desc: cmdapi.CommandDescriptor{Identifier: "start_machine", Mode: "sync"}})
-	service := NewService(&commandTestCatalog{device: testDevice("qhl0001", "qhl")}, &commandTestDriver{}, &commandTestPublisher{}, nil, nil, registry)
+	service := NewService(&commandTestCatalog{device: testDevice("qhl0001", "qhl")}, &commandTestDriver{}, &commandTestPublisher{}, nil, nil, registry, nil)
 
 	result, statusCode := service.Execute("start_machine", cmdapi.CommandRequest{TraceID: "trace-unbound", DeviceCode: "qhl0001", Data: map[string]interface{}{}}, "")
 	if statusCode != 405 || result.Code != ctl.CodeNotSupported {

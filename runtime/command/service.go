@@ -11,6 +11,7 @@ import (
 	cfg "github.com/punk-one/edge-service-sdk/config"
 	ctl "github.com/punk-one/edge-service-sdk/control"
 	contracts "github.com/punk-one/edge-service-sdk/driver"
+	"github.com/punk-one/edge-service-sdk/file"
 	logger "github.com/punk-one/edge-service-sdk/logging"
 	rtconfig "github.com/punk-one/edge-service-sdk/runtime/config"
 	rtcontrol "github.com/punk-one/edge-service-sdk/runtime/control"
@@ -31,12 +32,13 @@ type Service struct {
 	registry             cmdapi.Registry
 	logger               logger.LoggingClient
 	commandResultEnabled bool
+	fileClient           file.Client
 
 	mu          sync.Mutex
 	activeAsync map[string]struct{}
 }
 
-func NewService(catalog DeviceCatalog, driver contracts.ProtocolDriver, publisher mqtt.Publisher, store rtcontrol.Store, logClient logger.LoggingClient, registry cmdapi.Registry) *Service {
+func NewService(catalog DeviceCatalog, driver contracts.ProtocolDriver, publisher mqtt.Publisher, store rtcontrol.Store, logClient logger.LoggingClient, registry cmdapi.Registry, fileClient file.Client) *Service {
 	if registry == nil {
 		registry = cmdapi.NewRegistry()
 	}
@@ -47,6 +49,7 @@ func NewService(catalog DeviceCatalog, driver contracts.ProtocolDriver, publishe
 		store:       store,
 		registry:    registry,
 		logger:      logClient,
+		fileClient:  fileClient,
 		activeAsync: make(map[string]struct{}),
 	}
 }
@@ -386,10 +389,11 @@ func (s *Service) executePendingCommand(pending rtcontrol.PendingCommand) cmdapi
 
 func (s *Service) executeRegisteredCommand(device contracts.DeviceConfig, desc cmdapi.CommandDescriptor, cmd cmdapi.Command, req cmdapi.CommandRequest, progress func(cmdapi.ProgressPayload)) (_ map[string]interface{}, cmdErr *cmdapi.CommandError) {
 	ctx := &runtimeCommandContext{
-		service:  s,
-		device:   device,
-		req:      req,
-		progress: progress,
+		service:    s,
+		device:     device,
+		req:        req,
+		progress:   progress,
+		fileClient: s.fileClient,
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -587,10 +591,11 @@ func cloneProgress(progress cmdapi.ProgressPayload) map[string]interface{} {
 }
 
 type runtimeCommandContext struct {
-	service  *Service
-	device   contracts.DeviceConfig
-	req      cmdapi.CommandRequest
-	progress func(cmdapi.ProgressPayload)
+	service    *Service
+	device     contracts.DeviceConfig
+	req        cmdapi.CommandRequest
+	progress   func(cmdapi.ProgressPayload)
+	fileClient file.Client
 }
 
 func (c *runtimeCommandContext) TraceID() string {
@@ -610,6 +615,10 @@ func (c *runtimeCommandContext) Logger() logger.LoggingClient {
 		return nil
 	}
 	return c.service.logger
+}
+
+func (c *runtimeCommandContext) FileClient() file.Client {
+	return c.fileClient
 }
 
 func (c *runtimeCommandContext) GetProperties(names []string) (map[string]interface{}, error) {
