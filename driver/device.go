@@ -85,6 +85,8 @@ type TelemetryConfig struct {
 	Points            []PointConfig    `yaml:"points"`
 	Groups            []TelemetryGroup `yaml:"groups"`
 	Structs           []PropertyStruct `yaml:"structs"`
+	BitMerge          bool             `yaml:"bitMerge"`
+	BitMergeMaxGap    int              `yaml:"bitMergeMaxGap"`
 }
 
 // PropertyConfig defines remotely readable/writable properties for a device.
@@ -95,6 +97,8 @@ type PropertyConfig struct {
 	HeartbeatInterval string           `yaml:"heartbeatInterval"`
 	Points            []PointConfig    `yaml:"points"`
 	Structs           []PropertyStruct `yaml:"structs"`
+	BitMerge          bool             `yaml:"bitMerge"`
+	BitMergeMaxGap    int              `yaml:"bitMergeMaxGap"`
 }
 
 // PointConfig defines a telemetry/property point configured directly on the device.

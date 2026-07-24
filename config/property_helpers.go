@@ -108,6 +108,17 @@ func ProtocolPropertiesFromConfig(device contracts.DeviceConfig) map[string]cont
 			protocols[name] = v
 		}
 	}
+	// Inject bitMerge config from telemetry/property into s7 protocol properties.
+	if s7, ok := protocols["s7"]; ok {
+		if device.Telemetry.BitMerge {
+			s7["bitMerge"] = true
+			s7["bitMergeMaxGap"] = device.Telemetry.BitMergeMaxGap
+		}
+		if device.Property.BitMerge {
+			s7["propertyBitMerge"] = true
+			s7["propertyBitMergeMaxGap"] = device.Property.BitMergeMaxGap
+		}
+	}
 	return protocols
 }
 
