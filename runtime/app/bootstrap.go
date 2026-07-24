@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"time"
@@ -12,6 +13,9 @@ import (
 	contracts "github.com/punk-one/edge-service-sdk/driver"
 	"github.com/punk-one/edge-service-sdk/file"
 	logger "github.com/punk-one/edge-service-sdk/logging"
+	"github.com/punk-one/edge-service-sdk/runtime/ops"
+	"github.com/punk-one/edge-service-sdk/runtime/ops/configsvc"
+	"github.com/punk-one/edge-service-sdk/runtime/ops/logsvc"
 	httpserver "github.com/punk-one/edge-service-sdk/ops/http"
 	rtstatus "github.com/punk-one/edge-service-sdk/ops/status"
 	rtapi "github.com/punk-one/edge-service-sdk/property"
@@ -34,12 +38,26 @@ type DeviceSDK struct {
 	productDevices map[string][]contracts.DeviceConfig
 	nameIndex      map[string]string
 	statusTracker  *rtstatus.Tracker
+
+	// Ops services
+	configService   *configsvc.ConfigService
+	logSearcher     *logsvc.LogSearcher
+	restarter       *ops.Restarter
+	statusPublisher *deviceStatusPublisher
 }
 
 type telemetryState struct {
 	lastValues    map[string]interface{}
 	lastEmittedAt map[string]int64
 }
+
+// Ops services exposed for app-layer command access.
+// These are set during Bootstrap() and safe to read after Bootstrap() completes.
+var (
+	ConfigService *configsvc.ConfigService
+	LogSearcher   *logsvc.LogSearcher
+	Restarter     *ops.Restarter
+)
 
 func NewDeviceSDK(config rtconfig.Config, logClient logger.LoggingClient, tracker *rtstatus.Tracker) *DeviceSDK {
 	if logClient == nil {
@@ -152,6 +170,22 @@ func (s *DeviceSDK) DeviceWriteFailed(deviceName string, err error) {
 	}
 }
 
+// ConfigService returns the runtime configuration service.
+func (s *DeviceSDK) ConfigService() *configsvc.ConfigService { return s.configService }
+
+// LogSearcher returns the log search service.
+func (s *DeviceSDK) LogSearcher() *logsvc.LogSearcher { return s.logSearcher }
+
+// Restarter returns the service restarter.
+func (s *DeviceSDK) Restarter() *ops.Restarter { return s.restarter }
+
+// UpdateHeartbeatInterval updates the status report heartbeat interval at runtime.
+func (s *DeviceSDK) UpdateHeartbeatInterval(interval time.Duration) {
+	if s.statusPublisher != nil {
+		s.statusPublisher.UpdateHeartbeatInterval(interval)
+	}
+}
+
 func validateCommandBindings(devices []contracts.DeviceConfig, registry cmdapi.Registry) error {
 	for _, device := range devices {
 		seen := map[string]struct{}{}
@@ -233,6 +267,39 @@ func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver, reg
 		return
 	}
 
+	// Initialize ops services
+	logDir := filepath.Dir(config.Logging.File)
+	if logDir == "" || logDir == "." {
+		logDir = "."
+	}
+	configService := configsvc.NewConfigService("./configs", config.Devices, nil)
+	logSearcher := logsvc.NewLogSearcher(logDir)
+	restarter := ops.NewRestarter(serviceName, func() error {
+		logClient.Infof("Soft restart triggered for %s", serviceName)
+		return nil
+	})
+
+	// Wire config change callback for hot-reload
+	configService.SetOnChange(func(change configsvc.ConfigChange) {
+		if change.Scope == "config" && change.ConfigPath == "statusReport.heartbeatInterval" {
+			if s, ok := change.NewValue.(string); ok {
+				if d, err := time.ParseDuration(s); err == nil && d > 0 {
+					sdk.UpdateHeartbeatInterval(d)
+					logClient.Infof("Hot-reloaded heartbeat interval to %s", s)
+				}
+			}
+		}
+	})
+
+	sdk.configService = configService
+	sdk.logSearcher = logSearcher
+	sdk.restarter = restarter
+
+	// Expose for app-layer command access
+	ConfigService = configService
+	LogSearcher = logSearcher
+	Restarter = restarter
+
 	dependencyManager := dependency.NewDependencyManager(logClient)
 	dependencyManager.Register(dependency.NamedDependency("driver", func() error { return nil }))
 	dependencyManager.Register(dependency.NamedDependency("auth", authService.HealthCheck))
@@ -268,7 +335,7 @@ func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver, reg
 	queryService := newMQTTQueryService(sdk, registry, controlStore, publisher, logClient)
 	queryService.RegisterMQTTHandlers(config)
 
-	installStatusPublisher(statusTracker, sdk, publisher, config.StatusReport, logClient)
+	sdk.statusPublisher = installStatusPublisher(statusTracker, sdk, publisher, config.StatusReport, logClient)
 
 	go processAsyncValues(sdk, telemetrySink, logClient)
 
@@ -798,12 +865,13 @@ func buildRuntimeReadiness(authService *rtauth.Service, publisher mqtt.Publisher
 	}
 }
 
-func installStatusPublisher(tracker *rtstatus.Tracker, sdk *DeviceSDK, publisher mqtt.Publisher, topicConfig mqtt.TopicConfig, logClient logger.LoggingClient) {
+func installStatusPublisher(tracker *rtstatus.Tracker, sdk *DeviceSDK, publisher mqtt.Publisher, topicConfig mqtt.TopicConfig, logClient logger.LoggingClient) *deviceStatusPublisher {
 	reporter := newDeviceStatusPublisher(tracker, sdk, publisher, topicConfig, logClient)
 	if reporter == nil {
-		return
+		return nil
 	}
 	reporter.Start()
+	return reporter
 }
 
 func shouldEmitTelemetry(cfg contracts.TelemetryConfig, values []*contracts.CommandValue, state telemetryState, now time.Time) bool {

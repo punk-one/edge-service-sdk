@@ -82,6 +82,17 @@ func (p *deviceStatusPublisher) Start() {
 	go p.runHeartbeatLoop()
 }
 
+// UpdateHeartbeatInterval updates the heartbeat interval at runtime.
+// The new interval takes effect on the next heartbeat tick.
+func (p *deviceStatusPublisher) UpdateHeartbeatInterval(interval time.Duration) {
+	if p == nil || interval <= 0 {
+		return
+	}
+	p.mu.Lock()
+	p.heartbeatInterval = interval
+	p.mu.Unlock()
+}
+
 func (p *deviceStatusPublisher) runHeartbeatLoop() {
 	if p == nil || p.heartbeatInterval <= 0 {
 		return
