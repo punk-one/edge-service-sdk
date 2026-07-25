@@ -1,6 +1,21 @@
 # Changelog
 
-## v0.8.5
+## v0.8.8
+
+- Added **multi-MQTT broker support** with group-based architecture: top-level parallel groups with per-group failover broker chains (`transport/mqtt/multi.go`). Each group supports per-broker `clientId`, `username`, `password` config, per-group `dataFormat` overrides, and per-group `heartbeatInterval`.
+- Added `MQTTGroupConfig` to `types.go` with `Name`, `TelemetryFormat`, `StatusReportFormat`, `HeartbeatInterval`, `Brokers` fields.
+- Added `MultiGroupPublisher` interface with `GroupPublishers()` and `GroupStatusTopic(i)` methods.
+- Added `NewPublisher()` factory that auto-detects groups vs single-broker mode for full backward compatibility.
+- Added `PublishJSON` to `Publisher` interface for MQTT query transport.
+- Added `StartHeartbeatOnly()` to `deviceStatusPublisher` for per-group independent heartbeat goroutines (`runtime/app/status_report.go`).
+- Added **runtime ops services**: `configsvc.ConfigService` (dynamic config read/write, diff, backup, restore, hot-reload callbacks), `logsvc.LogSearcher` (paginated log browsing with filtering), `ops.Restarter` (service restart lifecycle).
+- Added **service port auto-assign**: `service.port: 0` now auto-binds to an OS-picked free port instead of disabling the server.
+- Added **service port range search**: `service.portEnd` enables trying ports in `[port, portEnd]` range, using the first available.
+- Changed `Server.Run()` to use `net.Listen` + `Serve` for actual port capture; runtime status API now reports the actual bound port.
+- Added `bitMerge bool` to `TelemetryConfig` and `PropertyConfig`, propagated through `mergeDeviceWithProfile`.
+- Enhanced `convertToCompactFormat` to include `trace_id`, `time`, `send_at` fields.
+- Added ClientId randomization: `sdk-{10-digit}` when unset, `{custom}-{6-digit}` when configured in `lifecycle.go`.
+- Added `FileClient` to `CommandContext` interface for presigned URL file transfer.
 
 - Added `SchemaField` type to `command` package for structured input/output schema definitions.
 - Added `Enable bool`, `InputSchema []SchemaField`, `OutputSchema []SchemaField` fields to `CommandDescriptor`.

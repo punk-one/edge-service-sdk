@@ -17,6 +17,16 @@ It extracts the common runtime, control, and transport capabilities out of proto
 - control job persistence, result history, diagnostics, export, and MQTT query handling
 - dependency checks, worker supervision, and shared logging contracts
 
+## What's New In v0.8.8
+
+- **Multi-MQTT broker support** — group-based architecture: top-level parallel groups, each group with its own failover broker chain. Per-group `dataFormat` overrides, per-group `heartbeatInterval`, and per-broker `clientId`/`username`/`password`. `NewPublisher()` factory auto-detects groups vs single-broker mode.
+- **Per-group device status** — `deviceStatusPublisher` creates independent heartbeat goroutines per MQTT group via `StartHeartbeatOnly()`.
+- **Runtime ops services** — `configsvc.ConfigService` for dynamic config read/write, diff, backup, restore, and hot-reload callback support. `logsvc.LogSearcher` for log file browsing with pagination and filtering. `ops.Restarter` for service restarts.
+- **Service port auto-assign & range search** — `service.port: 0` now auto-assigns a free port (OS-picked). `service.portEnd` enables range search: try each port in `[port, portEnd]`, use the first available. Previously `port <= 0` disabled the server.
+- **Telemetry compact format** — now includes `trace_id`, `time`, and `send_at` alongside device-name-keyed data.
+- **bitMerge config** — `bitMerge` field on `TelemetryConfig` and `PropertyConfig` for bit-level data merging.
+- **ClientId randomization** — MQTT clientId always gets a random suffix: `sdk-{10-digit}` when unset, `{custom}-{6-digit}` when configured.
+
 ## What's New In v0.7.5
 
 - **`kind: struct`** — standalone struct type (no index), supports multi-field nested structures: `PropertyStructField` now has recursive `Kind`, `Fields`, `MaxItems`, `IndexStride` for nesting
@@ -151,4 +161,4 @@ MQTT runtime capabilities include telemetry/property/status publishing, property
 
 ## Version
 
-This repository is being published as `v0.7.5`.
+This repository is being published as `v0.8.8`.
