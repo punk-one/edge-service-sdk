@@ -3,6 +3,7 @@ package mqtt
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"time"
 
 	logger "github.com/punk-one/edge-service-sdk/logging"
@@ -169,7 +170,12 @@ func (c *mqttClient) connectOnce(mode string) error {
 		return fmt.Errorf("mqtt broker url is empty")
 	}
 
-	clientID := fmt.Sprintf("edge-service-sdk-%d", time.Now().UnixNano())
+	clientID := c.config.ClientId
+	if clientID == "" {
+		clientID = fmt.Sprintf("sdk-%010d", rand.Int63n(10000000000))
+	} else {
+		clientID = fmt.Sprintf("%s-%06d", clientID, rand.Intn(1000000))
+	}
 	opts, err := c.buildClientOptions(clientID)
 	if err != nil {
 		return err

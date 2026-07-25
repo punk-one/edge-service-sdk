@@ -82,6 +82,15 @@ func (p *deviceStatusPublisher) Start() {
 	go p.runHeartbeatLoop()
 }
 
+// StartHeartbeatOnly starts only the heartbeat loop (no OnChange registration).
+// Used for per-group heartbeat in multi-group setups.
+func (p *deviceStatusPublisher) StartHeartbeatOnly() {
+	if p == nil || p.heartbeatInterval <= 0 {
+		return
+	}
+	go p.runHeartbeatLoop()
+}
+
 // UpdateHeartbeatInterval updates the heartbeat interval at runtime.
 // The new interval takes effect on the next heartbeat tick.
 func (p *deviceStatusPublisher) UpdateHeartbeatInterval(interval time.Duration) {

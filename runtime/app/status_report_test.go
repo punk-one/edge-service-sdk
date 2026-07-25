@@ -72,6 +72,10 @@ func (p *fakeStatusPublisher) PublishStatus(device contracts.DeviceConfig, paylo
 	return nil
 }
 
+func (p *fakeStatusPublisher) PublishJSON(topic string, qos byte, retain bool, payload interface{}) error {
+	return nil
+}
+
 func (p *fakeStatusPublisher) Subscribe(topic string, qos byte, handler mqtt.MessageHandler) error {
 	return nil
 }

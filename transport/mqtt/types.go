@@ -31,34 +31,80 @@ type Publisher interface {
 	PublishPropertyReport(device contracts.DeviceConfig, payload map[string]interface{}) error
 	PublishCommandResult(device contracts.DeviceConfig, payload map[string]interface{}) error
 	PublishStatus(device contracts.DeviceConfig, payload map[string]interface{}) error
+	PublishJSON(topic string, qos byte, retain bool, payload interface{}) error
 	Subscribe(topic string, qos byte, handler MessageHandler) error
 	HealthCheck() error
 	Close() error
 }
 
+// MultiGroupPublisher is implemented by publishers that fan out to multiple groups.
+type MultiGroupPublisher interface {
+	Publisher
+	GroupPublishers() []Publisher
+	GroupStatusTopic(i int) TopicConfig
+}
+
 // MQTTConfig represents MQTT configuration.
 type MQTTConfig struct {
-	CACert                  string `yaml:"caCert"`
-	CAPath                  string `yaml:"caPath"`
-	CertPath                string `yaml:"certPath"`
-	ClientCert              string `yaml:"clientCert"`
-	ClientKey               string `yaml:"clientKey"`
-	MTLS                    bool   `yaml:"mtls"`
-	Password                string `yaml:"password"`
-	PrivKeyPath             string `yaml:"privateKeyPath"`
-	QoS                     int    `yaml:"qos"`
-	Retain                  bool   `yaml:"retain"`
-	SkipTLSVer              bool   `yaml:"skipTLSVerify"`
-	URL                     string `yaml:"url"`
-	Username                string `yaml:"username"`
-	KeepAliveSec            int    `yaml:"keepAliveSec"`
-	PingTimeoutSec          int    `yaml:"pingTimeoutSec"`
-	ConnectTimeoutSec       int    `yaml:"connectTimeoutSec"`
-	PublishTimeoutSec       int    `yaml:"publishTimeoutSec"`
-	HealthCheckIntervalSec  int    `yaml:"healthCheckIntervalSec"`
-	InitialRetryIntervalMs  int    `yaml:"initialRetryIntervalMs"`
-	MaxReconnectIntervalSec int    `yaml:"maxReconnectIntervalSec"`
-	DisconnectQuiesceMs     int    `yaml:"disconnectQuiesceMs"`
+	CACert                  string            `yaml:"caCert"`
+	CAPath                  string            `yaml:"caPath"`
+	CertPath                string            `yaml:"certPath"`
+	ClientCert              string            `yaml:"clientCert"`
+	ClientKey               string            `yaml:"clientKey"`
+	MTLS                    bool              `yaml:"mtls"`
+	Password                string            `yaml:"password"`
+	PrivKeyPath             string            `yaml:"privateKeyPath"`
+	QoS                     int               `yaml:"qos"`
+	Retain                  bool              `yaml:"retain"`
+	SkipTLSVer              bool              `yaml:"skipTLSVerify"`
+	URL                     string            `yaml:"url"`
+	Username                string            `yaml:"username"`
+	KeepAliveSec            int               `yaml:"keepAliveSec"`
+	PingTimeoutSec          int               `yaml:"pingTimeoutSec"`
+	ConnectTimeoutSec       int               `yaml:"connectTimeoutSec"`
+	PublishTimeoutSec       int               `yaml:"publishTimeoutSec"`
+	HealthCheckIntervalSec  int               `yaml:"healthCheckIntervalSec"`
+	InitialRetryIntervalMs  int               `yaml:"initialRetryIntervalMs"`
+	MaxReconnectIntervalSec int               `yaml:"maxReconnectIntervalSec"`
+	DisconnectQuiesceMs     int               `yaml:"disconnectQuiesceMs"`
+	ClientId                string            `yaml:"clientId"` // optional, auto-generated if empty
+	Groups                  []MQTTGroupConfig `yaml:"groups"`
+}
+
+// MQTTGroupConfig represents one parallel MQTT group.
+type MQTTGroupConfig struct {
+	Name                 string       `yaml:"name"`
+	Mode                 string       `yaml:"mode"`                 // "" / "failover"
+	HeartbeatInterval    string       `yaml:"heartbeatInterval"`    // overrides statusReport.heartbeatInterval
+	TelemetryFormat      string       `yaml:"telemetryFormat"`      // overrides telemetryReport.dataFormat
+	PropertyResultFormat string       `yaml:"propertyResultFormat"` // overrides propertyResult.dataFormat
+	PropertyReportFormat string       `yaml:"propertyReportFormat"` // overrides propertyReport.dataFormat
+	CommandResultFormat  string       `yaml:"commandResultFormat"`  // overrides commandResult.dataFormat
+	StatusReportFormat   string       `yaml:"statusReportFormat"`   // overrides statusReport.dataFormat
+	Brokers              []MQTTConfig `yaml:"brokers"`
+	// Connection overrides (inherit from top-level MQTTConfig when empty)
+	URL                     string `yaml:"url,omitempty"`
+	Username                string `yaml:"username,omitempty"`
+	Password                string `yaml:"password,omitempty"`
+	ClientId                string `yaml:"clientId,omitempty"`
+	KeepAliveSec            int    `yaml:"keepAliveSec,omitempty"`
+	PingTimeoutSec          int    `yaml:"pingTimeoutSec,omitempty"`
+	ConnectTimeoutSec       int    `yaml:"connectTimeoutSec,omitempty"`
+	PublishTimeoutSec       int    `yaml:"publishTimeoutSec,omitempty"`
+	HealthCheckIntervalSec  int    `yaml:"healthCheckIntervalSec,omitempty"`
+	InitialRetryIntervalMs  int    `yaml:"initialRetryIntervalMs,omitempty"`
+	MaxReconnectIntervalSec int    `yaml:"maxReconnectIntervalSec,omitempty"`
+	DisconnectQuiesceMs     int    `yaml:"disconnectQuiesceMs,omitempty"`
+	SkipTLSVerify           *bool  `yaml:"skipTLSVerify,omitempty"`
+	MTLS                    *bool  `yaml:"mtls,omitempty"`
+	QOS                     int    `yaml:"qos,omitempty"`
+	Retain                  *bool  `yaml:"retain,omitempty"`
+	CACert                  string `yaml:"caCert,omitempty"`
+	CAPath                  string `yaml:"caPath,omitempty"`
+	CertPath                string `yaml:"certPath,omitempty"`
+	ClientCert              string `yaml:"clientCert,omitempty"`
+	ClientKey               string `yaml:"clientKey,omitempty"`
+	PrivKeyPath             string `yaml:"privateKeyPath,omitempty"`
 }
 
 // TopicConfig represents one MQTT topic section in config.

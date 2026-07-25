@@ -61,6 +61,7 @@ type AuthConfig struct {
 type ServiceConfig struct {
 	Host       string `yaml:"host"`
 	Port       int    `yaml:"port"`
+	PortEnd    int    `yaml:"portEnd"`
 	StartupMsg string `yaml:"startupMsg"`
 	Type       string `yaml:"type"`
 }

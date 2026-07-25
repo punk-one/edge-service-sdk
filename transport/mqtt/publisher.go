@@ -230,6 +230,9 @@ func (p *MQTTPublisher) convertToCompactFormat(event outevent.TelemetryEvent, da
 		deviceData[key] = actualValue(value)
 	}
 	return json.Marshal(map[string]interface{}{
+		"trace_id": event.TraceID,
+		"time":     event.CollectedAt,
+		"send_at":  sendAt,
 		event.DeviceName: deviceData,
 	})
 }

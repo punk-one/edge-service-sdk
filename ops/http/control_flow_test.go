@@ -111,6 +111,9 @@ func (p *flowPublisher) PublishCommandResult(device contracts.DeviceConfig, payl
 	p.commandResults = append(p.commandResults, clonePayload(payload))
 	return nil
 }
+func (p *flowPublisher) PublishJSON(topic string, qos byte, retain bool, payload interface{}) error {
+	return nil
+}
 func (p *flowPublisher) PublishStatus(device contracts.DeviceConfig, payload map[string]interface{}) error {
 	return nil
 }

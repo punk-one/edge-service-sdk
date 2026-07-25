@@ -90,6 +90,7 @@ type Config struct {
 	Version                    string
 	Host                       string
 	Port                       int
+	PortEnd                    int
 	StartupMsg                 string
 	ServiceType                string
 	StartedAt                  time.Time
@@ -122,7 +123,8 @@ type Config struct {
 
 // Server exposes runtime HTTP APIs without blocking telemetry or MQTT workers.
 type Server struct {
-	cfg Config
+	cfg        Config
+	actualPort int
 }
 
 // New creates a new HTTP runtime server.
@@ -135,7 +137,7 @@ func New(cfg Config) *Server {
 
 // Enabled reports whether the HTTP service should be started.
 func (s *Server) Enabled() bool {
-	return s != nil && s.cfg.Port > 0
+	return s != nil && s.cfg.Port >= 0
 }
 
 // Run starts the Gin HTTP server and blocks until it exits.
@@ -143,7 +145,7 @@ func (s *Server) Run() error {
 	if s == nil {
 		return nil
 	}
-	if !s.Enabled() {
+	if s.cfg.Port < 0 {
 		if s.cfg.Logger != nil {
 			s.cfg.Logger.Infof("HTTP runtime server disabled: service.port=%d", s.cfg.Port)
 		}
@@ -151,28 +153,67 @@ func (s *Server) Run() error {
 	}
 
 	router := s.router()
+	listener, err := s.listen()
+	if err != nil {
+		return err
+	}
 
-	addr := listenAddress(s.cfg.Host, s.cfg.Port)
+	s.actualPort = listener.Addr().(*net.TCPAddr).Port
 	if s.cfg.Logger != nil {
 		s.cfg.Logger.Infof(
 			"HTTP runtime server listening: addr=%s startupMsg=%s serviceType=%s",
-			addr,
+			listenAddress(s.cfg.Host, s.actualPort),
 			strings.TrimSpace(s.cfg.StartupMsg),
 			strings.TrimSpace(s.cfg.ServiceType),
 		)
 	}
 
 	server := &http.Server{
-		Addr:              addr,
 		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	err := server.ListenAndServe()
-	if err == nil || errors.Is(err, http.ErrServerClosed) {
+	serveErr := server.Serve(listener)
+	if serveErr == nil || errors.Is(serveErr, http.ErrServerClosed) {
 		return nil
 	}
-	return err
+	return serveErr
+}
+
+// listen creates a TCP listener, with optional port search when PortEnd > Port
+// or OS auto-assign when Port == 0.
+func (s *Server) listen() (net.Listener, error) {
+	if s.cfg.Port == 0 {
+		return s.listenOn(listenAddress(s.cfg.Host, 0))
+	}
+	if s.cfg.PortEnd > s.cfg.Port {
+		return s.listenRange(s.cfg.Port, s.cfg.PortEnd)
+	}
+	return s.listenOn(listenAddress(s.cfg.Host, s.cfg.Port))
+}
+
+func (s *Server) listenOn(addr string) (net.Listener, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	return ln, nil
+}
+
+func (s *Server) listenRange(start, end int) (net.Listener, error) {
+	var lastErr error
+	for port := start; port <= end; port++ {
+		addr := listenAddress(s.cfg.Host, port)
+		ln, err := net.Listen("tcp", addr)
+		if err == nil {
+			if s.cfg.Logger != nil {
+				s.cfg.Logger.Infof("HTTP port search: bound to %s (tried ports %d-%d)", addr, start, port-1)
+			}
+			return ln, nil
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("failed to bind any port in range %d-%d: %w", start, end, lastErr)
 }
 
 func (s *Server) router() *gin.Engine {
@@ -269,8 +310,8 @@ func (s *Server) handleRuntimeStatus(c *gin.Context) {
 			"version":     s.cfg.Version,
 			"type":        s.cfg.ServiceType,
 			"host":        normalizedHost(s.cfg.Host),
-			"port":        s.cfg.Port,
-			"address":     listenAddress(s.cfg.Host, s.cfg.Port),
+			"port":        s.effectivePort(),
+			"address":     listenAddress(s.cfg.Host, s.effectivePort()),
 			"startup_msg": s.cfg.StartupMsg,
 			"started_at":  s.cfg.StartedAt.Format(time.RFC3339),
 			"uptime_sec":  int64(time.Since(s.cfg.StartedAt).Seconds()),
@@ -899,6 +940,13 @@ func parseOptionalInt64Query(c *gin.Context, key string) (int64, error) {
 		return 0, fmt.Errorf("%s must be a non-negative integer", key)
 	}
 	return value, nil
+}
+
+func (s *Server) effectivePort() int {
+	if s.actualPort > 0 {
+		return s.actualPort
+	}
+	return s.cfg.Port
 }
 
 func (s *Server) readyState() (bool, error) {

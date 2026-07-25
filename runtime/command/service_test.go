@@ -106,6 +106,9 @@ func (p *commandTestPublisher) PublishCommandResult(device contracts.DeviceConfi
 	p.messages = append(p.messages, commandPublishedMessage{device: device, payload: copied})
 	return nil
 }
+func (p *commandTestPublisher) PublishJSON(topic string, qos byte, retain bool, payload interface{}) error {
+	return nil
+}
 func (p *commandTestPublisher) PublishStatus(device contracts.DeviceConfig, payload map[string]interface{}) error {
 	return nil
 }

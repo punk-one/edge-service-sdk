@@ -242,7 +242,7 @@ func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver, reg
 		return
 	}
 
-	publisher := mqtt.NewMQTTPublisher(config.MQTT, config.TelemetryReport, config.PropertyResult, config.PropertyReport, config.CommandResult, config.StatusReport, logClient)
+	publisher := mqtt.NewPublisher(config.MQTT, config.TelemetryReport, config.PropertyResult, config.PropertyReport, config.CommandResult, config.StatusReport, logClient)
 	telemetrySink, err := reliable.NewDispatcher(config.ReliableQueue, publisher, logClient)
 	if err != nil {
 		logClient.Errorf("Failed to initialize reliable telemetry dispatcher: %v", err)
@@ -389,6 +389,7 @@ func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver, reg
 		Version:              version,
 		Host:                 config.Service.Host,
 		Port:                 config.Service.Port,
+		PortEnd:              config.Service.PortEnd,
 		StartupMsg:           config.Service.StartupMsg,
 		ServiceType:          config.Service.Type,
 		StartedAt:            time.Now(),
@@ -866,6 +867,25 @@ func buildRuntimeReadiness(authService *rtauth.Service, publisher mqtt.Publisher
 }
 
 func installStatusPublisher(tracker *rtstatus.Tracker, sdk *DeviceSDK, publisher mqtt.Publisher, topicConfig mqtt.TopicConfig, logClient logger.LoggingClient) *deviceStatusPublisher {
+	// Multi-group: snapshot via MultiPublisher, heartbeat per group
+	if mg, ok := publisher.(mqtt.MultiGroupPublisher); ok {
+		main := newDeviceStatusPublisher(tracker, sdk, publisher, topicConfig, logClient)
+		if main == nil {
+			return nil
+		}
+		main.Start()
+
+		for i, gp := range mg.GroupPublishers() {
+			groupTopic := mg.GroupStatusTopic(i)
+			gsp := newDeviceStatusPublisher(tracker, sdk, gp, groupTopic, logClient)
+			if gsp != nil {
+				gsp.StartHeartbeatOnly()
+			}
+		}
+		return main
+	}
+
+	// Single publisher: existing behavior
 	reporter := newDeviceStatusPublisher(tracker, sdk, publisher, topicConfig, logClient)
 	if reporter == nil {
 		return nil

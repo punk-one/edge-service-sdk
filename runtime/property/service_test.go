@@ -107,6 +107,9 @@ func (p *propertyTestPublisher) PublishPropertyReport(device contracts.DeviceCon
 func (p *propertyTestPublisher) PublishCommandResult(device contracts.DeviceConfig, payload map[string]interface{}) error {
 	return p.PublishPropertyResult(device, payload)
 }
+func (p *propertyTestPublisher) PublishJSON(topic string, qos byte, retain bool, payload interface{}) error {
+	return nil
+}
 func (p *propertyTestPublisher) PublishStatus(device contracts.DeviceConfig, payload map[string]interface{}) error {
 	return nil
 }
