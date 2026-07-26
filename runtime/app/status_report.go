@@ -1,6 +1,8 @@
 package app
 
 import (
+	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -11,7 +13,11 @@ import (
 	mqtt "github.com/punk-one/edge-service-sdk/transport/mqtt"
 )
 
-const defaultStatusHeartbeatInterval = 30 * time.Second
+const (
+	defaultStatusHeartbeatInterval = 30 * time.Second
+	defaultPingInterval            = 15 * time.Second
+	pingTimeout                    = 2 * time.Second
+)
 
 type deviceStatusPublisher struct {
 	tracker           *rtstatus.Tracker
@@ -22,6 +28,10 @@ type deviceStatusPublisher struct {
 
 	mu            sync.Mutex
 	lastPublished map[string]publishedDeviceStatus
+
+	pingCache    map[string]bool
+	pingMu       sync.RWMutex
+	pingInterval time.Duration
 }
 
 type publishedDeviceStatus struct {
@@ -66,6 +76,8 @@ func newDeviceStatusPublisher(tracker *rtstatus.Tracker, sdk *DeviceSDK, publish
 		logClient:         logClient,
 		heartbeatInterval: parseStatusHeartbeatInterval(topicConfig.HeartbeatInterval, logClient),
 		lastPublished:     make(map[string]publishedDeviceStatus),
+		pingCache:         make(map[string]bool),
+		pingInterval:      defaultPingInterval,
 	}
 }
 
@@ -80,6 +92,7 @@ func (p *deviceStatusPublisher) Start() {
 
 	p.publishSnapshot(p.tracker.Snapshot(), true, time.Now().UnixMilli())
 	go p.runHeartbeatLoop()
+	go p.startPingLoop()
 }
 
 // StartHeartbeatOnly starts only the heartbeat loop (no OnChange registration).
@@ -130,7 +143,7 @@ func (p *deviceStatusPublisher) publishSnapshot(states []rtstatus.DeviceState, f
 			continue
 		}
 
-		data := statusPayloadDataFromState(state)
+		data := statusPayloadDataFromState(state, p.isOnline(state.DeviceCode))
 		summary := statusSummaryFromData(data)
 
 		p.mu.Lock()
@@ -170,7 +183,7 @@ func (p *deviceStatusPublisher) publishHeartbeat(states []rtstatus.DeviceState, 
 			continue
 		}
 
-		data := statusPayloadDataFromState(state)
+		data := statusPayloadDataFromState(state, p.isOnline(state.DeviceCode))
 		summary := statusSummaryFromData(data)
 
 		p.mu.Lock()
@@ -212,9 +225,9 @@ func (p *deviceStatusPublisher) publishDeviceStatus(device contracts.DeviceConfi
 	return p.publisher.PublishStatus(device, statusMessageToMap(message))
 }
 
-func statusPayloadDataFromState(state rtstatus.DeviceState) statusPayloadData {
+func statusPayloadDataFromState(state rtstatus.DeviceState, online bool) statusPayloadData {
 	data := statusPayloadData{
-		Online:          state.ConnectionState == rtstatus.StateConnected,
+		Online:          online,
 		ConnectionState: state.ConnectionState,
 		LastSeenAt:      state.LastSuccessAt,
 	}
@@ -282,4 +295,95 @@ func forceStatusHeartbeat(record publishedDeviceStatus, now int64, interval time
 		return true
 	}
 	return now-record.publishedAt >= interval.Milliseconds()
+}
+
+func (p *deviceStatusPublisher) startPingLoop() {
+	if p == nil || p.pingInterval <= 0 {
+		return
+	}
+
+	ticker := time.NewTicker(p.pingInterval)
+	defer ticker.Stop()
+
+	p.pingAllDevices()
+
+	for range ticker.C {
+		p.pingAllDevices()
+	}
+}
+
+func (p *deviceStatusPublisher) pingAllDevices() {
+	if p == nil || p.sdk == nil {
+		return
+	}
+
+	devices := p.sdk.deviceConfigs
+	for _, device := range devices {
+		addr := extractHostPort(device)
+		if addr == "" {
+			continue
+		}
+		reachable := pingTCP(addr, pingTimeout)
+
+		p.pingMu.Lock()
+		p.pingCache[device.Name] = reachable
+		p.pingMu.Unlock()
+	}
+}
+
+func (p *deviceStatusPublisher) isOnline(deviceCode string) bool {
+	p.pingMu.RLock()
+	online, ok := p.pingCache[deviceCode]
+	p.pingMu.RUnlock()
+	if !ok {
+		return false
+	}
+	return online
+}
+
+func extractHostPort(device contracts.DeviceConfig) string {
+	host, port := "", ""
+	for _, proto := range device.Protocols {
+		props, ok := proto.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		h, _ := props["Host"].(string)
+		if h == "" {
+			continue
+		}
+		host = h
+		p := "102"
+		if v, ok := props["Port"]; ok {
+			switch val := v.(type) {
+			case int:
+				if val > 0 {
+					p = strconv.Itoa(val)
+				}
+			case float64:
+				if val > 0 {
+					p = strconv.Itoa(int(val))
+				}
+			case string:
+				if val != "" {
+					p = val
+				}
+			}
+		}
+		port = p
+		break
+	}
+	if host == "" {
+		return ""
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func pingTCP(addr string, timeout time.Duration) bool {
+	conn, err := net.DialTimeout("tcp", addr, timeout)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }

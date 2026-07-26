@@ -100,6 +100,12 @@ func (p *fakeStatusPublisher) Message(index int) publishedStatusMessage {
 	return p.messages[index]
 }
 
+func (p *deviceStatusPublisher) setOnlineForTest(deviceCode string, online bool) {
+	p.pingMu.Lock()
+	p.pingCache[deviceCode] = online
+	p.pingMu.Unlock()
+}
+
 func TestInstallStatusPublisherUsesIncrementalAndHeartbeat(t *testing.T) {
 	tracker := rtstatus.NewTracker()
 	config := rtconfig.Config{
@@ -110,7 +116,7 @@ func TestInstallStatusPublisherUsesIncrementalAndHeartbeat(t *testing.T) {
 	sdk := NewDeviceSDK(config, logger.LoggingClient(&statusTestLogger{}), tracker)
 	publisher := &fakeStatusPublisher{}
 
-	installStatusPublisher(tracker, sdk, publisher, mqtt.TopicConfig{
+	sp := installStatusPublisher(tracker, sdk, publisher, mqtt.TopicConfig{
 		Topic:             "v1/gateway/{productCode}/status/report",
 		HeartbeatInterval: "50ms",
 	}, &statusTestLogger{})
@@ -129,6 +135,9 @@ func TestInstallStatusPublisherUsesIncrementalAndHeartbeat(t *testing.T) {
 	if initial.Data.Error != nil {
 		t.Fatalf("expected nil initial error: %#v", initial)
 	}
+
+	// Simulate ping success before MarkConnected so online reflects network reachability
+	sp.setOnlineForTest("qhl0001", true)
 
 	tracker.MarkConnected("qhl0001")
 	waitForStatusMessages(t, publisher, 2, 300*time.Millisecond)
@@ -155,8 +164,8 @@ func TestInstallStatusPublisherUsesIncrementalAndHeartbeat(t *testing.T) {
 	tracker.MarkReadError("qhl0001", errors.New("read timeout"))
 	waitForStatusMessages(t, publisher, 4, 300*time.Millisecond)
 	failed := publisher.Message(3).Message
-	if failed.Data.Online {
-		t.Fatalf("expected degraded state to report offline: %#v", failed)
+	if !failed.Data.Online {
+		t.Fatalf("expected degraded state to report online (ping still reachable): %#v", failed)
 	}
 	if failed.Data.ConnectionState != rtstatus.StateDegraded {
 		t.Fatalf("unexpected degraded payload: %#v", failed)
