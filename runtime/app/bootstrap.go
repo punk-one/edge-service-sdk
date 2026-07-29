@@ -592,18 +592,18 @@ func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.
 					if shouldEmitTelemetry(device.Telemetry, deviceValues, deviceLevelState, now) {
 						updateTelemetryState(deviceLevelState, deviceValues, now.UnixMilli())
 						mergedValues = append(mergedValues, deviceValues...)
-					}
 
-					// Assemble device-level struct values
-					if len(structValues) > 0 && len(deviceStructBindings) > 0 {
-						structMaps := appconfig.BuildPropertyResponse(structValues, deviceStructBindings)
-						for structName, structVal := range structMaps {
-							cv, err := contracts.NewCommandValue(structName, "Object", structVal)
-							if err != nil {
-								logClient.Warnf("Failed to create struct command value %s: %v", structName, err)
-								continue
+						// Assemble device-level struct values
+						if len(structValues) > 0 && len(deviceStructBindings) > 0 {
+							structMaps := appconfig.BuildPropertyResponse(structValues, deviceStructBindings)
+							for structName, structVal := range structMaps {
+								cv, err := contracts.NewCommandValue(structName, "Object", structVal)
+								if err != nil {
+									logClient.Warnf("Failed to create struct command value %s: %v", structName, err)
+									continue
+								}
+								mergedValues = append(mergedValues, cv)
 							}
-							mergedValues = append(mergedValues, cv)
 						}
 					}
 
@@ -628,18 +628,18 @@ func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.
 						if shouldEmitTelemetry(groupStates[i].cfg, groupValues, groupStates[i].state, now) {
 							updateTelemetryState(groupStates[i].state, groupValues, now.UnixMilli())
 							mergedValues = append(mergedValues, groupValues...)
-						}
 
-						// Assemble group-level struct values
-						if len(structValues) > 0 && len(groupStates[i].structBindings) > 0 {
-							structMaps := appconfig.BuildPropertyResponse(structValues, groupStates[i].structBindings)
-							for structName, structVal := range structMaps {
-								cv, err := contracts.NewCommandValue(structName, "Object", structVal)
-								if err != nil {
-									logClient.Warnf("Failed to create group struct command value %s: %v", structName, err)
-									continue
+							// Assemble group-level struct values
+							if len(structValues) > 0 && len(groupStates[i].structBindings) > 0 {
+								structMaps := appconfig.BuildPropertyResponse(structValues, groupStates[i].structBindings)
+								for structName, structVal := range structMaps {
+									cv, err := contracts.NewCommandValue(structName, "Object", structVal)
+									if err != nil {
+										logClient.Warnf("Failed to create group struct command value %s: %v", structName, err)
+										continue
+									}
+									mergedValues = append(mergedValues, cv)
 								}
-								mergedValues = append(mergedValues, cv)
 							}
 						}
 					}
@@ -742,10 +742,30 @@ func isDueWallClock(interval string, gcd time.Duration, elapsed time.Duration, i
 // buildGroupRequests builds read requests for all points in a telemetry group.
 func buildGroupRequests(group contracts.TelemetryGroup) ([]contracts.CommandRequest, error) {
 	reqs := make([]contracts.CommandRequest, 0, len(group.Points))
+	readFirstSet := make(map[string]bool, len(group.ReadFirstFields))
+	watchedSet := make(map[string]bool, len(group.WatchedFields))
+	for _, f := range group.ReadFirstFields {
+		readFirstSet[f] = true
+	}
+	for _, f := range group.WatchedFields {
+		watchedSet[f] = true
+	}
 	for _, point := range group.Points {
 		req, err := point.ToCommandRequest(point.NodeName)
 		if err != nil {
 			return nil, err
+		}
+		if readFirstSet[point.Name] {
+			if req.Attributes == nil {
+				req.Attributes = make(map[string]interface{})
+			}
+			req.Attributes["readFirstField"] = true
+		}
+		if watchedSet[point.Name] {
+			if req.Attributes == nil {
+				req.Attributes = make(map[string]interface{})
+			}
+			req.Attributes["watchedField"] = true
 		}
 		reqs = append(reqs, req)
 	}

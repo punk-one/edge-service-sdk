@@ -502,6 +502,7 @@ func cloneGroups(groups []contracts.TelemetryGroup) []contracts.TelemetryGroup {
 	for i := range groups {
 		cloned[i] = groups[i]
 		cloned[i].Points = clonePoints(groups[i].Points)
+		cloned[i].ReadFirstFields = append([]string(nil), groups[i].ReadFirstFields...)
 		cloned[i].WatchedFields = append([]string(nil), groups[i].WatchedFields...)
 		cloned[i].Structs = cloneStructs(groups[i].Structs)
 	}

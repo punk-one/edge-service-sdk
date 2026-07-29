@@ -71,6 +71,7 @@ type TelemetryGroup struct {
 	Interval          string           `yaml:"interval"`
 	OnChange          bool             `yaml:"onChange"`
 	WatchedFields     []string         `yaml:"watchedFields"`
+	ReadFirstFields   []string         `yaml:"readFirstFields"`
 	HeartbeatInterval string           `yaml:"heartbeatInterval"`
 	Points            []PointConfig    `yaml:"points"`
 	Structs           []PropertyStruct `yaml:"structs"`
@@ -127,6 +128,7 @@ type PropertyStruct struct {
 	IndexBase  int                   `yaml:"indexBase"`
 	MaxItems   int                   `yaml:"maxItems"`
 	AutoReport bool                  `yaml:"autoReport"`
+	ActualItem string                `yaml:"actualItem"`
 	Address    PropertyStructAddress `yaml:"address"`
 	Fields     []PropertyStructField `yaml:"fields"`
 }

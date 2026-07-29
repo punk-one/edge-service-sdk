@@ -113,12 +113,28 @@ func BuildTelemetryStructReadRequests(structs []contracts.PropertyStruct) ([]con
 					if err != nil {
 						return nil, nil, err
 					}
+					if structDef.ActualItem != "" {
+						if req.Attributes == nil {
+							req.Attributes = make(map[string]interface{})
+						}
+						req.Attributes["actualItem"] = structDef.ActualItem
+						req.Attributes["arrayIndex"] = offset
+					}
 					reqs = append(reqs, req)
 					bindings = append(bindings, PropertyBinding{Path: []string{structDef.Name, indexKey}})
 				} else {
 					subReqs, subBindings, err := buildStructReadFields(structDef, structDef.Fields, nil, []string{structDef.Name, indexKey}, indexOffset)
 					if err != nil {
 						return nil, nil, err
+					}
+					if structDef.ActualItem != "" {
+						for i := range subReqs {
+							if subReqs[i].Attributes == nil {
+								subReqs[i].Attributes = make(map[string]interface{})
+							}
+							subReqs[i].Attributes["actualItem"] = structDef.ActualItem
+							subReqs[i].Attributes["arrayIndex"] = offset
+						}
 					}
 					reqs = append(reqs, subReqs...)
 					bindings = append(bindings, subBindings...)
