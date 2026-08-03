@@ -159,23 +159,25 @@ func (s *Service) handleCommandCall(productCode string, identifier string, paylo
 		}
 		return
 	}
+
+	req.DeviceCode = strings.TrimSpace(req.DeviceCode)
+	if req.DeviceCode == "" {
+		return
+	}
+	device, ok := s.catalog.DeviceConfigByName(req.DeviceCode)
+	if !ok || device.ProductCode != productCode {
+		return
+	}
+	if _, ok := cfg.FindCommandByIdentifier(device, identifier); !ok {
+		return
+	}
+
 	if req.Data == nil {
 		req.Data = map[string]interface{}{}
 	}
 	result, _ := s.Execute(identifier, req, productCode)
 	if !s.commandResultEnabled {
 		return
-	}
-	if result.Code == ctl.CodeNotFound {
-		return
-	}
-	deviceCode := strings.TrimSpace(req.DeviceCode)
-	if deviceCode == "" {
-		return
-	}
-	device := contracts.DeviceConfig{Name: deviceCode, ProductCode: productCode}
-	if resolved, ok := s.catalog.DeviceConfigByName(deviceCode); ok && resolved.ProductCode == productCode {
-		device = resolved
 	}
 	_ = s.publisher.PublishCommandResult(device, map[string]interface{}{
 		"trace_id": result.TraceID,
