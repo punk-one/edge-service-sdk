@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Added the protocol-independent `event` engine with validated EVENT YAML profiles, direct telemetry/property references, standard connect events, exclusive OEE states, aggregate alarm/fault events, pulse/rise-clear actions, hold/recover debounce, and summary windows.
+- Added `device.eventDir`, `device.eventProfile`, and the optional global `eventReport` MQTT topic while preserving old configurations that omit them.
+- Added an independent SQLite-backed event outbox with replay metadata, event-time preservation, state-file recovery, and safe shutdown draining.
+- Added `runtime/event` integration and an optional timestamp-aware driver status reporter so protocol services can provide collection/processing time without changing the existing reporter interface.
+
 ## v0.8.8
 
 - Added **multi-MQTT broker support** with group-based architecture: top-level parallel groups with per-group failover broker chains (`transport/mqtt/multi.go`). Each group supports per-broker `clientId`, `username`, `password` config, per-group `dataFormat` overrides, and per-group `heartbeatInterval`.

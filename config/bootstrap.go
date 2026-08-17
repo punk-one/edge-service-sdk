@@ -34,6 +34,7 @@ type Config struct {
 	QueryRequest    mqtt.TopicConfig         `yaml:"queryRequest"`
 	QueryResult     mqtt.TopicConfig         `yaml:"queryResult"`
 	StatusReport    mqtt.TopicConfig         `yaml:"statusReport"`
+	EventReport     mqtt.TopicConfig         `yaml:"eventReport"`
 	ControlStore    ControlStoreConfig       `yaml:"controlStore"`
 	Devices         []contracts.DeviceConfig `yaml:"deviceList"`
 	LogLevel        string                   `yaml:"logLevel"`
@@ -70,6 +71,7 @@ type ServiceConfig struct {
 type DeviceConfig struct {
 	ProfilesDir string `yaml:"profilesDir"`
 	DevicesDir  string `yaml:"devicesDir"`
+	EventDir    string `yaml:"eventDir"`
 }
 
 // LoadConfig loads configuration from YAML file.
@@ -127,6 +129,10 @@ func loadMainConfig(configPath string) (Config, error) {
 		Device: DeviceConfig{
 			ProfilesDir: "./configs/profiles",
 			DevicesDir:  "./configs/devices",
+			// EventDir intentionally remains empty by default. This preserves
+			// compatibility: old services do not initialize EVENT rules until
+			// they explicitly opt in.
+			EventDir: "",
 		},
 		ReliableQueue: reliable.Config{
 			Enabled:          true,
@@ -376,6 +382,9 @@ func mergeDeviceWithProfile(device contracts.DeviceConfig, profile contracts.Dev
 }
 
 func NormalizeConfig(config Config) Config {
+	config.Device.ProfilesDir = filepath.FromSlash(config.Device.ProfilesDir)
+	config.Device.DevicesDir = filepath.FromSlash(config.Device.DevicesDir)
+	config.Device.EventDir = filepath.FromSlash(config.Device.EventDir)
 	config.Logging = EffectiveLoggerConfig(config)
 	if config.TelemetryReport.DataFormat == "" {
 		config.TelemetryReport.DataFormat = "rule"
@@ -413,6 +422,7 @@ func normalizeConfig(config Config) Config {
 func NormalizeDeviceConfig(device contracts.DeviceConfig) contracts.DeviceConfig {
 	device.Name = strings.TrimSpace(device.Name)
 	device.SubName = strings.TrimSpace(device.SubName)
+	device.EventProfile = strings.TrimSpace(device.EventProfile)
 	if device.SubName != "" {
 		device.InternalName = device.Name + "-" + device.SubName
 	} else {

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	contracts "github.com/punk-one/edge-service-sdk/driver"
+	events "github.com/punk-one/edge-service-sdk/event"
 	logger "github.com/punk-one/edge-service-sdk/logging"
 	outevent "github.com/punk-one/edge-service-sdk/telemetry"
 )
@@ -13,11 +14,11 @@ import (
 // NewPublisher creates a Publisher. When cfg.Groups is empty, it returns a
 // plain MQTTPublisher (backward-compatible). When groups are present, it
 // returns a MultiPublisher that fans out to all groups.
-func NewPublisher(cfg MQTTConfig, telemetry, propertyResult, propertyReport, commandResult, statusReport TopicConfig, logClient logger.LoggingClient) Publisher {
+func NewPublisher(cfg MQTTConfig, telemetry, propertyResult, propertyReport, commandResult, statusReport TopicConfig, logClient logger.LoggingClient, eventReport ...TopicConfig) Publisher {
 	if len(cfg.Groups) == 0 {
-		return NewMQTTPublisher(cfg, telemetry, propertyResult, propertyReport, commandResult, statusReport, logClient)
+		return NewMQTTPublisher(cfg, telemetry, propertyResult, propertyReport, commandResult, statusReport, logClient, eventReport...)
 	}
-	return newMultiPublisher(cfg, telemetry, propertyResult, propertyReport, commandResult, statusReport, logClient)
+	return newMultiPublisher(cfg, telemetry, propertyResult, propertyReport, commandResult, statusReport, logClient, eventReport...)
 }
 
 // ─── MultiPublisher ───────────────────────────────────────────────────────────
@@ -27,7 +28,7 @@ type multiPublisher struct {
 	logger logger.LoggingClient
 }
 
-func newMultiPublisher(cfg MQTTConfig, telemetry, propertyResult, propertyReport, commandResult, statusReport TopicConfig, logClient logger.LoggingClient) *multiPublisher {
+func newMultiPublisher(cfg MQTTConfig, telemetry, propertyResult, propertyReport, commandResult, statusReport TopicConfig, logClient logger.LoggingClient, eventReport ...TopicConfig) *multiPublisher {
 	base := cfg
 	base.Groups = nil // prevent recursion
 
@@ -40,6 +41,7 @@ func newMultiPublisher(cfg MQTTConfig, telemetry, propertyResult, propertyReport
 		groupPropertyReport := buildGroupTopics(propertyReport, gc.PropertyReportFormat)
 		groupCommandResult := buildGroupTopics(commandResult, gc.CommandResultFormat)
 		groupStatusReport := buildGroupTopics(statusReport, gc.StatusReportFormat)
+		groupEventReport := buildGroupTopics(firstTopic(eventReport), "")
 
 		heartbeatInterval := gc.HeartbeatInterval
 		if heartbeatInterval == "" {
@@ -47,7 +49,7 @@ func newMultiPublisher(cfg MQTTConfig, telemetry, propertyResult, propertyReport
 		}
 
 		brokerCfgs := buildGroupBrokerList(gc, groupDefaults)
-		gp := newGroupPublisher(gc.Name, gc.Mode, brokerCfgs, groupTelemetry, groupPropertyResult, groupPropertyReport, groupCommandResult, groupStatusReport, heartbeatInterval, logClient)
+		gp := newGroupPublisher(gc.Name, gc.Mode, brokerCfgs, groupTelemetry, groupPropertyResult, groupPropertyReport, groupCommandResult, groupStatusReport, groupEventReport, heartbeatInterval, logClient)
 		groups = append(groups, gp)
 	}
 
@@ -96,6 +98,24 @@ func (m *multiPublisher) PublishTelemetryEvent(event outevent.TelemetryEvent, re
 	for _, g := range m.groups {
 		if err := g.PublishTelemetryEvent(event, replayed); err != nil {
 			m.logger.Warnf("[mqtt] group %s: PublishTelemetryEvent failed: %v", g.name, err)
+			lastErr = err
+		}
+	}
+	return lastErr
+}
+
+func firstTopic(topics []TopicConfig) TopicConfig {
+	if len(topics) == 0 {
+		return TopicConfig{}
+	}
+	return topics[0]
+}
+
+func (m *multiPublisher) PublishEvent(event events.Event, replayed bool) error {
+	var lastErr error
+	for _, g := range m.groups {
+		if err := g.PublishEvent(event, replayed); err != nil {
+			m.logger.Warnf("[mqtt] group %s: PublishEvent failed: %v", g.name, err)
 			lastErr = err
 		}
 	}
@@ -205,6 +225,7 @@ type groupPublisher struct {
 	propertyReport    TopicConfig
 	commandResult     TopicConfig
 	statusReport      TopicConfig
+	eventReport       TopicConfig
 	heartbeatInterval string
 	logger            logger.LoggingClient
 
@@ -222,7 +243,7 @@ type subscriptionRecord struct {
 	handler MessageHandler
 }
 
-func newGroupPublisher(name, mode string, brokers []MQTTConfig, telemetry, propertyResult, propertyReport, commandResult, statusReport TopicConfig, heartbeatInterval string, logClient logger.LoggingClient) *groupPublisher {
+func newGroupPublisher(name, mode string, brokers []MQTTConfig, telemetry, propertyResult, propertyReport, commandResult, statusReport, eventReport TopicConfig, heartbeatInterval string, logClient logger.LoggingClient) *groupPublisher {
 	gp := &groupPublisher{
 		name:              name,
 		mode:              mode,
@@ -232,6 +253,7 @@ func newGroupPublisher(name, mode string, brokers []MQTTConfig, telemetry, prope
 		propertyReport:    propertyReport,
 		commandResult:     commandResult,
 		statusReport:      statusReport,
+		eventReport:       eventReport,
 		heartbeatInterval: heartbeatInterval,
 		logger:            logClient,
 		stopCh:            make(chan struct{}),
@@ -259,7 +281,7 @@ func (g *groupPublisher) activateSingle() {
 	cfg := g.brokers[0]
 	g.mu.Unlock()
 
-	p := NewMQTTPublisher(cfg, g.telemetry, g.propertyResult, g.propertyReport, g.commandResult, g.statusReport, g.logger)
+	p := NewMQTTPublisher(cfg, g.telemetry, g.propertyResult, g.propertyReport, g.commandResult, g.statusReport, g.logger, g.eventReport)
 
 	g.mu.Lock()
 	old := g.active
@@ -287,7 +309,7 @@ func (g *groupPublisher) activateFailover() {
 	var active *MQTTPublisher
 
 	for i := 0; i < len(brokers); i++ {
-		p := NewMQTTPublisher(brokers[i], g.telemetry, g.propertyResult, g.propertyReport, g.commandResult, g.statusReport, g.logger)
+		p := NewMQTTPublisher(brokers[i], g.telemetry, g.propertyResult, g.propertyReport, g.commandResult, g.statusReport, g.logger, g.eventReport)
 		if err := p.HealthCheck(); err != nil {
 			g.logger.Warnf("[mqtt] group %s: broker[%d] %s initial health check failed: %v", g.name, i, brokers[i].URL, err)
 			p.Close()
@@ -374,7 +396,7 @@ func (g *groupPublisher) switchToNext() {
 			nextIdx := (idx + 1 + i) % len(brokers)
 			cfg := brokers[nextIdx]
 
-			p := NewMQTTPublisher(cfg, g.telemetry, g.propertyResult, g.propertyReport, g.commandResult, g.statusReport, g.logger)
+			p := NewMQTTPublisher(cfg, g.telemetry, g.propertyResult, g.propertyReport, g.commandResult, g.statusReport, g.logger, g.eventReport)
 			if err := p.HealthCheck(); err != nil {
 				g.logger.Warnf("[mqtt] group %s: broker[%d] %s health check failed: %v", g.name, nextIdx, cfg.URL, err)
 				p.Close()
@@ -444,6 +466,13 @@ func (g *groupPublisher) PublishCommandValues(device contracts.DeviceConfig, val
 func (g *groupPublisher) PublishTelemetryEvent(event outevent.TelemetryEvent, replayed bool) error {
 	if p := g.getActive(); p != nil {
 		return p.PublishTelemetryEvent(event, replayed)
+	}
+	return fmt.Errorf("group %s: no active publisher", g.name)
+}
+
+func (g *groupPublisher) PublishEvent(event events.Event, replayed bool) error {
+	if p := g.getActive(); p != nil {
+		return p.PublishEvent(event, replayed)
 	}
 	return fmt.Errorf("group %s: no active publisher", g.name)
 }

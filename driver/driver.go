@@ -59,3 +59,16 @@ type DeviceStatusReporter interface {
 	DeviceWriteSucceeded(deviceName string)
 	DeviceWriteFailed(deviceName string, err error)
 }
+
+// DeviceStatusReporterAt is an optional timestamp-aware extension. Existing
+// protocol drivers may continue using DeviceStatusReporter; new drivers can
+// provide observation time so EVENT retains protocol/edge detection time
+// instead of the later MQTT send time.
+type DeviceStatusReporterAt interface {
+	DeviceConnectedAt(deviceName string, observedAt int64)
+	DeviceDisconnectedAt(deviceName string, err error, observedAt int64)
+	DeviceReadSucceededAt(deviceName string, observedAt int64)
+	DeviceReadFailedAt(deviceName string, err error, observedAt int64)
+	DeviceWriteSucceededAt(deviceName string, observedAt int64)
+	DeviceWriteFailedAt(deviceName string, err error, observedAt int64)
+}

@@ -7,18 +7,24 @@ import (
 	"time"
 
 	contracts "github.com/punk-one/edge-service-sdk/driver"
+	events "github.com/punk-one/edge-service-sdk/event"
 	logger "github.com/punk-one/edge-service-sdk/logging"
 	outevent "github.com/punk-one/edge-service-sdk/telemetry"
 )
 
 // NewMQTTPublisher creates a new MQTT publisher.
-func NewMQTTPublisher(config MQTTConfig, telemetry TopicConfig, propertyResult TopicConfig, propertyReport TopicConfig, commandResult TopicConfig, statusReport TopicConfig, logger logger.LoggingClient) *MQTTPublisher {
+func NewMQTTPublisher(config MQTTConfig, telemetry TopicConfig, propertyResult TopicConfig, propertyReport TopicConfig, commandResult TopicConfig, statusReport TopicConfig, logger logger.LoggingClient, eventReport ...TopicConfig) *MQTTPublisher {
+	configuredEventReport := TopicConfig{}
+	if len(eventReport) > 0 {
+		configuredEventReport = eventReport[0]
+	}
 	return &MQTTPublisher{
 		telemetry:      telemetry,
 		propertyResult: propertyResult,
 		propertyReport: propertyReport,
 		commandResult:  commandResult,
 		statusReport:   statusReport,
+		eventReport:    configuredEventReport,
 		client:         newMQTTClient(config, logger),
 	}
 }
@@ -97,6 +103,28 @@ func (p *MQTTPublisher) PublishCommandResult(device contracts.DeviceConfig, payl
 
 func (p *MQTTPublisher) PublishStatus(device contracts.DeviceConfig, payload map[string]interface{}) error {
 	return p.publishJSONTopic(resolveTopic(p.statusReport.Topic, device.ProductCode), payload, p.statusReport.QoS, p.statusReport.Retain)
+}
+
+// PublishEvent publishes the public event envelope. Delivery metadata is
+// generated at the last possible moment so replay does not alter event time or
+// event_instance_id.
+func (p *MQTTPublisher) PublishEvent(event events.Event, replayed bool) error {
+	if p == nil || strings.TrimSpace(p.eventReport.Topic) == "" {
+		return fmt.Errorf("event report topic is not configured")
+	}
+	body, err := event.MarshalPublicJSON(replayed, time.Now().UnixMilli())
+	if err != nil {
+		return err
+	}
+	return p.publishRaw(mqttMessage{
+		Topic:       resolveTopic(p.eventReport.Topic, event.ProductCode),
+		QoS:         byte(resolveQoS(p.eventReport.QoS, p.client.config.QoS)),
+		Retain:      p.eventReport.Retain,
+		Payload:     body,
+		DeviceName:  event.DeviceCode,
+		ProductCode: event.ProductCode,
+		TraceID:     event.TraceID,
+	})
 }
 
 func (p *MQTTPublisher) publishJSONTopic(topic string, payload map[string]interface{}, qos int, retain bool) error {
@@ -230,9 +258,9 @@ func (p *MQTTPublisher) convertToCompactFormat(event outevent.TelemetryEvent, da
 		deviceData[key] = actualValue(value)
 	}
 	return json.Marshal(map[string]interface{}{
-		"trace_id": event.TraceID,
-		"time":     event.CollectedAt,
-		"send_at":  sendAt,
+		"trace_id":       event.TraceID,
+		"time":           event.CollectedAt,
+		"send_at":        sendAt,
 		event.DeviceName: deviceData,
 	})
 }

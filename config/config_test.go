@@ -70,8 +70,8 @@ reliableQueue:
   retentionDays: 7
   keepLatestOnly: false
 device:
-  profilesDir: "` + profilesDir + `"
-  devicesDir: "` + devicesDir + `"
+  profilesDir: "` + filepath.ToSlash(profilesDir) + `"
+  devicesDir: "` + filepath.ToSlash(devicesDir) + `"
 telemetryReport:
   topic: "v1/gateway/{productCode}/telemetry/report"
   qos: 0

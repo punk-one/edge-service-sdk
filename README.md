@@ -11,6 +11,8 @@ It extracts the common runtime, control, and transport capabilities out of proto
 - ops HTTP runtime endpoints for health, readiness, runtime status, model query, and control tracing
 - device status tracking and optional MQTT status reporting
 - telemetry event normalization and reliable replay via SQLite
+- built-in EVENT engine for connection, OEE, alarm, fault, pulse and rise-clear rules
+- event profile loading from `device.eventDir`, device-level `eventProfile` binding, state persistence, summary windows, and a separate durable event outbox
 - MQTT lifecycle management with explicit reconnect, subscription recovery, and health checks
 - property request execution over HTTP and MQTT, including auto-report and progress/failure context
 - command registry, synchronous/asynchronous command execution, and persisted command result tracking
@@ -26,6 +28,32 @@ It extracts the common runtime, control, and transport capabilities out of proto
 - **Telemetry compact format** — now includes `trace_id`, `time`, and `send_at` alongside device-name-keyed data.
 - **bitMerge config** — `bitMerge` field on `TelemetryConfig` and `PropertyConfig` for bit-level data merging.
 - **ClientId randomization** — MQTT clientId always gets a random suffix: `sdk-{10-digit}` when unset, `{custom}-{6-digit}` when configured.
+
+## EVENT Configuration
+
+EVENT is an SDK capability shared by protocol services. It is enabled only when
+`device.eventDir`, `device.eventProfile`, and (for cloud delivery)
+`eventReport.topic` are configured. Existing configurations without these keys
+continue to run their status, telemetry, property, and command paths unchanged.
+
+```yaml
+device:
+  profilesDir: "./configs/profiles"
+  devicesDir: "./configs/devices"
+  eventDir: "./configs/events"
+
+eventReport:
+  topic: "v1/gateway/{productCode}/event/report"
+  qos: 1
+  retain: false
+```
+
+Each device selects one named EVENT profile with `eventProfile`. The SDK
+evaluates telemetry snapshots and standard connection observations, keeps
+state separately from the durable event outbox, preserves the original event
+`time` during replay, and updates only transport metadata such as `send_at` and
+`is_replayed`. EVENT profiles do not contain middleware pipelines or MQTT
+connection settings.
 
 ## What's New In v0.7.5
 
@@ -101,6 +129,10 @@ The bootstrap flow loads config, initializes auth/MQTT/reliable queue/control st
   Runtime health, readiness, auth, model-query, property, command, and control-job HTTP endpoints.
 - `ops/status`
   Device status tracking and runtime snapshots.
+- `event`
+  Protocol-independent event model, YAML validation, expression evaluation, connection/OEE/alarm state machines, payload selection, and summary windows.
+- `runtime/event`
+  EVENT runtime lifecycle, state-file persistence, event dispatch, and integration with the MQTT event publisher.
 - `runtime/app`
   SDK bootstrap facade, runtime assembly, status publishing, and MQTT query wiring.
 - `runtime/config`
@@ -118,7 +150,7 @@ The bootstrap flow loads config, initializes auth/MQTT/reliable queue/control st
 - `telemetry`
   Unified telemetry event model and trace identifiers.
 - `telemetry/reliable`
-  Durable queueing, replay, retention, and queue statistics.
+  Durable telemetry queueing and replay plus the independent event outbox namespace.
 - `transport/mqtt`
   MQTT client lifecycle, publishing, subscriptions, and health checks.
 - `logging`

@@ -43,6 +43,7 @@ type DeviceConfig struct {
 	SubName            string                 `yaml:"subName"`
 	InternalName       string                 `yaml:"-"`
 	ProfileName        string                 `yaml:"profileName"`
+	EventProfile       string                 `yaml:"eventProfile"`
 	ProductCode        string                 `yaml:"productCode"`
 	Description        string                 `yaml:"description"`
 	Labels             []string               `yaml:"labels"`
@@ -182,8 +183,8 @@ type SchemaField struct {
 
 // CommandConfig declares one remotely callable command supported by a device/profile.
 type CommandConfig struct {
-	Identifier   string       `yaml:"identifier"`
-	Enabled      *bool        `yaml:"enabled,omitempty"`
+	Identifier   string        `yaml:"identifier"`
+	Enabled      *bool         `yaml:"enabled,omitempty"`
 	InputSchema  []SchemaField `yaml:"inputSchema,omitempty"`
 	OutputSchema []SchemaField `yaml:"outputSchema,omitempty"`
 }

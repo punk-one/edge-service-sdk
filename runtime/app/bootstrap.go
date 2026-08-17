@@ -11,11 +11,9 @@ import (
 	cmdapi "github.com/punk-one/edge-service-sdk/command"
 	appconfig "github.com/punk-one/edge-service-sdk/config"
 	contracts "github.com/punk-one/edge-service-sdk/driver"
+	coreevent "github.com/punk-one/edge-service-sdk/event"
 	"github.com/punk-one/edge-service-sdk/file"
 	logger "github.com/punk-one/edge-service-sdk/logging"
-	"github.com/punk-one/edge-service-sdk/runtime/ops"
-	"github.com/punk-one/edge-service-sdk/runtime/ops/configsvc"
-	"github.com/punk-one/edge-service-sdk/runtime/ops/logsvc"
 	httpserver "github.com/punk-one/edge-service-sdk/ops/http"
 	rtstatus "github.com/punk-one/edge-service-sdk/ops/status"
 	rtapi "github.com/punk-one/edge-service-sdk/property"
@@ -23,6 +21,10 @@ import (
 	rtconfig "github.com/punk-one/edge-service-sdk/runtime/config"
 	rtcontrol "github.com/punk-one/edge-service-sdk/runtime/control"
 	dependency "github.com/punk-one/edge-service-sdk/runtime/dependency"
+	eventruntime "github.com/punk-one/edge-service-sdk/runtime/event"
+	"github.com/punk-one/edge-service-sdk/runtime/ops"
+	"github.com/punk-one/edge-service-sdk/runtime/ops/configsvc"
+	"github.com/punk-one/edge-service-sdk/runtime/ops/logsvc"
 	rtproperty "github.com/punk-one/edge-service-sdk/runtime/property"
 	supervisor "github.com/punk-one/edge-service-sdk/runtime/scheduler"
 	outevent "github.com/punk-one/edge-service-sdk/telemetry"
@@ -38,6 +40,7 @@ type DeviceSDK struct {
 	productDevices map[string][]contracts.DeviceConfig
 	nameIndex      map[string]string
 	statusTracker  *rtstatus.Tracker
+	eventService   *eventruntime.Service
 
 	// Ops services
 	configService   *configsvc.ConfigService
@@ -135,39 +138,109 @@ func (s *DeviceSDK) ProductCodes() []string {
 }
 
 func (s *DeviceSDK) DeviceConnected(deviceName string) {
-	if s.statusTracker != nil {
-		s.statusTracker.MarkConnected(deviceName)
-	}
+	s.DeviceConnectedAt(deviceName, time.Now().UnixMilli())
 }
 
 func (s *DeviceSDK) DeviceDisconnected(deviceName string, err error) {
+	s.DeviceDisconnectedAt(deviceName, err, time.Now().UnixMilli())
+}
+
+func (s *DeviceSDK) DeviceConnectedAt(deviceName string, observedAt int64) {
 	if s.statusTracker != nil {
-		s.statusTracker.MarkDisconnected(deviceName, err)
+		s.statusTracker.MarkConnected(deviceName)
 	}
+	s.observeConnection(deviceName, true, "connected", observedAt, 0, "")
 }
 
 func (s *DeviceSDK) DeviceReadSucceeded(deviceName string) {
+	s.DeviceReadSucceededAt(deviceName, time.Now().UnixMilli())
+}
+
+func (s *DeviceSDK) DeviceDisconnectedAt(deviceName string, err error, observedAt int64) {
+	if s.statusTracker != nil {
+		s.statusTracker.MarkDisconnected(deviceName, err)
+	}
+	s.observeConnection(deviceName, false, "disconnected", observedAt, 0, errorString(err))
+}
+
+func (s *DeviceSDK) DeviceReadSucceededAt(deviceName string, observedAt int64) {
 	if s.statusTracker != nil {
 		s.statusTracker.MarkReadSuccess(deviceName)
 	}
+	s.observeConnection(deviceName, true, "connected", observedAt, observedAt, "")
 }
 
 func (s *DeviceSDK) DeviceReadFailed(deviceName string, err error) {
+	s.DeviceReadFailedAt(deviceName, err, time.Now().UnixMilli())
+}
+
+func (s *DeviceSDK) DeviceReadFailedAt(deviceName string, err error, observedAt int64) {
 	if s.statusTracker != nil {
 		s.statusTracker.MarkReadError(deviceName, err)
 	}
+	s.observeConnection(deviceName, false, "degraded", observedAt, 0, errorString(err))
 }
 
 func (s *DeviceSDK) DeviceWriteSucceeded(deviceName string) {
+	s.DeviceWriteSucceededAt(deviceName, time.Now().UnixMilli())
+}
+
+func (s *DeviceSDK) DeviceWriteSucceededAt(deviceName string, observedAt int64) {
 	if s.statusTracker != nil {
 		s.statusTracker.MarkWriteSuccess(deviceName)
 	}
+	s.observeConnection(deviceName, true, "connected", observedAt, observedAt, "")
 }
 
 func (s *DeviceSDK) DeviceWriteFailed(deviceName string, err error) {
+	s.DeviceWriteFailedAt(deviceName, err, time.Now().UnixMilli())
+}
+
+func (s *DeviceSDK) DeviceWriteFailedAt(deviceName string, err error, observedAt int64) {
 	if s.statusTracker != nil {
 		s.statusTracker.MarkWriteError(deviceName, err)
 	}
+	s.observeConnection(deviceName, false, "degraded", observedAt, 0, errorString(err))
+}
+
+func (s *DeviceSDK) SetEventService(service *eventruntime.Service) {
+	s.eventService = service
+}
+
+func (s *DeviceSDK) EventService() *eventruntime.Service {
+	if s == nil {
+		return nil
+	}
+	return s.eventService
+}
+
+func (s *DeviceSDK) ObserveEventProperty(deviceName string, observedAt int64, values map[string]interface{}) error {
+	if s == nil || s.eventService == nil {
+		return nil
+	}
+	return s.eventService.ObserveProperty(deviceName, observedAt, values)
+}
+
+func (s *DeviceSDK) observeConnection(deviceName string, online bool, state string, observedAt, lastSeenAt int64, errMessage string) {
+	if s == nil || s.eventService == nil {
+		return
+	}
+	if observedAt == 0 {
+		observedAt = time.Now().UnixMilli()
+	}
+	if lastSeenAt == 0 && online {
+		lastSeenAt = observedAt
+	}
+	if err := s.eventService.ObserveConnection(coreevent.ConnectionObservation{DeviceCode: deviceName, Online: online, State: state, ObservedAt: observedAt, LastSeenAt: lastSeenAt, Error: errMessage, Known: true}); err != nil && s.logger != nil {
+		s.logger.Warnf("EVENT connection observation failed for device %s: %v", deviceName, err)
+	}
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // ConfigService returns the runtime configuration service.
@@ -242,7 +315,7 @@ func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver, reg
 		return
 	}
 
-	publisher := mqtt.NewPublisher(config.MQTT, config.TelemetryReport, config.PropertyResult, config.PropertyReport, config.CommandResult, config.StatusReport, logClient)
+	publisher := mqtt.NewPublisher(config.MQTT, config.TelemetryReport, config.PropertyResult, config.PropertyReport, config.CommandResult, config.StatusReport, logClient, config.EventReport)
 	telemetrySink, err := reliable.NewDispatcher(config.ReliableQueue, publisher, logClient)
 	if err != nil {
 		logClient.Errorf("Failed to initialize reliable telemetry dispatcher: %v", err)
@@ -262,6 +335,15 @@ func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver, reg
 	}
 
 	sdk := NewDeviceSDK(config, logClient, statusTracker)
+	eventService, err := eventruntime.NewService(config, publisher, logClient)
+	if err != nil {
+		logClient.Errorf("Failed to initialize EVENT service: %v", err)
+		return
+	}
+	sdk.SetEventService(eventService)
+	if eventService != nil {
+		eventService.Start()
+	}
 	if err := driver.Initialize(sdk); err != nil {
 		logClient.Errorf("Failed to initialize driver: %v", err)
 		return
@@ -379,7 +461,7 @@ func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver, reg
 				len(reqs),
 			)
 			super.Start(deviceCopy.InternalName+"-property", func() error {
-				return runPropertyWorker(driver, deviceCopy, publisher, logClient)
+				return runPropertyWorker(driver, deviceCopy, publisher, sdk, logClient)
 			})
 		}
 	}
@@ -443,6 +525,11 @@ func processAsyncValues(sdk *DeviceSDK, telemetrySink reliable.TelemetrySink, lo
 		if !ok {
 			logClient.Warnf("Dropping async values for unknown device %s", asyncValues.DeviceName)
 			continue
+		}
+		if sdk.eventService != nil {
+			if err := sdk.eventService.ObserveTelemetry(device.InternalName, asyncValues.CollectedAt, asyncValues.Values); err != nil {
+				logClient.Warnf("Failed to process EVENT telemetry for %s: %v", asyncValues.DeviceName, err)
+			}
 		}
 		if err := telemetrySink.PublishAsyncValues(device, asyncValues); err != nil {
 			logClient.Errorf("Failed to publish async values for %s: %v", asyncValues.DeviceName, err)
@@ -570,8 +657,10 @@ func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.
 		if len(dueReqs) > 0 {
 			values, err := driver.HandleReadCommands(device.InternalName, rtconfig.ProtocolPropertiesFromConfig(device), dueReqs)
 			if err != nil {
+				sdk.DeviceReadFailedAt(device.InternalName, err, now.UnixMilli())
 				logClient.Errorf("Telemetry read failed for device %s: %v", device.InternalName, err)
 			} else {
+				sdk.DeviceReadSucceededAt(device.InternalName, now.UnixMilli())
 				// Phase 3: 评估上报
 				var mergedValues []*contracts.CommandValue
 
@@ -833,7 +922,7 @@ func filterValuesByNames(values []*contracts.CommandValue, names map[string]bool
 	return filtered
 }
 
-func runPropertyWorker(driver contracts.ProtocolDriver, device contracts.DeviceConfig, publisher mqtt.Publisher, logClient logger.LoggingClient) error {
+func runPropertyWorker(driver contracts.ProtocolDriver, device contracts.DeviceConfig, publisher mqtt.Publisher, sdk *DeviceSDK, logClient logger.LoggingClient) error {
 	duration, err := parsePropertyInterval(device.Property.Interval)
 	if err != nil {
 		return fmt.Errorf("invalid property interval %s for device %s: %w", device.Property.Interval, device.InternalName, err)
@@ -857,14 +946,31 @@ func runPropertyWorker(driver contracts.ProtocolDriver, device contracts.DeviceC
 	for {
 		values, err := driver.HandleReadCommands(device.InternalName, rtconfig.ProtocolPropertiesFromConfig(device), reqs)
 		if err != nil {
+			if sdk != nil {
+				sdk.DeviceReadFailedAt(device.InternalName, err, time.Now().UnixMilli())
+			}
 			logClient.Errorf("Property read failed for device %s: %v", device.InternalName, err)
-		} else if shouldEmitProperty(device.Property, values, state, time.Now()) {
-			now := time.Now().UnixMilli()
-			updateTelemetryState(state, values, now)
+		} else {
+			now := time.Now()
+			if sdk != nil {
+				sdk.DeviceReadSucceededAt(device.InternalName, now.UnixMilli())
+			}
+			if !shouldEmitProperty(device.Property, values, state, now) {
+				<-ticker.C
+				continue
+			}
+			observedAt := now.UnixMilli()
+			updateTelemetryState(state, values, observedAt)
+			propertyData := appconfig.BuildPropertyResponse(values, bindings)
+			if sdk != nil && sdk.eventService != nil {
+				if eventErr := sdk.eventService.ObserveProperty(device.InternalName, observedAt, propertyData); eventErr != nil {
+					logClient.Warnf("Failed to process EVENT property values for %s: %v", device.InternalName, eventErr)
+				}
+			}
 			_ = publisher.PublishPropertyReport(device, map[string]interface{}{
 				"device_code": device.Name,
-				"time":        now,
-				"data":        appconfig.BuildPropertyResponse(values, bindings),
+				"time":        observedAt,
+				"data":        propertyData,
 			})
 		}
 

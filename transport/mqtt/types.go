@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	contracts "github.com/punk-one/edge-service-sdk/driver"
+	events "github.com/punk-one/edge-service-sdk/event"
 	logger "github.com/punk-one/edge-service-sdk/logging"
 	outevent "github.com/punk-one/edge-service-sdk/telemetry"
 
@@ -35,6 +36,13 @@ type Publisher interface {
 	Subscribe(topic string, qos byte, handler MessageHandler) error
 	HealthCheck() error
 	Close() error
+}
+
+// EventPublisher is an optional extension implemented by MQTT publishers that
+// have an eventReport topic. Keeping it separate preserves compatibility with
+// existing service-local publisher test doubles and integrations.
+type EventPublisher interface {
+	PublishEvent(event events.Event, replayed bool) error
 }
 
 // MultiGroupPublisher is implemented by publishers that fan out to multiple groups.
@@ -123,6 +131,7 @@ type MQTTPublisher struct {
 	propertyReport TopicConfig
 	commandResult  TopicConfig
 	statusReport   TopicConfig
+	eventReport    TopicConfig
 	client         *mqttClient
 }
 
