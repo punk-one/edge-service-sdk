@@ -1,8 +1,10 @@
 package mqtt
 
 import (
+	"fmt"
 	"sync"
 
+	busapi "github.com/punk-one/edge-service-sdk/bus"
 	contracts "github.com/punk-one/edge-service-sdk/driver"
 	events "github.com/punk-one/edge-service-sdk/event"
 	logger "github.com/punk-one/edge-service-sdk/logging"
@@ -10,6 +12,33 @@ import (
 
 	paho "github.com/eclipse/paho.mqtt.golang"
 )
+
+type MessageDirection string
+
+const (
+	DirectionOutbound MessageDirection = "outbound"
+	DirectionInbound  MessageDirection = "inbound"
+)
+
+// Observation is a copy of one logical MQTT message. Observers are optional;
+// their failures must never alter the MQTT return path.
+type Observation struct {
+	Direction   MessageDirection
+	Type        busapi.MessageType
+	Topic       string
+	QoS         byte
+	Retain      bool
+	Payload     []byte
+	DataFormat  string
+	DeviceName  string
+	ProductCode string
+	TraceID     string
+	Identifier  string
+}
+
+type Observer interface {
+	ObserveMQTT(message Observation)
+}
 
 // MessageHandler handles incoming MQTT messages for subscribed topics.
 type MessageHandler func(topic string, payload []byte)
@@ -133,9 +162,11 @@ type MQTTPublisher struct {
 	statusReport   TopicConfig
 	eventReport    TopicConfig
 	client         *mqttClient
+	observer       Observer
 }
 
 type mqttMessage struct {
+	Type        busapi.MessageType
 	Topic       string
 	QoS         byte
 	Retain      bool
@@ -143,6 +174,8 @@ type mqttMessage struct {
 	DeviceName  string
 	ProductCode string
 	TraceID     string
+	Identifier  string
+	DataFormat  string
 }
 
 type subscription struct {
@@ -181,3 +214,39 @@ type telemetryData struct {
 
 var _ Client = (*mqttClient)(nil)
 var _ Publisher = (*MQTTPublisher)(nil)
+
+type observerPublisher interface {
+	setObserver(Observer)
+	observeInbound(Observation)
+	publishDirect(topic string, qos byte, retain bool, payload []byte) error
+}
+
+// AttachObserver adds an optional message mirror without changing Publisher.
+func AttachObserver(publisher Publisher, observer Observer) bool {
+	target, ok := publisher.(interface{ setObserver(Observer) })
+	if !ok {
+		return false
+	}
+	target.setObserver(observer)
+	return true
+}
+
+// ObserveInbound mirrors a received MQTT message while leaving its existing
+// callback and error semantics untouched.
+func ObserveInbound(publisher Publisher, message Observation) {
+	if target, ok := publisher.(interface{ observeInbound(Observation) }); ok {
+		target.observeInbound(message)
+	}
+}
+
+// PublishDirect bypasses the observer and is used only for process-originated
+// messages to prevent a JetStream -> MQTT -> JetStream loop.
+func PublishDirect(publisher Publisher, topic string, qos byte, retain bool, payload []byte) error {
+	target, ok := publisher.(interface {
+		publishDirect(string, byte, bool, []byte) error
+	})
+	if !ok {
+		return fmt.Errorf("mqtt publisher does not support direct publish")
+	}
+	return target.publishDirect(topic, qos, retain, payload)
+}

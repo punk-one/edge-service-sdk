@@ -24,8 +24,9 @@ func NewPublisher(cfg MQTTConfig, telemetry, propertyResult, propertyReport, com
 // ─── MultiPublisher ───────────────────────────────────────────────────────────
 
 type multiPublisher struct {
-	groups []*groupPublisher
-	logger logger.LoggingClient
+	groups   []*groupPublisher
+	logger   logger.LoggingClient
+	observer Observer
 }
 
 func newMultiPublisher(cfg MQTTConfig, telemetry, propertyResult, propertyReport, commandResult, statusReport TopicConfig, logClient logger.LoggingClient, eventReport ...TopicConfig) *multiPublisher {
@@ -214,6 +215,37 @@ func (m *multiPublisher) Close() error {
 	return lastErr
 }
 
+func (m *multiPublisher) setObserver(observer Observer) {
+	m.observer = observer
+	// Mirror exactly one actual MQTT representation. Parallel MQTT groups may
+	// format the same logical telemetry differently; the first configured group
+	// is the stable primary representation for the optional bus.
+	for i, group := range m.groups {
+		if i == 0 {
+			group.setObserver(observer)
+		} else {
+			group.setObserver(nil)
+		}
+	}
+}
+
+func (m *multiPublisher) observeInbound(message Observation) {
+	if m != nil && m.observer != nil {
+		message.Direction = DirectionInbound
+		m.observer.ObserveMQTT(message)
+	}
+}
+
+func (m *multiPublisher) publishDirect(topic string, qos byte, retain bool, payload []byte) error {
+	var lastErr error
+	for _, group := range m.groups {
+		if err := group.publishDirect(topic, qos, retain, payload); err != nil {
+			lastErr = err
+		}
+	}
+	return lastErr
+}
+
 // ─── groupPublisher ───────────────────────────────────────────────────────────
 
 type groupPublisher struct {
@@ -228,6 +260,7 @@ type groupPublisher struct {
 	eventReport       TopicConfig
 	heartbeatInterval string
 	logger            logger.LoggingClient
+	observer          Observer
 
 	mu            sync.RWMutex
 	active        *MQTTPublisher
@@ -282,6 +315,7 @@ func (g *groupPublisher) activateSingle() {
 	g.mu.Unlock()
 
 	p := NewMQTTPublisher(cfg, g.telemetry, g.propertyResult, g.propertyReport, g.commandResult, g.statusReport, g.logger, g.eventReport)
+	p.setObserver(g.observer)
 
 	g.mu.Lock()
 	old := g.active
@@ -310,6 +344,7 @@ func (g *groupPublisher) activateFailover() {
 
 	for i := 0; i < len(brokers); i++ {
 		p := NewMQTTPublisher(brokers[i], g.telemetry, g.propertyResult, g.propertyReport, g.commandResult, g.statusReport, g.logger, g.eventReport)
+		p.setObserver(g.observer)
 		if err := p.HealthCheck(); err != nil {
 			g.logger.Warnf("[mqtt] group %s: broker[%d] %s initial health check failed: %v", g.name, i, brokers[i].URL, err)
 			p.Close()
@@ -397,6 +432,7 @@ func (g *groupPublisher) switchToNext() {
 			cfg := brokers[nextIdx]
 
 			p := NewMQTTPublisher(cfg, g.telemetry, g.propertyResult, g.propertyReport, g.commandResult, g.statusReport, g.logger, g.eventReport)
+			p.setObserver(g.observer)
 			if err := p.HealthCheck(); err != nil {
 				g.logger.Warnf("[mqtt] group %s: broker[%d] %s health check failed: %v", g.name, nextIdx, cfg.URL, err)
 				p.Close()
@@ -538,6 +574,23 @@ func (g *groupPublisher) Close() error {
 		return g.active.Close()
 	}
 	return nil
+}
+
+func (g *groupPublisher) setObserver(observer Observer) {
+	g.mu.Lock()
+	g.observer = observer
+	active := g.active
+	g.mu.Unlock()
+	if active != nil {
+		active.setObserver(observer)
+	}
+}
+
+func (g *groupPublisher) publishDirect(topic string, qos byte, retain bool, payload []byte) error {
+	if publisher := g.getActive(); publisher != nil {
+		return publisher.publishDirect(topic, qos, retain, payload)
+	}
+	return fmt.Errorf("group %s: no active publisher", g.name)
 }
 
 // ─── Merge helpers ────────────────────────────────────────────────────────────

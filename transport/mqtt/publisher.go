@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	busapi "github.com/punk-one/edge-service-sdk/bus"
 	contracts "github.com/punk-one/edge-service-sdk/driver"
 	events "github.com/punk-one/edge-service-sdk/event"
 	logger "github.com/punk-one/edge-service-sdk/logging"
@@ -43,6 +44,7 @@ func (p *MQTTPublisher) PublishTelemetry(device contracts.DeviceConfig, data map
 	}
 
 	return p.publishRaw(mqttMessage{
+		Type:        busapi.TelemetryReport,
 		Topic:       resolveTopic(p.telemetry.Topic, device.ProductCode),
 		QoS:         byte(resolveQoS(p.telemetry.QoS, p.client.config.QoS)),
 		Retain:      p.telemetry.Retain,
@@ -50,6 +52,7 @@ func (p *MQTTPublisher) PublishTelemetry(device contracts.DeviceConfig, data map
 		DeviceName:  device.Name,
 		ProductCode: device.ProductCode,
 		TraceID:     event.TraceID,
+		DataFormat:  p.telemetry.DataFormat,
 	})
 }
 
@@ -65,6 +68,7 @@ func (p *MQTTPublisher) PublishTelemetryEvent(event outevent.TelemetryEvent, rep
 	}
 
 	return p.publishRaw(mqttMessage{
+		Type:        busapi.TelemetryReport,
 		Topic:       resolveTopic(p.telemetry.Topic, event.ProductCode),
 		QoS:         byte(resolveQoS(p.telemetry.QoS, p.client.config.QoS)),
 		Retain:      p.telemetry.Retain,
@@ -72,6 +76,7 @@ func (p *MQTTPublisher) PublishTelemetryEvent(event outevent.TelemetryEvent, rep
 		DeviceName:  event.DeviceName,
 		ProductCode: event.ProductCode,
 		TraceID:     event.TraceID,
+		DataFormat:  p.telemetry.DataFormat,
 	})
 }
 
@@ -90,19 +95,19 @@ func (p *MQTTPublisher) PublishCommandValues(device contracts.DeviceConfig, valu
 }
 
 func (p *MQTTPublisher) PublishPropertyResult(device contracts.DeviceConfig, payload map[string]interface{}) error {
-	return p.publishJSONTopic(resolveTopic(p.propertyResult.Topic, device.ProductCode), payload, p.propertyResult.QoS, p.propertyResult.Retain)
+	return p.publishJSONTopic(mqttMessage{Type: busapi.PropertyResult, Topic: resolveTopic(p.propertyResult.Topic, device.ProductCode), DeviceName: device.Name, ProductCode: device.ProductCode, TraceID: traceIDFromPayload(payload)}, payload, p.propertyResult.QoS, p.propertyResult.Retain)
 }
 
 func (p *MQTTPublisher) PublishPropertyReport(device contracts.DeviceConfig, payload map[string]interface{}) error {
-	return p.publishJSONTopic(resolveTopic(p.propertyReport.Topic, device.ProductCode), payload, p.propertyReport.QoS, p.propertyReport.Retain)
+	return p.publishJSONTopic(mqttMessage{Type: busapi.PropertyReport, Topic: resolveTopic(p.propertyReport.Topic, device.ProductCode), DeviceName: device.Name, ProductCode: device.ProductCode, TraceID: traceIDFromPayload(payload)}, payload, p.propertyReport.QoS, p.propertyReport.Retain)
 }
 
 func (p *MQTTPublisher) PublishCommandResult(device contracts.DeviceConfig, payload map[string]interface{}) error {
-	return p.publishJSONTopic(resolveTopic(p.commandResult.Topic, device.ProductCode), payload, p.commandResult.QoS, p.commandResult.Retain)
+	return p.publishJSONTopic(mqttMessage{Type: busapi.CommandResult, Topic: resolveTopic(p.commandResult.Topic, device.ProductCode), DeviceName: device.Name, ProductCode: device.ProductCode, TraceID: traceIDFromPayload(payload)}, payload, p.commandResult.QoS, p.commandResult.Retain)
 }
 
 func (p *MQTTPublisher) PublishStatus(device contracts.DeviceConfig, payload map[string]interface{}) error {
-	return p.publishJSONTopic(resolveTopic(p.statusReport.Topic, device.ProductCode), payload, p.statusReport.QoS, p.statusReport.Retain)
+	return p.publishJSONTopic(mqttMessage{Type: busapi.StatusReport, Topic: resolveTopic(p.statusReport.Topic, device.ProductCode), DeviceName: device.Name, ProductCode: device.ProductCode, TraceID: traceIDFromPayload(payload)}, payload, p.statusReport.QoS, p.statusReport.Retain)
 }
 
 // PublishEvent publishes the public event envelope. Delivery metadata is
@@ -117,6 +122,7 @@ func (p *MQTTPublisher) PublishEvent(event events.Event, replayed bool) error {
 		return err
 	}
 	return p.publishRaw(mqttMessage{
+		Type:        busapi.EventReport,
 		Topic:       resolveTopic(p.eventReport.Topic, event.ProductCode),
 		QoS:         byte(resolveQoS(p.eventReport.QoS, p.client.config.QoS)),
 		Retain:      p.eventReport.Retain,
@@ -127,24 +133,68 @@ func (p *MQTTPublisher) PublishEvent(event events.Event, replayed bool) error {
 	})
 }
 
-func (p *MQTTPublisher) publishJSONTopic(topic string, payload map[string]interface{}, qos int, retain bool) error {
-	if topic == "" {
+func (p *MQTTPublisher) publishJSONTopic(message mqttMessage, payload map[string]interface{}, qos int, retain bool) error {
+	if message.Topic == "" {
 		return nil
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	return p.publishRaw(mqttMessage{
-		Topic:   topic,
-		QoS:     byte(resolveQoS(qos, p.client.config.QoS)),
-		Retain:  retain,
-		Payload: body,
-	})
+	message.QoS = byte(resolveQoS(qos, p.client.config.QoS))
+	message.Retain = retain
+	message.Payload = body
+	message.DataFormat = "json"
+	return p.publishRaw(message)
 }
 
 func (p *MQTTPublisher) publishRaw(message mqttMessage) error {
-	return p.client.publishMessage(message)
+	err := p.client.publishMessage(message)
+	p.observe(Observation{
+		Direction:   DirectionOutbound,
+		Type:        message.Type,
+		Topic:       message.Topic,
+		QoS:         message.QoS,
+		Retain:      message.Retain,
+		Payload:     append([]byte(nil), message.Payload...),
+		DataFormat:  message.DataFormat,
+		DeviceName:  message.DeviceName,
+		ProductCode: message.ProductCode,
+		TraceID:     message.TraceID,
+		Identifier:  message.Identifier,
+	})
+	return err
+}
+
+func (p *MQTTPublisher) setObserver(observer Observer) {
+	p.observer = observer
+}
+
+func (p *MQTTPublisher) observe(message Observation) {
+	if p != nil && p.observer != nil && message.Type != "" {
+		p.observer.ObserveMQTT(message)
+	}
+}
+
+func (p *MQTTPublisher) observeInbound(message Observation) {
+	message.Direction = DirectionInbound
+	p.observe(message)
+}
+
+func (p *MQTTPublisher) publishDirect(topic string, qos byte, retain bool, payload []byte) error {
+	if p == nil || p.client == nil {
+		return fmt.Errorf("mqtt publisher is not initialized")
+	}
+	return p.client.Publish(topic, qos, retain, payload)
+}
+
+func traceIDFromPayload(payload map[string]interface{}) string {
+	for _, key := range []string{"trace_id", "traceId"} {
+		if value, ok := payload[key].(string); ok {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func (p *MQTTPublisher) Subscribe(topic string, qos byte, handler MessageHandler) error {

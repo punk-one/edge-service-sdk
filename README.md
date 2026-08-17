@@ -111,6 +111,54 @@ The bootstrap flow loads config, initializes auth/MQTT/reliable queue/control st
 4. Route telemetry/property/status/command topics through the SDK MQTT publisher instead of re-implementing transport logic.
 5. Reuse the SDK HTTP endpoints and control store so HTTP, MQTT, async execution, and result queries stay aligned.
 
+## Optional embedded JetStream bus
+
+The MQTT, SQLite, collection, property, and command paths remain authoritative.
+The embedded JetStream bus is disabled by default and mirrors MQTT traffic only
+when `bus.enabled` is true. A bus startup or publish failure is reported as a
+degraded optional dependency and does not stop the existing service path.
+
+The embedded server binds `127.0.0.1` on a random operating-system-selected
+port. Subjects and the port are SDK conventions and are not application
+configuration.
+
+### Fixed subjects
+
+| Logical type | JetStream subject | Direction |
+| --- | --- | --- |
+| `telemetry.report` | `edge.v1.telemetry.report` | SDK/process to monitoring or MQTT |
+| `property.report` | `edge.v1.property.report` | SDK/process to monitoring or MQTT |
+| `property.result` | `edge.v1.property.result` | SDK/process to monitoring or MQTT |
+| `command.result` | `edge.v1.command.result` | SDK/process to monitoring or MQTT |
+| `property.set` | `edge.v1.property.set` | MQTT/process/NATS to property service |
+| `property.get` | `edge.v1.property.get` | MQTT/process/NATS to property service |
+| `command.call` | `edge.v1.command.call.{identifier}` | MQTT/process/NATS to command service |
+| `event.report` | `edge.v1.event.report` | SDK/process to monitoring or MQTT |
+| `status.report` | `edge.v1.status.report` | SDK/process to monitoring or MQTT |
+
+JetStream data is the same payload produced for the corresponding MQTT route.
+Telemetry therefore follows the effective `telemetryReport.dataFormat`; it is
+not forced to `rule`. The SDK adds routing metadata only as NATS headers:
+`Edge-Origin`, `Edge-Process-Name`, `Edge-Message-Type`, `Edge-Data-Format`,
+`Edge-Trace-Id`, `Edge-Product-Code`, `Edge-Device-Code`, and `Edge-Hop`.
+
+Minimal optional configuration:
+
+```yaml
+bus:
+  enabled: true
+
+process:
+  # Defaults to ./configs/processes when enabled is non-empty.
+  configDir: "./configs/processes"
+  enabled:
+    - telemetry-alarm
+```
+
+Omitting either section preserves the previous behavior. See
+[`docs/process-development-spec.md`](docs/process-development-spec.md) for the
+application process API and lifecycle contract.
+
 ## Package Layout
 
 - `config`
@@ -133,6 +181,12 @@ The bootstrap flow loads config, initializes auth/MQTT/reliable queue/control st
   Protocol-independent event model, YAML validation, expression evaluation, connection/OEE/alarm state machines, payload selection, and summary windows.
 - `runtime/event`
   EVENT runtime lifecycle, state-file persistence, event dispatch, and integration with the MQTT event publisher.
+- `bus` / `runtime/bus`
+  Fixed message contracts plus the optional embedded JetStream server, mirror,
+  durable consumers, and random-port lifecycle.
+- `process` / `runtime/process`
+  Application handler registry, YAML definitions, independent durable
+  consumers, self-loop prevention, timeout handling, and output publication.
 - `runtime/app`
   SDK bootstrap facade, runtime assembly, status publishing, and MQTT query wiring.
 - `runtime/config`

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	busapi "github.com/punk-one/edge-service-sdk/bus"
 	cfg "github.com/punk-one/edge-service-sdk/config"
 	ctl "github.com/punk-one/edge-service-sdk/control"
 	contracts "github.com/punk-one/edge-service-sdk/driver"
@@ -173,20 +174,46 @@ func (s *Service) RegisterMQTTHandlers(config rtconfig.Config) {
 	for _, productCode := range s.catalog.ProductCodes() {
 		if config.PropertySet.Topic != "" {
 			topic := cfg.StringsReplaceProductCode(config.PropertySet.Topic, productCode)
-			_ = s.publisher.Subscribe(topic, byte(config.PropertySet.QoS), func(_ string, payload []byte) {
+			_ = s.publisher.Subscribe(topic, byte(config.PropertySet.QoS), func(actualTopic string, payload []byte) {
+				mqtt.ObserveInbound(s.publisher, mqtt.Observation{
+					Type:        busapi.PropertySet,
+					Topic:       actualTopic,
+					QoS:         byte(config.PropertySet.QoS),
+					Payload:     append([]byte(nil), payload...),
+					DataFormat:  "json",
+					ProductCode: productCode,
+				})
 				s.handlePropertySet(productCode, payload)
 			})
 		}
 
 		if config.PropertyGet.Topic != "" && config.PropertyResult.Topic != "" {
 			topic := cfg.StringsReplaceProductCode(config.PropertyGet.Topic, productCode)
-			_ = s.publisher.Subscribe(topic, byte(config.PropertyGet.QoS), func(_ string, payload []byte) {
+			_ = s.publisher.Subscribe(topic, byte(config.PropertyGet.QoS), func(actualTopic string, payload []byte) {
+				mqtt.ObserveInbound(s.publisher, mqtt.Observation{
+					Type:        busapi.PropertyGet,
+					Topic:       actualTopic,
+					QoS:         byte(config.PropertyGet.QoS),
+					Payload:     append([]byte(nil), payload...),
+					DataFormat:  "json",
+					ProductCode: productCode,
+				})
 				s.handlePropertyGet(productCode, payload)
 			})
 		} else if config.PropertyGet.Topic != "" && config.PropertyResult.Topic == "" && s.logger != nil {
 			s.logger.Warnf("PropertyGet configured but PropertyResult topic is empty; disabling property get for product %s", productCode)
 		}
 	}
+}
+
+// HandleBusPropertySet reuses the existing MQTT property path for a
+// process/NATS-originated payload without reflecting the input back to the bus.
+func (s *Service) HandleBusPropertySet(productCode string, payload []byte) {
+	s.handlePropertySet(productCode, payload)
+}
+
+func (s *Service) HandleBusPropertyGet(productCode string, payload []byte) {
+	s.handlePropertyGet(productCode, payload)
 }
 
 func (s *Service) ResumePending() error {

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	busapi "github.com/punk-one/edge-service-sdk/bus"
 	cmdapi "github.com/punk-one/edge-service-sdk/command"
 	cfg "github.com/punk-one/edge-service-sdk/config"
 	ctl "github.com/punk-one/edge-service-sdk/control"
@@ -124,9 +125,24 @@ func (s *Service) RegisterMQTTHandlers(config rtconfig.Config) {
 				}
 				return
 			}
+			mqtt.ObserveInbound(s.publisher, mqtt.Observation{
+				Type:        busapi.CommandCall,
+				Topic:       topic,
+				QoS:         byte(config.CommandCall.QoS),
+				Payload:     append([]byte(nil), payload...),
+				DataFormat:  "json",
+				ProductCode: productCode,
+				Identifier:  identifier,
+			})
 			s.handleCommandCall(productCode, identifier, payload)
 		})
 	}
+}
+
+// HandleBusCommandCall reuses the existing command execution and result path
+// for process/NATS-originated requests.
+func (s *Service) HandleBusCommandCall(productCode string, identifier string, payload []byte) {
+	s.handleCommandCall(productCode, identifier, payload)
 }
 
 func (s *Service) ResumePending() error {

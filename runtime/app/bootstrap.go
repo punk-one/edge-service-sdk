@@ -16,7 +16,9 @@ import (
 	logger "github.com/punk-one/edge-service-sdk/logging"
 	httpserver "github.com/punk-one/edge-service-sdk/ops/http"
 	rtstatus "github.com/punk-one/edge-service-sdk/ops/status"
+	processapi "github.com/punk-one/edge-service-sdk/process"
 	rtapi "github.com/punk-one/edge-service-sdk/property"
+	runtimebus "github.com/punk-one/edge-service-sdk/runtime/bus"
 	rtcommand "github.com/punk-one/edge-service-sdk/runtime/command"
 	rtconfig "github.com/punk-one/edge-service-sdk/runtime/config"
 	rtcontrol "github.com/punk-one/edge-service-sdk/runtime/control"
@@ -25,6 +27,7 @@ import (
 	"github.com/punk-one/edge-service-sdk/runtime/ops"
 	"github.com/punk-one/edge-service-sdk/runtime/ops/configsvc"
 	"github.com/punk-one/edge-service-sdk/runtime/ops/logsvc"
+	runtimeprocess "github.com/punk-one/edge-service-sdk/runtime/process"
 	rtproperty "github.com/punk-one/edge-service-sdk/runtime/property"
 	supervisor "github.com/punk-one/edge-service-sdk/runtime/scheduler"
 	outevent "github.com/punk-one/edge-service-sdk/telemetry"
@@ -282,8 +285,20 @@ func validateCommandBindings(devices []contracts.DeviceConfig, registry cmdapi.R
 	return nil
 }
 
+type BootstrapOptions struct {
+	CommandRegistry cmdapi.Registry
+	ProcessRegistry processapi.Registry
+}
+
+// Bootstrap preserves the original SDK entry point for every deployed
+// application that does not define custom processors.
 func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver, registry cmdapi.Registry) {
+	BootstrapWithOptions(serviceName, version, driver, BootstrapOptions{CommandRegistry: registry})
+}
+
+func BootstrapWithOptions(serviceName, version string, driver contracts.ProtocolDriver, options BootstrapOptions) {
 	fmt.Printf("Starting %s version %s\n", serviceName, version)
+	registry := options.CommandRegistry
 	if registry == nil {
 		registry = cmdapi.NewRegistry()
 	}
@@ -315,7 +330,30 @@ func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver, reg
 		return
 	}
 
+	busService, busErr := runtimebus.Start(serviceName, config.Bus, logClient)
+	if busErr != nil {
+		// The bus is an optional side path. A failure must never prevent the
+		// deployed MQTT/SQLite/device path from starting.
+		logClient.Errorf("Optional JetStream bus is degraded and will be disabled: %v", busErr)
+		busService = nil
+	}
+	if busService != nil {
+		defer busService.Close()
+	}
+
 	publisher := mqtt.NewPublisher(config.MQTT, config.TelemetryReport, config.PropertyResult, config.PropertyReport, config.CommandResult, config.StatusReport, logClient, config.EventReport)
+	var mqttObserver *runtimebus.MQTTObserver
+	if busService != nil {
+		mqttObserver = runtimebus.NewMQTTObserver(busService, logClient)
+		if !mqtt.AttachObserver(publisher, mqttObserver) {
+			logClient.Warnf("MQTT publisher does not expose observation hooks; JetStream mirroring is disabled")
+			mqttObserver.Close()
+			mqttObserver = nil
+		}
+	}
+	if mqttObserver != nil {
+		defer mqttObserver.Close()
+	}
 	telemetrySink, err := reliable.NewDispatcher(config.ReliableQueue, publisher, logClient)
 	if err != nil {
 		logClient.Errorf("Failed to initialize reliable telemetry dispatcher: %v", err)
@@ -416,6 +454,22 @@ func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver, reg
 
 	queryService := newMQTTQueryService(sdk, registry, controlStore, publisher, logClient)
 	queryService.RegisterMQTTHandlers(config)
+
+	if busService != nil {
+		if err := installJetStreamRoutes(busService, sdk, publisher, config, propertyService, commandService, logClient); err != nil {
+			logClient.Errorf("Some optional JetStream routes were not installed: %v", err)
+		}
+		processRunner := runtimeprocess.NewRunner(config.Process, options.ProcessRegistry, busService, logClient)
+		started, err := processRunner.Start()
+		if err != nil {
+			logClient.Errorf("Some optional processes were not started: %v", err)
+		}
+		if len(config.Process.Enabled) > 0 {
+			logClient.Infof("Process runtime initialized: enabled=%d started=%d", len(config.Process.Enabled), started)
+		}
+	} else if len(config.Process.Enabled) > 0 {
+		logClient.Warnf("Processes are configured but disabled because the optional JetStream bus is unavailable")
+	}
 
 	sdk.statusPublisher = installStatusPublisher(statusTracker, sdk, publisher, config.StatusReport, logClient)
 

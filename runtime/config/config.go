@@ -11,6 +11,8 @@ type StorageConfig = cfg.StorageConfig
 type AuthConfig = cfg.AuthConfig
 type ServiceConfig = cfg.ServiceConfig
 type DeviceConfig = cfg.DeviceConfig
+type BusConfig = cfg.BusConfig
+type ProcessConfig = cfg.ProcessConfig
 
 func LoadConfig(path string) (Config, error) {
 	return cfg.LoadConfig(path)

@@ -36,8 +36,26 @@ type Config struct {
 	StatusReport    mqtt.TopicConfig         `yaml:"statusReport"`
 	EventReport     mqtt.TopicConfig         `yaml:"eventReport"`
 	ControlStore    ControlStoreConfig       `yaml:"controlStore"`
+	Bus             BusConfig                `yaml:"bus"`
+	Process         ProcessConfig            `yaml:"process"`
 	Devices         []contracts.DeviceConfig `yaml:"deviceList"`
 	LogLevel        string                   `yaml:"logLevel"`
+}
+
+// BusConfig controls the optional embedded JetStream server. Subjects and the
+// listen port are SDK conventions and are intentionally not configurable.
+type BusConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	StoreDir string `yaml:"storeDir"`
+	MaxAge   string `yaml:"maxAge"`
+	MaxBytes int64  `yaml:"maxBytes"`
+}
+
+// ProcessConfig selects application processors. An empty list disables all
+// processors even when the bus itself is enabled.
+type ProcessConfig struct {
+	ConfigDir string   `yaml:"configDir"`
+	Enabled   []string `yaml:"enabled"`
 }
 
 // StorageConfig represents shared runtime storage.
@@ -385,6 +403,8 @@ func NormalizeConfig(config Config) Config {
 	config.Device.ProfilesDir = filepath.FromSlash(config.Device.ProfilesDir)
 	config.Device.DevicesDir = filepath.FromSlash(config.Device.DevicesDir)
 	config.Device.EventDir = filepath.FromSlash(config.Device.EventDir)
+	config.Bus.StoreDir = filepath.FromSlash(config.Bus.StoreDir)
+	config.Process.ConfigDir = filepath.FromSlash(config.Process.ConfigDir)
 	config.Logging = EffectiveLoggerConfig(config)
 	if config.TelemetryReport.DataFormat == "" {
 		config.TelemetryReport.DataFormat = "rule"
