@@ -2,6 +2,7 @@ package process
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -11,7 +12,7 @@ import (
 	"time"
 
 	busapi "github.com/punk-one/edge-service-sdk/bus"
-	appconfig "github.com/punk-one/edge-service-sdk/config"
+	contracts "github.com/punk-one/edge-service-sdk/driver"
 	logger "github.com/punk-one/edge-service-sdk/logging"
 	processapi "github.com/punk-one/edge-service-sdk/process"
 	runtimebus "github.com/punk-one/edge-service-sdk/runtime/bus"
@@ -19,32 +20,44 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const defaultConfigDir = "./configs/processes"
+const defaultConfigDir = "./configs/process"
 
 type Runner struct {
-	config   appconfig.ProcessConfig
-	registry processapi.Registry
-	bus      *runtimebus.Service
-	logger   logger.LoggingClient
+	configDir string
+	devices   []contracts.DeviceConfig
+	registry  processapi.Registry
+	bus       *runtimebus.Service
+	logger    logger.LoggingClient
 }
 
-func NewRunner(config appconfig.ProcessConfig, registry processapi.Registry, busService *runtimebus.Service, logClient logger.LoggingClient) *Runner {
-	return &Runner{config: config, registry: registry, bus: busService, logger: logClient}
+func NewRunner(configDir string, devices []contracts.DeviceConfig, registry processapi.Registry, busService *runtimebus.Service, logClient logger.LoggingClient) *Runner {
+	return &Runner{configDir: configDir, devices: devices, registry: registry, bus: busService, logger: logClient}
 }
 
-// Start loads and starts only the processors named by process.enabled. Invalid
-// processors are reported and skipped without affecting the application path.
+// ConfiguredProcessCount returns the number of distinct Process names bound to
+// at least one device.
+func ConfiguredProcessCount(devices []contracts.DeviceConfig) int {
+	return len(buildBindings(devices))
+}
+
+// Start loads and starts the distinct processors referenced by device
+// processNames. Invalid processors are reported and skipped without affecting
+// the authoritative device, MQTT, or SQLite paths.
 func (r *Runner) Start() (int, error) {
-	if r == nil || len(r.config.Enabled) == 0 {
+	if r == nil {
+		return 0, nil
+	}
+	bindings := buildBindings(r.devices)
+	if len(bindings) == 0 {
 		return 0, nil
 	}
 	if r.bus == nil {
-		return 0, fmt.Errorf("processes are configured but the JetStream bus is unavailable")
+		return 0, fmt.Errorf("device-bound processes are configured but the JetStream bus is unavailable")
 	}
 	if r.registry == nil {
-		return 0, fmt.Errorf("processes are configured but no process registry was supplied")
+		return 0, fmt.Errorf("device-bound processes are configured but no process registry was supplied")
 	}
-	dir := strings.TrimSpace(r.config.ConfigDir)
+	dir := strings.TrimSpace(r.configDir)
 	if dir == "" {
 		dir = defaultConfigDir
 	}
@@ -53,21 +66,18 @@ func (r *Runner) Start() (int, error) {
 		return 0, err
 	}
 
+	names := make([]string, 0, len(bindings))
+	for name := range bindings {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
 	started := 0
 	var startErrors []error
-	seen := make(map[string]struct{}, len(r.config.Enabled))
-	for _, rawName := range r.config.Enabled {
-		name := strings.TrimSpace(rawName)
-		if name == "" {
-			continue
-		}
-		if _, duplicate := seen[name]; duplicate {
-			continue
-		}
-		seen[name] = struct{}{}
+	for _, name := range names {
 		definition, ok := definitions[name]
 		if !ok {
-			startErrors = append(startErrors, fmt.Errorf("enabled process %q has no YAML definition in %s", name, dir))
+			startErrors = append(startErrors, fmt.Errorf("device-bound process %q has no YAML definition in %s", name, dir))
 			continue
 		}
 		handlerName := strings.TrimSpace(definition.Handler)
@@ -76,36 +86,36 @@ func (r *Runner) Start() (int, error) {
 		}
 		handler, ok := r.registry.Lookup(handlerName)
 		if !ok {
-			startErrors = append(startErrors, fmt.Errorf("enabled process %q has no registered handler %q", name, handlerName))
+			startErrors = append(startErrors, fmt.Errorf("device-bound process %q has no registered handler %q", name, handlerName))
 			continue
 		}
-		if err := r.startDefinition(definition, handler); err != nil {
+		if err := r.startDefinition(definition, bindings[name], handler); err != nil {
 			startErrors = append(startErrors, fmt.Errorf("start process %q: %w", name, err))
 			continue
 		}
 		started++
 		if r.logger != nil {
-			r.logger.Infof("Process started: name=%s subscriptions=%d", name, len(definition.Subscribe))
+			r.logger.Infof("Process started: name=%s devices=%d subject=%s", name, len(bindings[name]), busapi.StreamSubject)
 		}
 	}
 	return started, errors.Join(startErrors...)
 }
 
-func (r *Runner) startDefinition(definition processapi.Definition, handler processapi.Handler) error {
+func (r *Runner) startDefinition(definition processapi.Definition, devices map[string]struct{}, handler processapi.Handler) error {
 	definition.Name = strings.TrimSpace(definition.Name)
 	if definition.Name == "" {
 		return fmt.Errorf("name is required")
 	}
-	if len(definition.Subscribe) == 0 {
-		return fmt.Errorf("at least one subscribe message type is required")
-	}
 	if definition.MaxHop <= 0 {
-		definition.MaxHop = 4
+		definition.MaxHop = processapi.DefaultMaxHop
+	}
+	if definition.MaxHop > processapi.MaximumMaxHop {
+		return fmt.Errorf("maxHop %d exceeds SDK maximum %d", definition.MaxHop, processapi.MaximumMaxHop)
 	}
 	if definition.Concurrency <= 0 {
-		definition.Concurrency = 1
+		definition.Concurrency = processapi.DefaultConcurrency
 	}
-	timeout := 30 * time.Second
+	timeout := processapi.DefaultTimeout
 	if strings.TrimSpace(definition.Timeout) != "" {
 		parsed, err := time.ParseDuration(definition.Timeout)
 		if err != nil || parsed <= 0 {
@@ -113,44 +123,22 @@ func (r *Runner) startDefinition(definition processapi.Definition, handler proce
 		}
 		timeout = parsed
 	}
-	allowedPublish, err := parseAllowedTypes(definition.Publish)
-	if err != nil {
-		return err
-	}
-	for _, rawType := range definition.Subscribe {
-		messageType, err := busapi.ParseMessageType(rawType)
-		if err != nil {
-			return fmt.Errorf("invalid subscribe type %q: %w", rawType, err)
-		}
-		filter, err := busapi.FilterSubjectFor(messageType)
-		if err != nil {
-			return err
-		}
-		durable := "process-" + definition.Name + "-" + strings.ReplaceAll(string(messageType), ".", "-")
-		definitionCopy := definition
-		if err := r.bus.StartConsumer(runtimebus.ConsumerConfig{
-			Durable:       durable,
-			FilterSubject: filter,
-			Workers:       definition.Concurrency,
-			AckWait:       timeout + 5*time.Second,
-			MaxDeliver:    10,
-		}, func(parent context.Context, message busapi.Message) error {
-			return r.handle(parent, definitionCopy, handler, allowedPublish, timeout, message)
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
+
+	definitionCopy := definition
+	return r.bus.StartConsumer(runtimebus.ConsumerConfig{
+		Durable:       "process-" + definition.Name,
+		FilterSubject: busapi.StreamSubject,
+		Workers:       definition.Concurrency,
+		AckWait:       timeout + 5*time.Second,
+		MaxDeliver:    10,
+	}, func(parent context.Context, message busapi.Message) error {
+		return r.handle(parent, definitionCopy, devices, handler, timeout, message)
+	})
 }
 
-func (r *Runner) handle(parent context.Context, definition processapi.Definition, handler processapi.Handler, allowedPublish map[busapi.MessageType]struct{}, timeout time.Duration, message busapi.Message) (err error) {
-	if message.Origin == busapi.OriginProcess {
-		if strings.EqualFold(strings.TrimSpace(message.ProcessName), definition.Name) {
-			return nil
-		}
-		if !definition.AcceptProcessMessages {
-			return nil
-		}
+func (r *Runner) handle(parent context.Context, definition processapi.Definition, devices map[string]struct{}, handler processapi.Handler, timeout time.Duration, message busapi.Message) (err error) {
+	if message.Origin == busapi.OriginProcess && strings.EqualFold(strings.TrimSpace(message.ProcessName), definition.Name) {
+		return nil
 	}
 	if message.Hop >= definition.MaxHop {
 		if r.logger != nil {
@@ -158,12 +146,12 @@ func (r *Runner) handle(parent context.Context, definition processapi.Definition
 		}
 		return nil
 	}
-	if message.Type == busapi.TelemetryReport && !supportsFormat(definition.DataFormats, message.DataFormat) {
-		if r.logger != nil {
-			r.logger.Warnf("Process %s skipped telemetry format %q", definition.Name, message.DataFormat)
-		}
+	deviceCode := messageDeviceCode(message)
+	if _, ok := devices[deviceCode]; !ok {
 		return nil
 	}
+	message.DeviceCode = deviceCode
+
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	defer func() {
@@ -176,8 +164,8 @@ func (r *Runner) handle(parent context.Context, definition processapi.Definition
 		return err
 	}
 	for _, output := range outputs {
-		if _, ok := allowedPublish[output.Type]; !ok {
-			return fmt.Errorf("process %s attempted undeclared publish type %q", definition.Name, output.Type)
+		if _, err := busapi.SubjectFor(output.Type, output.Identifier); err != nil {
+			return fmt.Errorf("process %s attempted invalid publish type: %w", definition.Name, err)
 		}
 		output.Origin = busapi.OriginProcess
 		output.ProcessName = definition.Name
@@ -194,6 +182,9 @@ func (r *Runner) handle(parent context.Context, definition processapi.Definition
 		if output.DeviceCode == "" {
 			output.DeviceCode = message.DeviceCode
 		}
+		if _, ok := devices[strings.TrimSpace(output.DeviceCode)]; !ok {
+			return fmt.Errorf("process %s attempted output for unbound device %q", definition.Name, output.DeviceCode)
+		}
 		if output.DataFormat == "" {
 			output.DataFormat = message.DataFormat
 		}
@@ -202,6 +193,50 @@ func (r *Runner) handle(parent context.Context, definition processapi.Definition
 		}
 	}
 	return nil
+}
+
+func buildBindings(devices []contracts.DeviceConfig) map[string]map[string]struct{} {
+	bindings := make(map[string]map[string]struct{})
+	for _, device := range devices {
+		deviceCode := strings.TrimSpace(device.InternalName)
+		if deviceCode == "" {
+			deviceCode = strings.TrimSpace(device.Name)
+		}
+		if deviceCode == "" {
+			continue
+		}
+		for _, rawName := range device.ProcessNames {
+			name := strings.TrimSpace(rawName)
+			if name == "" {
+				continue
+			}
+			if bindings[name] == nil {
+				bindings[name] = make(map[string]struct{})
+			}
+			bindings[name][deviceCode] = struct{}{}
+		}
+	}
+	return bindings
+}
+
+func messageDeviceCode(message busapi.Message) string {
+	if deviceCode := strings.TrimSpace(message.DeviceCode); deviceCode != "" {
+		return deviceCode
+	}
+	var envelope struct {
+		DeviceCode    string `json:"device_code"`
+		DeviceCodeAlt string `json:"deviceCode"`
+		DeviceName    string `json:"deviceName"`
+	}
+	if json.Unmarshal(message.Data, &envelope) != nil {
+		return ""
+	}
+	for _, value := range []string{envelope.DeviceCode, envelope.DeviceCodeAlt, envelope.DeviceName} {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func loadDefinitions(dir string) (map[string]processapi.Definition, error) {
@@ -240,28 +275,4 @@ func loadDefinitions(dir string) (map[string]processapi.Definition, error) {
 		definitions[definition.Name] = definition
 	}
 	return definitions, nil
-}
-
-func parseAllowedTypes(values []string) (map[busapi.MessageType]struct{}, error) {
-	result := make(map[busapi.MessageType]struct{}, len(values))
-	for _, value := range values {
-		messageType, err := busapi.ParseMessageType(value)
-		if err != nil {
-			return nil, fmt.Errorf("invalid publish type %q: %w", value, err)
-		}
-		result[messageType] = struct{}{}
-	}
-	return result, nil
-}
-
-func supportsFormat(supported []string, actual string) bool {
-	if len(supported) == 0 || strings.TrimSpace(actual) == "" {
-		return true
-	}
-	for _, candidate := range supported {
-		if strings.EqualFold(strings.TrimSpace(candidate), strings.TrimSpace(actual)) {
-			return true
-		}
-	}
-	return false
 }

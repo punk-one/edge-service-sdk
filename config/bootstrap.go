@@ -36,26 +36,18 @@ type Config struct {
 	StatusReport    mqtt.TopicConfig         `yaml:"statusReport"`
 	EventReport     mqtt.TopicConfig         `yaml:"eventReport"`
 	ControlStore    ControlStoreConfig       `yaml:"controlStore"`
-	Bus             BusConfig                `yaml:"bus"`
-	Process         ProcessConfig            `yaml:"process"`
+	NATSBus         NATSBusConfig            `yaml:"natsBus"`
 	Devices         []contracts.DeviceConfig `yaml:"deviceList"`
 	LogLevel        string                   `yaml:"logLevel"`
 }
 
-// BusConfig controls the optional embedded JetStream server. Subjects and the
+// NATSBusConfig controls the optional embedded JetStream server. Subjects and the
 // listen port are SDK conventions and are intentionally not configurable.
-type BusConfig struct {
+type NATSBusConfig struct {
 	Enabled  bool   `yaml:"enabled"`
 	StoreDir string `yaml:"storeDir"`
 	MaxAge   string `yaml:"maxAge"`
 	MaxBytes int64  `yaml:"maxBytes"`
-}
-
-// ProcessConfig selects application processors. An empty list disables all
-// processors even when the bus itself is enabled.
-type ProcessConfig struct {
-	ConfigDir string   `yaml:"configDir"`
-	Enabled   []string `yaml:"enabled"`
 }
 
 // StorageConfig represents shared runtime storage.
@@ -89,6 +81,7 @@ type ServiceConfig struct {
 type DeviceConfig struct {
 	ProfilesDir string `yaml:"profilesDir"`
 	DevicesDir  string `yaml:"devicesDir"`
+	ProcessDir  string `yaml:"processDir"`
 	EventDir    string `yaml:"eventDir"`
 }
 
@@ -147,6 +140,7 @@ func loadMainConfig(configPath string) (Config, error) {
 		Device: DeviceConfig{
 			ProfilesDir: "./configs/profiles",
 			DevicesDir:  "./configs/devices",
+			ProcessDir:  "./configs/process",
 			// EventDir intentionally remains empty by default. This preserves
 			// compatibility: old services do not initialize EVENT rules until
 			// they explicitly opt in.
@@ -400,11 +394,14 @@ func mergeDeviceWithProfile(device contracts.DeviceConfig, profile contracts.Dev
 }
 
 func NormalizeConfig(config Config) Config {
+	if strings.TrimSpace(config.Device.ProcessDir) == "" {
+		config.Device.ProcessDir = "./configs/process"
+	}
 	config.Device.ProfilesDir = filepath.FromSlash(config.Device.ProfilesDir)
 	config.Device.DevicesDir = filepath.FromSlash(config.Device.DevicesDir)
+	config.Device.ProcessDir = filepath.FromSlash(config.Device.ProcessDir)
 	config.Device.EventDir = filepath.FromSlash(config.Device.EventDir)
-	config.Bus.StoreDir = filepath.FromSlash(config.Bus.StoreDir)
-	config.Process.ConfigDir = filepath.FromSlash(config.Process.ConfigDir)
+	config.NATSBus.StoreDir = filepath.FromSlash(config.NATSBus.StoreDir)
 	config.Logging = EffectiveLoggerConfig(config)
 	if config.TelemetryReport.DataFormat == "" {
 		config.TelemetryReport.DataFormat = "rule"
@@ -443,6 +440,7 @@ func NormalizeDeviceConfig(device contracts.DeviceConfig) contracts.DeviceConfig
 	device.Name = strings.TrimSpace(device.Name)
 	device.SubName = strings.TrimSpace(device.SubName)
 	device.EventProfile = strings.TrimSpace(device.EventProfile)
+	device.ProcessNames = normalizedUniqueStrings(device.ProcessNames)
 	if device.SubName != "" {
 		device.InternalName = device.Name + "-" + device.SubName
 	} else {
@@ -476,6 +474,23 @@ func NormalizeDeviceConfig(device contracts.DeviceConfig) contracts.DeviceConfig
 		}
 	}
 	return device
+}
+
+func normalizedUniqueStrings(values []string) []string {
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, duplicate := seen[value]; duplicate {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
 }
 
 func normalizeDeviceConfig(device contracts.DeviceConfig) contracts.DeviceConfig {

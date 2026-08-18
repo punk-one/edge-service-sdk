@@ -47,6 +47,7 @@ type DeviceConfig struct {
 	ProductCode        string                 `yaml:"productCode"`
 	Description        string                 `yaml:"description"`
 	Labels             []string               `yaml:"labels"`
+	ProcessNames       []string               `yaml:"processNames"`
 	Protocols          map[string]interface{} `yaml:"protocols"`
 	ConnectionStrategy string                 `yaml:"connectionStrategy"`
 	Telemetry          TelemetryConfig        `yaml:"telemetry"`

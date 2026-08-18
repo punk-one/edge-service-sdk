@@ -7,8 +7,16 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/punk-one/edge-service-sdk/bus"
+)
+
+const (
+	DefaultConcurrency = 1
+	DefaultTimeout     = 30 * time.Second
+	DefaultMaxHop      = 4
+	MaximumMaxHop      = 16
 )
 
 // Handler implements one application-owned processor.
@@ -84,15 +92,12 @@ func (r *registry) Names() []string {
 	return names
 }
 
-// Definition is loaded from configs/processes/*.yaml.
+// Definition is loaded from configs/process/*.yaml. Every enabled Process
+// receives all fixed SDK message types. Runtime controls are optional.
 type Definition struct {
-	Name                  string   `yaml:"name"`
-	Handler               string   `yaml:"handler"`
-	Subscribe             []string `yaml:"subscribe"`
-	Publish               []string `yaml:"publish"`
-	DataFormats           []string `yaml:"dataFormats"`
-	Concurrency           int      `yaml:"concurrency"`
-	Timeout               string   `yaml:"timeout"`
-	AcceptProcessMessages bool     `yaml:"acceptProcessMessages"`
-	MaxHop                int      `yaml:"maxHop"`
+	Name        string `yaml:"name"`
+	Handler     string `yaml:"handler"`
+	Concurrency int    `yaml:"concurrency"`
+	Timeout     string `yaml:"timeout"`
+	MaxHop      int    `yaml:"maxHop"`
 }

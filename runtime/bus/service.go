@@ -46,13 +46,13 @@ type Service struct {
 	closeOnce sync.Once
 }
 
-func Start(serviceName string, config appconfig.BusConfig, logClient logger.LoggingClient) (*Service, error) {
+func Start(serviceName string, config appconfig.NATSBusConfig, logClient logger.LoggingClient) (*Service, error) {
 	if !config.Enabled {
 		return nil, nil
 	}
 	storeDir := strings.TrimSpace(config.StoreDir)
 	if storeDir == "" {
-		storeDir = filepath.Join("data", "nats", sanitizeToken(serviceName))
+		storeDir = filepath.Join("data", "natsbus")
 	}
 	if err := os.MkdirAll(storeDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create JetStream store directory: %w", err)

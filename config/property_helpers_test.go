@@ -90,6 +90,38 @@ func TestBuildPropertyWriteRequestsSupportsPointArrayAndStruct(t *testing.T) {
 	if !foundStruct {
 		t.Fatal("expected struct write requests for wheels[2]")
 	}
+
+	for index, req := range reqs {
+		if req.DeviceResourceName != "status_text" {
+			continue
+		}
+		if got, ok := params[index].Value.(string); !ok || got != contracts.NormalizeStringForWrite("READY", 20) {
+			t.Fatalf("status_text write value = %#v, want fixed 20-byte value", params[index].Value)
+		}
+		return
+	}
+	t.Fatal("status_text write request not found")
+}
+
+func TestBuildPropertyWriteRequestsTruncatesStringOverMaxLength(t *testing.T) {
+	device := contracts.DeviceConfig{
+		Name: "fixed-string-device",
+		Property: contracts.PropertyConfig{Points: []contracts.PointConfig{{
+			Name:      "model",
+			ValueType: "String",
+			NodeName:  "D6100",
+			MaxLength: 6,
+			ReadWrite: "RW",
+		}}},
+	}
+
+	_, params, err := BuildPropertyWriteRequests(device, map[string]interface{}{"model": "ABCDEFG"})
+	if err != nil {
+		t.Fatalf("BuildPropertyWriteRequests() error = %v", err)
+	}
+	if got := params[0].Value; got != "ABCDEF" {
+		t.Fatalf("truncated model value = %#v, want %q", got, "ABCDEF")
+	}
 }
 
 func TestBuildPropertyReadRequestsBuildsNestedBindings(t *testing.T) {
@@ -621,8 +653,8 @@ func TestBuildPropertyWriteRequestsArrayKind(t *testing.T) {
 	if len(reqs) != 1 || len(params) != 1 {
 		t.Fatalf("expected 1 request and param, got %d and %d", len(reqs), len(params))
 	}
-	if params[0].Value != "轮型2" {
-		t.Fatalf("expected param value '轮型2', got %v", params[0].Value)
+	if params[0].Value != contracts.NormalizeStringForWrite("轮型2", 18) {
+		t.Fatalf("expected fixed-width param value, got %v", params[0].Value)
 	}
 
 	// Test Int16 array write
@@ -790,11 +822,11 @@ func TestBuildPropertyWriteRequestsArrayKindBackwardCompat(t *testing.T) {
 	if len(reqs) != 2 || len(params) != 2 {
 		t.Fatalf("expected 2 requests and params, got %d and %d", len(reqs), len(params))
 	}
-	if params[0].Value != "轮型1" {
-		t.Fatalf("expected '轮型1', got %v", params[0].Value)
+	if params[0].Value != contracts.NormalizeStringForWrite("轮型1", 18) {
+		t.Fatalf("expected fixed-width value for Name[1], got %v", params[0].Value)
 	}
-	if params[1].Value != "轮型2" {
-		t.Fatalf("expected '轮型2', got %v", params[1].Value)
+	if params[1].Value != contracts.NormalizeStringForWrite("轮型2", 18) {
+		t.Fatalf("expected fixed-width value for Name[2], got %v", params[1].Value)
 	}
 }
 

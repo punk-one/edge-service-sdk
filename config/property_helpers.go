@@ -476,6 +476,7 @@ func resolvePropertyPointWrite(device contracts.DeviceConfig, key string, raw in
 		if err != nil {
 			return contracts.CommandRequest{}, nil, false, err
 		}
+		normalizePropertyWriteValue(req, value)
 		return req, value, true, nil
 	}
 	return contracts.CommandRequest{}, nil, false, nil
@@ -999,6 +1000,7 @@ func buildStructFieldWriteWithOffset(structDef contracts.PropertyStruct, field c
 	if err != nil {
 		return contracts.CommandRequest{}, nil, err
 	}
+	normalizePropertyWriteValue(req, value)
 	return req, value, nil
 }
 
@@ -1139,6 +1141,25 @@ func findStructFieldByList(fields []contracts.PropertyStructField, name string) 
 		}
 	}
 	return contracts.PropertyStructField{}, false
+}
+
+// normalizePropertyWriteValue applies the SDK's fixed-width String property
+// contract before a value is handed to a protocol driver. The driver still
+// owns the protocol-specific encoding (S7 headers, MC word alignment, etc.),
+// while the shared property path guarantees that a configured String value
+// cannot exceed its configured storage width.
+func normalizePropertyWriteValue(req contracts.CommandRequest, value *contracts.CommandValue) {
+	if value == nil || contracts.NormalizedValueType(req.Type) != contracts.ValueTypeString {
+		return
+	}
+	if req.Properties.MaxLength <= 0 || strings.EqualFold(strings.TrimSpace(req.Properties.ReadWrite), "R") {
+		return
+	}
+	raw, ok := value.Value.(string)
+	if !ok {
+		return
+	}
+	value.Value = contracts.NormalizeStringForWrite(raw, req.Properties.MaxLength)
 }
 
 func commandValueFromRaw(name string, valueType string, raw interface{}) (*contracts.CommandValue, error) {

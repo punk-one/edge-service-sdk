@@ -11,12 +11,12 @@ import (
 )
 
 func TestEmbeddedServersUseDifferentRandomPorts(t *testing.T) {
-	first, err := Start("test-one", appconfig.BusConfig{Enabled: true, StoreDir: t.TempDir()}, nil)
+	first, err := Start("test-one", appconfig.NATSBusConfig{Enabled: true, StoreDir: t.TempDir()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer first.Close()
-	second, err := Start("test-two", appconfig.BusConfig{Enabled: true, StoreDir: t.TempDir()}, nil)
+	second, err := Start("test-two", appconfig.NATSBusConfig{Enabled: true, StoreDir: t.TempDir()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,7 +29,7 @@ func TestEmbeddedServersUseDifferentRandomPorts(t *testing.T) {
 }
 
 func TestPublishAndConsumePreservesPayloadAndMetadata(t *testing.T) {
-	service, err := Start("test-bus", appconfig.BusConfig{Enabled: true, StoreDir: t.TempDir()}, nil)
+	service, err := Start("test-bus", appconfig.NATSBusConfig{Enabled: true, StoreDir: t.TempDir()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

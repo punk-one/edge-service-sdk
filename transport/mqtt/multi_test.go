@@ -44,7 +44,7 @@ func TestMergeBrokerConfig_IntFields(t *testing.T) {
 		HealthCheckIntervalSec: 30,
 	}
 	override := MQTTConfig{
-		KeepAliveSec:  120,
+		KeepAliveSec:   120,
 		PingTimeoutSec: 0,
 	}
 

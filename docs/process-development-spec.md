@@ -2,7 +2,7 @@
 
 ## 1. Scope
 
-An SDK Process is application-owned Go code that observes fixed JetStream
+An SDK Process is application-owned Go code that observes the fixed JetStream
 routes and may publish new messages to those routes. It runs in the same binary
 as the edge service. It is not a sidecar, a Go plugin, or a replacement for the
 existing collection, MQTT, SQLite, property, or command paths.
@@ -19,7 +19,7 @@ edge-service-*/
 │   ├── config.yaml
 │   ├── devices/
 │   ├── profiles/
-│   └── processes/
+│   └── process/
 │       ├── telemetry-alarm.yaml
 │       └── external-query.yaml
 └── internal/
@@ -29,64 +29,83 @@ edge-service-*/
         └── external_query.go
 ```
 
-`process.configDir` is optional. When `process.enabled` is non-empty, its
-default is `./configs/processes`. When the entire `process` section or the
-enabled list is absent, the SDK does not scan the directory.
+`device.processDir` defaults to `./configs/process`. Go handlers are compiled
+into the application and require a rebuild. YAML is loaded at startup; hot
+reload and runtime Go-code loading are out of scope.
 
-Go handlers are compiled into the application and require a rebuild. YAML is
-loaded at startup; hot reload and runtime Go-code loading are out of scope.
+## 3. Enabling the runtime and binding devices
 
-## 3. Configuration
-
-Main configuration selects enabled Process names:
+The embedded bus is enabled in `configs/config.yaml`:
 
 ```yaml
-bus:
+natsBus:
   enabled: true
-  # Optional. Defaults to ./data/nats/{serviceName}.
-  storeDir: "./data/nats/device-s7"
-  maxAge: "72h"
-  maxBytes: 1073741824
 
-process:
-  configDir: "./configs/processes"
-  enabled:
-    - telemetry-alarm
-    - external-query
+device:
+  profilesDir: "./configs/profiles"
+  devicesDir: "./configs/devices"
+  processDir: "./configs/process"
 ```
 
-The enabled list is authoritative. A YAML file or registered handler that is
-not named in the list is not started. An enabled name with a missing YAML file
-or handler is reported and skipped without stopping other Processes.
+`storeDir`, `maxAge`, and `maxBytes` are optional. Their defaults are
+`./data/natsbus`, `72h`, and 1 GiB.
 
-One Process definition:
+A Process is enabled by binding its name to one or more devices:
 
 ```yaml
-name: telemetry-alarm
-handler: telemetry-alarm
+deviceList:
+  - name: device-01
+    profileName: profile-01
+    productCode: product-01
+    processNames:
+      - external-query
+```
 
-subscribe:
-  - telemetry.report
-  - property.result
-  - command.result
+The SDK starts each distinct referenced Process once. Before invoking it, the
+runtime requires the message device code to match one of its bound devices.
+Messages without a resolvable device code are skipped by device-bound
+Processes.
 
-publish:
-  - property.set
-  - command.call
+## 4. Process YAML
 
-dataFormats:
-  - compact
+Only `name` is required:
 
+```yaml
+name: external-query
+
+externalQuery:
+  baseURL: "https://example.invalid"
+  timeoutMs: 2000
+```
+
+`handler` defaults to `name`. Runtime controls are optional:
+
+```yaml
+name: external-query
+handler: external-query
 concurrency: 1
-timeout: 10s
-acceptProcessMessages: false
+timeout: 30s
 maxHop: 4
 ```
 
-YAML uses logical message types, never raw NATS subjects. The fixed mapping is
-defined in the SDK README and `bus` package.
+| Field | Default | Purpose |
+| --- | --- | --- |
+| `concurrency` | `1` | Concurrent handler calls. Keep 1 for ordered or stateful processing. |
+| `timeout` | `30s` | Maximum duration of one `Handle` call before redelivery. |
+| `maxHop` | `4` | Maximum Process-chain depth. Values above the SDK maximum of 16 are rejected. |
 
-## 4. Handler and registry
+Business-specific keys may coexist in the same YAML. The SDK reads the common
+definition fields; the application handler may load its own section. A Process
+does not receive a Profile object and must not use Process YAML to duplicate
+PLC node addresses, Profile point names, polling intervals, or point lengths.
+Those are SDK collection/control concerns. If a Process needs a business field,
+it owns that field name in code and reads it from the MQTT-compatible payload.
+
+There are no `subscribe`, `publish`, `dataFormats`, or
+`acceptProcessMessages` fields. Every enabled Process consumes `edge.v1.>` and
+may output any fixed SDK `bus.MessageType`.
+
+## 5. Handler and registry
 
 ```go
 type Handler interface {
@@ -98,7 +117,7 @@ Handlers register under the name referenced by YAML:
 
 ```go
 registry := process.NewRegistry()
-registry.MustRegister("telemetry-alarm", telemetryAlarm{})
+registry.MustRegister("external-query", externalQuery{})
 ```
 
 An application with Processes starts through `app.BootstrapWithOptions`:
@@ -113,16 +132,31 @@ app.BootstrapWithOptions(serviceName, version, driver, app.BootstrapOptions{
 The original `app.Bootstrap` remains supported and starts with no Process
 registry.
 
-## 5. Message contract
+## 6. Input and output contract
 
-`bus.Message.Data` is the MQTT payload for the same logical route. Telemetry
-uses the active MQTT data format (`compact`, `rule`, `raw`, `telemetry`, or
-`influx`). A handler must use `Message.DataFormat` rather than assuming Rule
-JSON. Property and command request/result data retains the existing MQTT JSON
-contract.
+Every Process receives all fixed logical message types for its bound devices:
 
-Application handlers set output metadata explicitly when it cannot be inherited
-from the input:
+- `telemetry.report`
+- `property.report`
+- `property.result`
+- `command.result`
+- `property.set`
+- `property.get`
+- `command.call`
+- `event.report`
+- `status.report`
+
+Use `Message.Type` to dispatch inputs. `Message.Data` is the MQTT payload for
+the same logical route. Telemetry uses the effective MQTT data format and
+`Message.DataFormat` reports the actual format. A handler must inspect that
+field instead of assuming Rule JSON. In multi-group MQTT mode, each emitted
+group payload is delivered independently; a Process can observe every emitted
+field over the message stream, but one payload is not required to contain the
+whole Profile.
+
+Property and command request/result data retains the existing MQTT JSON
+contract. Outputs set the logical type and any metadata that cannot be
+inherited:
 
 ```go
 return []bus.Message{{
@@ -136,9 +170,10 @@ return []bus.Message{{
 ```
 
 For `command.call`, `Identifier` is required. The SDK maps it to
-`edge.v1.command.call.{identifier}`.
+`edge.v1.command.call.{identifier}`. Outputs targeting a device not bound to
+the current Process are rejected.
 
-## 6. Origins and loop prevention
+## 7. Origins and loop prevention
 
 The runtime owns the following headers:
 
@@ -154,48 +189,40 @@ The runtime owns the following headers:
 
 Rules:
 
-1. SDK-originated outbound messages are already sent to MQTT; the JetStream
-   MQTT egress acknowledges them without sending them again.
-2. MQTT-originated control requests are already executed; the JetStream control
-   ingress acknowledges them without executing them again.
-3. Process- and NATS-originated outbound messages use direct MQTT publication,
-   which bypasses the mirror hook.
-4. Process- and NATS-originated property/command requests reuse the existing
+1. A Process always ignores every message it produced itself, including its
+   own property and command requests.
+2. Messages produced by another Process are accepted, enabling Process chains.
+3. Every Process output increments `Edge-Hop`; messages at `maxHop` are
+   acknowledged and skipped.
+4. SDK-originated outbound messages are already sent to MQTT, so MQTT egress
+   acknowledges them without sending them again.
+5. MQTT-originated control requests are already executed, so control ingress
+   acknowledges them without executing them again.
+6. Process- and NATS-originated property/command requests reuse the existing
    property and command services.
-5. A Process always ignores its own messages.
-6. Other Process-originated messages are ignored unless
-   `acceptProcessMessages` is true.
-7. Messages at `maxHop` are acknowledged and skipped.
 
-## 7. Delivery and error behavior
+## 8. Delivery and error behavior
 
-- Each Process/message-type pair has an independent durable pull consumer.
-- A handler input is acknowledged after every declared output receives a
-  JetStream publish acknowledgement.
+- Each Process has one independent durable `edge.v1.>` pull consumer.
+- A handler input is acknowledged after every output receives a JetStream
+  publish acknowledgement.
 - Handler errors and timeouts cause delayed redelivery.
-- Undeclared output types are rejected.
+- Invalid output message types and unbound target devices are rejected.
 - Panics are recovered and treated as handler errors.
-- Property and command requests require stable `trace_id` values and rely on
-  the existing control store for idempotency.
+- Property and command requests require stable trace IDs and rely on the
+  existing control store for idempotency.
 - JetStream delivery is at least once; handlers must tolerate duplicate input.
-
-## 8. MQTT format and multi-group behavior
-
-For a single MQTT publisher, the JetStream mirror is byte-for-byte the actual
-MQTT payload. In multi-group mode the first configured group is the stable
-mirrored representation, so one logical telemetry message is not duplicated on
-the bus. Process-generated telemetry should only be enabled when all target
-groups accept its declared format.
 
 ## 9. Required tests for an application Process
 
 Each Process must cover:
 
-- all declared input data formats;
-- invalid and incomplete payloads;
-- duplicate `trace_id` handling for side effects;
-- context timeout/cancellation;
+- every relevant `Message.Type` and telemetry `Message.DataFormat`;
+- invalid, stale, and incomplete payloads;
+- messages belonging to unbound devices;
+- duplicate trace IDs for side effects;
+- context timeout and cancellation;
 - self-origin and max-hop behavior;
-- every declared output type;
-- HTTP failure/timeout behavior when external data is used;
+- every emitted output type;
+- HTTP failure and timeout behavior when external data is used;
 - property/command payload compatibility with the current MQTT contract.

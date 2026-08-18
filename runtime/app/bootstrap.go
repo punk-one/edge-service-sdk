@@ -330,13 +330,14 @@ func BootstrapWithOptions(serviceName, version string, driver contracts.Protocol
 		return
 	}
 
-	busService, busErr := runtimebus.Start(serviceName, config.Bus, logClient)
+	busService, busErr := runtimebus.Start(serviceName, config.NATSBus, logClient)
 	if busErr != nil {
 		// The bus is an optional side path. A failure must never prevent the
 		// deployed MQTT/SQLite/device path from starting.
 		logClient.Errorf("Optional JetStream bus is degraded and will be disabled: %v", busErr)
 		busService = nil
 	}
+	configuredProcessCount := runtimeprocess.ConfiguredProcessCount(config.Devices)
 	if busService != nil {
 		defer busService.Close()
 	}
@@ -459,15 +460,15 @@ func BootstrapWithOptions(serviceName, version string, driver contracts.Protocol
 		if err := installJetStreamRoutes(busService, sdk, publisher, config, propertyService, commandService, logClient); err != nil {
 			logClient.Errorf("Some optional JetStream routes were not installed: %v", err)
 		}
-		processRunner := runtimeprocess.NewRunner(config.Process, options.ProcessRegistry, busService, logClient)
+		processRunner := runtimeprocess.NewRunner(config.Device.ProcessDir, config.Devices, options.ProcessRegistry, busService, logClient)
 		started, err := processRunner.Start()
 		if err != nil {
 			logClient.Errorf("Some optional processes were not started: %v", err)
 		}
-		if len(config.Process.Enabled) > 0 {
-			logClient.Infof("Process runtime initialized: enabled=%d started=%d", len(config.Process.Enabled), started)
+		if configuredProcessCount > 0 {
+			logClient.Infof("Process runtime initialized: configured=%d started=%d", configuredProcessCount, started)
 		}
-	} else if len(config.Process.Enabled) > 0 {
+	} else if configuredProcessCount > 0 {
 		logClient.Warnf("Processes are configured but disabled because the optional JetStream bus is unavailable")
 	}
 

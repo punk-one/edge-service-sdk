@@ -281,6 +281,7 @@ func newControlFlowAuth(t *testing.T) (rtcontrol.Store, *rtauth.Service, string,
 	if err != nil {
 		t.Fatalf("NewSQLiteStore() error = %v", err)
 	}
+	t.Cleanup(func() { _ = store.Close() })
 	authService, err := rtauth.NewService(rtauth.Config{
 		SQLitePath:     pathpkg.Join(root, "runtime.db"),
 		KeyFile:        pathpkg.Join(root, "auth.key"),

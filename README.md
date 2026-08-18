@@ -19,7 +19,7 @@ It extracts the common runtime, control, and transport capabilities out of proto
 - control job persistence, result history, diagnostics, export, and MQTT query handling
 - dependency checks, worker supervision, and shared logging contracts
 
-## What's New In v0.8.8
+## What's New In v0.9.1
 
 - **Multi-MQTT broker support** — group-based architecture: top-level parallel groups, each group with its own failover broker chain. Per-group `dataFormat` overrides, per-group `heartbeatInterval`, and per-broker `clientId`/`username`/`password`. `NewPublisher()` factory auto-detects groups vs single-broker mode.
 - **Per-group device status** — `deviceStatusPublisher` creates independent heartbeat goroutines per MQTT group via `StartHeartbeatOnly()`.
@@ -115,7 +115,7 @@ The bootstrap flow loads config, initializes auth/MQTT/reliable queue/control st
 
 The MQTT, SQLite, collection, property, and command paths remain authoritative.
 The embedded JetStream bus is disabled by default and mirrors MQTT traffic only
-when `bus.enabled` is true. A bus startup or publish failure is reported as a
+when `natsBus.enabled` is true. A bus startup or publish failure is reported as a
 degraded optional dependency and does not stop the existing service path.
 
 The embedded server binds `127.0.0.1` on a random operating-system-selected
@@ -145,17 +145,35 @@ not forced to `rule`. The SDK adds routing metadata only as NATS headers:
 Minimal optional configuration:
 
 ```yaml
-bus:
+natsBus:
   enabled: true
 
-process:
-  # Defaults to ./configs/processes when enabled is non-empty.
-  configDir: "./configs/processes"
-  enabled:
-    - telemetry-alarm
+device:
+  profilesDir: "./configs/profiles"
+  devicesDir: "./configs/devices"
+  # Optional; defaults to ./configs/process.
+  processDir: "./configs/process"
 ```
 
-Omitting either section preserves the previous behavior. See
+The default JetStream store is `./data/natsbus`. `maxAge`
+defaults to `72h` and `maxBytes` defaults to 1 GiB. The optional values can be
+overridden under `natsBus`.
+
+Processes are enabled per device in `configs/devices/*.yaml`:
+
+```yaml
+deviceList:
+  - name: device-01
+    profileName: profile-01
+    productCode: product-01
+    processNames:
+      - telemetry-alarm
+      - external-query
+```
+
+Each distinct referenced Process is started once and receives all fixed SDK
+message types for only its bound devices. Omitting `natsBus` preserves the
+previous runtime behavior; omitting `processNames` starts no Processes. See
 [`docs/process-development-spec.md`](docs/process-development-spec.md) for the
 application process API and lifecycle contract.
 
@@ -247,4 +265,4 @@ MQTT runtime capabilities include telemetry/property/status publishing, property
 
 ## Version
 
-This repository is being published as `v0.8.8`.
+This repository is being published as `v0.9.1`.

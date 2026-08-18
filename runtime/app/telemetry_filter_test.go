@@ -213,9 +213,9 @@ func TestEffectiveGroupConfigFallback(t *testing.T) {
 	}
 
 	group := contracts.TelemetryGroup{
-		Name:      "fast",
-		Interval:  "100ms",
-		Points:    []contracts.PointConfig{{Name: "vibration"}},
+		Name:     "fast",
+		Interval: "100ms",
+		Points:   []contracts.PointConfig{{Name: "vibration"}},
 	}
 
 	cfg := effectiveGroupConfig(device, group)

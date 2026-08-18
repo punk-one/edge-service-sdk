@@ -11,7 +11,7 @@ import (
 )
 
 func TestMQTTObserverPreservesPayloadAndDirection(t *testing.T) {
-	service, err := Start("observer-test", appconfig.BusConfig{Enabled: true, StoreDir: t.TempDir()}, nil)
+	service, err := Start("observer-test", appconfig.NATSBusConfig{Enabled: true, StoreDir: t.TempDir()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

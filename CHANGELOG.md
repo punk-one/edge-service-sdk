@@ -1,7 +1,17 @@
 # Changelog
 
-## Unreleased
+## v0.9.1
 
+- Added fixed-width `String` property write normalization: short values are
+  zero-padded and values over `maxLength` are truncated by byte length.
+- Renamed the unreleased optional JetStream configuration from `bus` to
+  `natsBus`; its store now defaults to `./data/natsbus`.
+- Replaced the top-level Process enable list with `device.processDir` and
+  per-device `processNames` bindings.
+- Simplified Process YAML so subject lists and telemetry format allowlists are
+  unnecessary. Each Process now consumes all fixed SDK subjects for its bound
+  devices, always skips its own outputs, accepts other Process outputs, and
+  retains timeout, concurrency, and hop-limit safeguards.
 - Added the protocol-independent `event` engine with validated EVENT YAML profiles, direct telemetry/property references, standard connect events, exclusive OEE states, aggregate alarm/fault events, pulse/rise-clear actions, hold/recover debounce, and summary windows.
 - Added `device.eventDir`, `device.eventProfile`, and the optional global `eventReport` MQTT topic while preserving old configurations that omit them.
 - Added an independent SQLite-backed event outbox with replay metadata, event-time preservation, state-file recovery, and safe shutdown draining.
