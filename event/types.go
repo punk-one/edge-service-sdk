@@ -48,13 +48,13 @@ type Event struct {
 }
 
 // EventData contains the event-specific data required by the event contract.
-// EventType is the lifecycle action (raise, clear, or pulse); the rule
-// definition type remains in Meta under rule_type.
+// Type is the lifecycle action (raise, clear, or pulse); the rule definition
+// type remains in Meta under rule_type.
 type EventData struct {
-	EventIdentifier string                 `json:"event_identifier"`
+	EventCode       string                 `json:"event_code"`
 	Category        string                 `json:"category"`
 	Level           interface{}            `json:"level,omitempty"`
-	EventType       string                 `json:"event_type"`
+	Type            string                 `json:"type"`
 	Phase           string                 `json:"phase"`
 	Status          string                 `json:"status"`
 	Message         string                 `json:"message,omitempty"`
@@ -89,11 +89,11 @@ func lifecycleStatus(eventType string) string {
 	return status
 }
 
-// NormalizeLifecycle fills the public lifecycle fields from EventType. The
+// NormalizeLifecycle fills the public lifecycle fields from Type. The
 // mapping is authoritative so callers cannot accidentally publish a
 // contradictory phase or status.
 func (d EventData) NormalizeLifecycle() EventData {
-	if phase, status, ok := EventLifecycle(d.EventType); ok {
+	if phase, status, ok := EventLifecycle(d.Type); ok {
 		d.Phase = phase
 		d.Status = status
 	}
@@ -120,8 +120,8 @@ func (e Event) PublicMap(replayed bool, sendAt int64) map[string]interface{} {
 
 // MarshalPublicJSON serializes the public event envelope.
 func (e Event) MarshalPublicJSON(replayed bool, sendAt int64) ([]byte, error) {
-	if _, _, ok := EventLifecycle(e.Data.EventType); !ok {
-		return nil, fmt.Errorf("unsupported event_type %q", e.Data.EventType)
+	if _, _, ok := EventLifecycle(e.Data.Type); !ok {
+		return nil, fmt.Errorf("unsupported event type %q", e.Data.Type)
 	}
 	return json.Marshal(e.PublicMap(replayed, sendAt))
 }

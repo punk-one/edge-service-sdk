@@ -110,8 +110,8 @@ func (d *EventDispatcher) Publish(event events.Event) error {
 	if closed {
 		return fmt.Errorf("event dispatcher is closed")
 	}
-	if _, _, ok := events.EventLifecycle(event.Data.EventType); !ok {
-		return fmt.Errorf("unsupported event_type %q", event.Data.EventType)
+	if _, _, ok := events.EventLifecycle(event.Data.Type); !ok {
+		return fmt.Errorf("unsupported event type %q", event.Data.Type)
 	}
 	event.Data = event.Data.NormalizeLifecycle()
 	if event.CreatedAt == 0 {
@@ -131,7 +131,7 @@ func (d *EventDispatcher) Publish(event events.Event) error {
 	}
 	if err := d.transport.PublishEvent(event, false); err != nil {
 		if d.logger != nil {
-			d.logger.Warnf("Realtime event publish failed, kept in outbox: device=%s category=%s event=%s instance=%s", event.DeviceCode, event.Data.Category, event.Data.EventIdentifier, event.Data.EventInstanceID)
+			d.logger.Warnf("Realtime event publish failed, kept in outbox: device=%s category=%s event=%s instance=%s", event.DeviceCode, event.Data.Category, event.Data.EventCode, event.Data.EventInstanceID)
 		}
 		return nil
 	}
@@ -139,7 +139,7 @@ func (d *EventDispatcher) Publish(event events.Event) error {
 		return fmt.Errorf("ack published event: %w", err)
 	}
 	if d.logger != nil {
-		d.logger.Debugf("Event published and acked from outbox: device=%s category=%s event=%s instance=%s", event.DeviceCode, event.Data.Category, event.Data.EventIdentifier, event.Data.EventInstanceID)
+		d.logger.Debugf("Event published and acked from outbox: device=%s category=%s event=%s instance=%s", event.DeviceCode, event.Data.Category, event.Data.EventCode, event.Data.EventInstanceID)
 	}
 	return nil
 }
@@ -225,7 +225,7 @@ func (d *EventDispatcher) replayOnce() {
 	for _, record := range records {
 		if err := d.transport.PublishEvent(record.Event, true); err != nil {
 			if d.logger != nil {
-				d.logger.Warnf("Event replay paused on publish failure: device=%s event=%s err=%v", record.Event.DeviceCode, record.Event.Data.EventIdentifier, err)
+				d.logger.Warnf("Event replay paused on publish failure: device=%s event=%s err=%v", record.Event.DeviceCode, record.Event.Data.EventCode, err)
 			}
 			break
 		}
@@ -302,7 +302,7 @@ CREATE TABLE IF NOT EXISTS event_outbox (
 	device_code TEXT NOT NULL,
 	product_code TEXT NOT NULL,
 	category TEXT NOT NULL,
-	event_identifier TEXT NOT NULL,
+	event_code TEXT NOT NULL,
 	event_instance_id TEXT NOT NULL,
 	event_time INTEGER NOT NULL,
 	created_at INTEGER NOT NULL,
@@ -335,7 +335,7 @@ func (s *eventSQLiteStore) append(item events.Event) (int64, error) {
 			_ = tx.Rollback()
 		}
 	}()
-	result, err := tx.Exec(`INSERT INTO event_outbox(device_code, product_code, category, event_identifier, event_instance_id, event_time, created_at, payload_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, item.DeviceCode, item.ProductCode, item.Data.Category, item.Data.EventIdentifier, item.Data.EventInstanceID, item.Time, createdAt, payload)
+	result, err := tx.Exec(`INSERT INTO event_outbox(device_code, product_code, category, event_code, event_instance_id, event_time, created_at, payload_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, item.DeviceCode, item.ProductCode, item.Data.Category, item.Data.EventCode, item.Data.EventInstanceID, item.Time, createdAt, payload)
 	if err != nil {
 		return 0, err
 	}
@@ -362,7 +362,7 @@ func (s *eventSQLiteStore) appendBatch(items []events.Event) error {
 			_ = tx.Rollback()
 		}
 	}()
-	stmt, err := tx.Prepare(`INSERT INTO event_outbox(device_code, product_code, category, event_identifier, event_instance_id, event_time, created_at, payload_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`)
+	stmt, err := tx.Prepare(`INSERT INTO event_outbox(device_code, product_code, category, event_code, event_instance_id, event_time, created_at, payload_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return err
 	}
@@ -377,7 +377,7 @@ func (s *eventSQLiteStore) appendBatch(items []events.Event) error {
 			err = marshalErr
 			return err
 		}
-		if _, err = stmt.Exec(item.DeviceCode, item.ProductCode, item.Data.Category, item.Data.EventIdentifier, item.Data.EventInstanceID, item.Time, createdAt, payload); err != nil {
+		if _, err = stmt.Exec(item.DeviceCode, item.ProductCode, item.Data.Category, item.Data.EventCode, item.Data.EventInstanceID, item.Time, createdAt, payload); err != nil {
 			return err
 		}
 	}

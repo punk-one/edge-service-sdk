@@ -53,9 +53,9 @@ func testReliableEvent() coreevent.Event {
 		TraceID:     "trace-event-1",
 		CreatedAt:   1710000000999,
 		Data: coreevent.EventData{
-			EventIdentifier: "EVENT_TEST",
+			EventCode:       "EVENT_TEST",
 			Category:        coreevent.CategoryOEE,
-			EventType:       coreevent.EventTypePulse,
+			Type:            coreevent.EventTypePulse,
 			Phase:           coreevent.EventPhaseRecord,
 			Status:          coreevent.EventStatusRecorded,
 			EventInstanceID: "evt-test-1",

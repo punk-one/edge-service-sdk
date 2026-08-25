@@ -2,13 +2,12 @@
 
 ## v0.9.2
 
-- Breaking EVENT payload contract: renamed `data.event_code` to
-  `data.event_identifier` and `data.type` to `data.event_type`.
+- EVENT payload uses the existing `data.event_code` and `data.type` fields.
 - Added required lifecycle fields: `raise` is `phase=start, status=active`,
   `clear` is `phase=end, status=resolved`, and `pulse` is
   `phase=record, status=recorded`.
-- Renamed EVENT metadata's rule-definition field to `meta.rule_type` so it is
-  not confused with the lifecycle `data.event_type`.
+- EVENT metadata keeps the rule-definition field as `meta.rule_type`, while
+  `data.type` carries the lifecycle action.
 - Changed EVENT delivery to a write-ahead SQLite `event_outbox`: every event
   is persisted before MQTT delivery and removed only after a successful send.
   The legacy event queue is not migrated.

@@ -239,10 +239,10 @@ func (s *Service) publishAndPersist(items []coreevent.Event) error {
 				return err
 			}
 		} else if s.log != nil {
-			s.log.Infof("EVENT generated without eventReport: device=%s category=%s event=%s event_type=%s instance=%s", item.DeviceCode, item.Data.Category, item.Data.EventIdentifier, item.Data.EventType, item.Data.EventInstanceID)
+			s.log.Infof("EVENT generated without eventReport: device=%s category=%s event=%s type=%s instance=%s", item.DeviceCode, item.Data.Category, item.Data.EventCode, item.Data.Type, item.Data.EventInstanceID)
 		}
 		if s.log != nil {
-			s.log.Debugf("EVENT processed: device=%s category=%s event=%s event_type=%s instance=%s time=%d", item.DeviceCode, item.Data.Category, item.Data.EventIdentifier, item.Data.EventType, item.Data.EventInstanceID, item.Time)
+			s.log.Debugf("EVENT processed: device=%s category=%s event=%s type=%s instance=%s time=%d", item.DeviceCode, item.Data.Category, item.Data.EventCode, item.Data.Type, item.Data.EventInstanceID, item.Time)
 		}
 	}
 	return s.saveState()

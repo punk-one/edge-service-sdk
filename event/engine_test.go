@@ -15,9 +15,9 @@ func TestEventPublicEnvelopeOmitsSourceAndKeepsTraceMetadata(t *testing.T) {
 		ProductCode: "P1",
 		TraceID:     "trace-1",
 		Data: EventData{
-			EventIdentifier: "EVENT_TEST",
+			EventCode:       "EVENT_TEST",
 			Category:        CategoryOEE,
-			EventType:       EventTypePulse,
+			Type:            EventTypePulse,
 			Phase:           EventPhaseRecord,
 			Status:          EventStatusRecorded,
 			Payload:         map[string]interface{}{"x": 1},
@@ -39,11 +39,11 @@ func TestEventPublicEnvelopeOmitsSourceAndKeepsTraceMetadata(t *testing.T) {
 	if !ok {
 		t.Fatalf("event data has unexpected type: %#v", decoded["data"])
 	}
-	if data["event_identifier"] != "EVENT_TEST" || data["event_type"] != EventTypePulse || data["phase"] != EventPhaseRecord || data["status"] != EventStatusRecorded {
+	if data["event_code"] != "EVENT_TEST" || data["type"] != EventTypePulse || data["phase"] != EventPhaseRecord || data["status"] != EventStatusRecorded {
 		t.Fatalf("unexpected event lifecycle fields: %#v", data)
 	}
-	if _, ok := data["event_code"]; ok {
-		t.Fatal("event payload must not contain event_code")
+	if _, ok := data["event_identifier"]; ok {
+		t.Fatal("event payload must not contain event_identifier")
 	}
 	if _, ok := decoded["source"]; ok {
 		t.Fatal("event envelope must not contain source")
@@ -54,9 +54,9 @@ func TestEventPublicEnvelopeOmitsSourceAndKeepsTraceMetadata(t *testing.T) {
 }
 
 func TestEventPublicEnvelopeRejectsUnknownLifecycle(t *testing.T) {
-	event := Event{Data: EventData{EventIdentifier: "EVENT_TEST", EventType: "unknown"}}
+	event := Event{Data: EventData{EventCode: "EVENT_TEST", Type: "unknown"}}
 	if _, err := event.MarshalPublicJSON(false, 2000); err == nil {
-		t.Fatal("MarshalPublicJSON() must reject an unknown event_type")
+		t.Fatal("MarshalPublicJSON() must reject an unknown type")
 	}
 }
 
@@ -277,7 +277,7 @@ func containsEvent(items []Event, code, eventType string) bool {
 
 func findEvent(items []Event, code, eventType string) *Event {
 	for i := range items {
-		if items[i].Data.EventIdentifier == code && items[i].Data.EventType == eventType {
+		if items[i].Data.EventCode == code && items[i].Data.Type == eventType {
 			return &items[i]
 		}
 	}
@@ -287,7 +287,7 @@ func findEvent(items []Event, code, eventType string) *Event {
 func eventSummaries(items []Event) []string {
 	result := make([]string, 0, len(items))
 	for _, item := range items {
-		result = append(result, item.Data.EventIdentifier+":"+item.Data.EventType)
+		result = append(result, item.Data.EventCode+":"+item.Data.Type)
 	}
 	return result
 }

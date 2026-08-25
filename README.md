@@ -21,8 +21,8 @@ It extracts the common runtime, control, and transport capabilities out of proto
 
 ## What's New In v0.9.2
 
-- **Breaking EVENT payload contract** — `data.event_code` is now
-  `data.event_identifier`, and `data.type` is now `data.event_type`.
+- **EVENT payload fields** — the existing `data.event_code` and `data.type`
+  fields remain the wire identifiers for event code and lifecycle action.
 - **Explicit EVENT lifecycle** — `raise` emits `phase=start,
   status=active`; `clear` emits `phase=end, status=resolved`; `pulse` emits
   `phase=record, status=recorded`.
@@ -66,8 +66,8 @@ evaluates telemetry snapshots and standard connection observations, keeps
 state separately from the durable event outbox, preserves the original event
 `time` during replay, and updates only transport metadata such as `send_at` and
 `is_replayed`. EVENT profiles do not contain middleware pipelines or MQTT
-connection settings. The v0.9.2 wire contract does not read the legacy
-`event_code`/`type` fields or migrate the legacy SQLite event queue.
+connection settings. The v0.9.2 wire contract keeps `event_code` and `type`,
+and does not migrate the legacy SQLite event queue.
 
 ## What's New In v0.7.5
 
