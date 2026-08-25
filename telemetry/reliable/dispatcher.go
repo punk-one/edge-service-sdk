@@ -3,6 +3,7 @@ package reliable
 import (
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	contracts "github.com/punk-one/edge-service-sdk/driver"
@@ -10,325 +11,488 @@ import (
 	outevent "github.com/punk-one/edge-service-sdk/telemetry"
 )
 
-// NewDispatcher creates the reliable telemetry dispatcher.
-func NewDispatcher(cfg Config, transport TelemetryTransport, logClient logger.LoggingClient) (*Dispatcher, error) {
-	dispatcher := &Dispatcher{
-		cfg:       normalizeConfig(cfg),
+const telemetryCleanupInterval = time.Hour
+
+// DefaultTelemetryOutboxConfig returns the SDK defaults for the mandatory
+// SQLite-first telemetry delivery path.
+func DefaultTelemetryOutboxConfig() TelemetryOutboxConfig {
+	return TelemetryOutboxConfig{
+		SQLitePath:        "./data/telemetry-outbox.db",
+		RetentionDays:     7,
+		SendBatchSize:     100,
+		MaxSendRatePerSec: 100,
+		RetryInitialMs:    1_000,
+		RetryMaxMs:        30_000,
+	}
+}
+
+// NormalizeTelemetryOutboxConfig applies operational defaults. RetentionDays
+// and MaxSendRatePerSec deliberately preserve zero (no expiry / no limit).
+func NormalizeTelemetryOutboxConfig(cfg TelemetryOutboxConfig) TelemetryOutboxConfig {
+	defaults := DefaultTelemetryOutboxConfig()
+	if strings.TrimSpace(cfg.SQLitePath) == "" {
+		cfg.SQLitePath = defaults.SQLitePath
+	}
+	if cfg.SendBatchSize == 0 {
+		cfg.SendBatchSize = defaults.SendBatchSize
+	}
+	if cfg.RetryInitialMs == 0 {
+		cfg.RetryInitialMs = defaults.RetryInitialMs
+	}
+	if cfg.RetryMaxMs == 0 {
+		cfg.RetryMaxMs = defaults.RetryMaxMs
+	}
+	return cfg
+}
+
+// ValidateTelemetryOutboxConfig rejects values that would make delivery or
+// retry behavior ambiguous.
+func ValidateTelemetryOutboxConfig(cfg TelemetryOutboxConfig) error {
+	if cfg.RetentionDays < 0 {
+		return fmt.Errorf("telemetryOutbox.retentionDays must be >= 0")
+	}
+	if cfg.SendBatchSize <= 0 {
+		return fmt.Errorf("telemetryOutbox.sendBatchSize must be > 0")
+	}
+	if cfg.MaxSendRatePerSec < 0 {
+		return fmt.Errorf("telemetryOutbox.maxSendRatePerSec must be >= 0")
+	}
+	if cfg.RetryInitialMs <= 0 {
+		return fmt.Errorf("telemetryOutbox.retryInitialMs must be > 0")
+	}
+	if cfg.RetryMaxMs < cfg.RetryInitialMs {
+		return fmt.Errorf("telemetryOutbox.retryMaxMs must be >= telemetryOutbox.retryInitialMs")
+	}
+	return nil
+}
+
+// NewTelemetryDispatcher creates the single write-ahead telemetry dispatcher.
+func NewTelemetryDispatcher(cfg TelemetryOutboxConfig, transport TelemetryTransport, logClient logger.LoggingClient) (*TelemetryDispatcher, error) {
+	if transport == nil {
+		return nil, fmt.Errorf("telemetry transport is nil")
+	}
+	cfg = NormalizeTelemetryOutboxConfig(cfg)
+	if err := ValidateTelemetryOutboxConfig(cfg); err != nil {
+		return nil, err
+	}
+	store, err := newSQLiteStore(cfg.SQLitePath)
+	if err != nil {
+		return nil, err
+	}
+
+	dispatcher := &TelemetryDispatcher{
+		cfg:       cfg,
 		logger:    logClient,
 		transport: transport,
-		enabled:   cfg.Enabled,
+		store:     store,
 		stopCh:    make(chan struct{}),
+		wakeCh:    make(chan struct{}, 1),
+		connectCh: make(chan struct{}, 1),
+		doneCh:    make(chan struct{}),
+		online:    transportIsHealthy(transport),
+	}
+	dispatcher.purgeExpired()
+
+	// Any row surviving process startup is recovery delivery, regardless of
+	// whether the previous process attempted it before exiting.
+	marked, err := store.MarkAllReplayed()
+	if err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("mark startup telemetry as replayed: %w", err)
+	}
+	cutoff, err := store.MaxID()
+	if err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("read startup telemetry cutoff: %w", err)
+	}
+	dispatcher.recoveryCutoff = cutoff
+	if marked > 0 && logClient != nil {
+		logClient.Infof("Telemetry outbox startup recovery: pending=%d cutoffId=%d", marked, cutoff)
 	}
 
-	if dispatcher.enabled {
-		store, err := newSQLiteStore(dispatcher.cfg.SQLitePath, dispatcher.cfg.KeepLatestOnly)
-		if err != nil {
-			return nil, err
-		}
-		dispatcher.store = store
-		dispatcher.persistCh = make(chan persistRequest, dispatcher.cfg.memoryQueueSize())
-		dispatcher.replayTokens = float64(dispatcher.cfg.replayRatePerSec())
-		dispatcher.lastReplayRefill = time.Now().UnixMilli()
-		go dispatcher.persistLoop()
-		go dispatcher.replayLoop()
+	if registrar, ok := transport.(connectRegistrar); ok {
+		registrar.RegisterOnConnect(dispatcher.notifyConnected)
 	}
-
+	go dispatcher.run()
 	return dispatcher, nil
 }
 
-// NewPassthroughSink creates a no-buffer telemetry sink.
-func NewPassthroughSink(transport TelemetryTransport, logClient logger.LoggingClient) *Dispatcher {
-	return &Dispatcher{
-		cfg:       normalizeConfig(Config{}),
-		logger:    logClient,
-		transport: transport,
-		enabled:   false,
-		stopCh:    make(chan struct{}),
+// PublishAsyncValues commits telemetry to SQLite and only then wakes the MQTT
+// sender. There is no realtime bypass or process-memory persistence queue.
+func (d *TelemetryDispatcher) PublishAsyncValues(device contracts.DeviceConfig, async *contracts.AsyncValues) error {
+	if d == nil {
+		return fmt.Errorf("telemetry dispatcher is nil")
 	}
-}
-
-// PublishAsyncValues attempts realtime delivery and falls back to durable queueing.
-func (d *Dispatcher) PublishAsyncValues(device contracts.DeviceConfig, async *contracts.AsyncValues) error {
 	event, err := outevent.NewTelemetryEvent(device, async)
 	if err != nil {
 		return err
 	}
 
-	if err := d.transport.PublishTelemetryEvent(event, false); err == nil {
-		return nil
-	} else if !d.enabled {
-		return err
-	} else if persistErr := d.enqueuePersist(event); persistErr != nil {
-		return fmt.Errorf("publish realtime telemetry: %w; persist telemetry: %v", err, persistErr)
+	d.lifecycleMu.RLock()
+	defer d.lifecycleMu.RUnlock()
+	if d.closed {
+		return fmt.Errorf("telemetry dispatcher is closed")
 	}
-
-	d.logger.Warnf("Realtime publish failed, queued telemetry for replay: device=%s traceId=%s", event.DeviceName, event.TraceID)
+	d.acceptanceMu.Lock()
+	defer d.acceptanceMu.Unlock()
+	replayed := !d.isOnline()
+	rowID, err := d.store.Append(event, replayed, nowMillis())
+	if err != nil {
+		return fmt.Errorf("persist telemetry before publish: %w", err)
+	}
+	if d.logger != nil {
+		d.logger.Debugf("Telemetry committed to outbox: id=%d device=%s traceId=%s isReplayed=%t", rowID, event.DeviceName, event.TraceID, replayed)
+	}
+	d.signalWake()
 	return nil
 }
 
-// Close stops background workers and flushes in-memory pending events.
-func (d *Dispatcher) Close() error {
+// Close stops delivery after all in-progress SQLite or MQTT work returns. All
+// unsent rows remain durable for the next process start.
+func (d *TelemetryDispatcher) Close() error {
 	if d == nil {
 		return nil
 	}
-
-	select {
-	case <-d.stopCh:
-	default:
+	d.closeOnce.Do(func() {
+		d.lifecycleMu.Lock()
+		d.closed = true
 		close(d.stopCh)
-	}
-
-	if d.store != nil {
-		return d.store.Close()
-	}
-	return nil
+		d.lifecycleMu.Unlock()
+		<-d.doneCh
+		d.closeErr = d.store.Close()
+	})
+	return d.closeErr
 }
 
-// Stats returns current queue depth, oldest backlog age, and replay metrics.
-func (d *Dispatcher) Stats() (QueueStats, error) {
-	stats := QueueStats{
-		ReplayRatePerSec: d.lastReplayRate,
-		LastReplayAt:     d.lastReplayAt,
+func (d *TelemetryDispatcher) Stats() (TelemetryOutboxStats, error) {
+	if d == nil || d.store == nil {
+		return TelemetryOutboxStats{}, nil
 	}
-	if d.store == nil {
-		return stats, nil
-	}
-
 	storeStats, err := d.store.Stats()
 	if err != nil {
-		return QueueStats{}, err
+		return TelemetryOutboxStats{}, err
 	}
-
-	stats.BufferDepth = storeStats.PendingCount
+	d.metricsMu.RLock()
+	result := TelemetryOutboxStats{
+		PendingCount:   storeStats.PendingCount,
+		SendRatePerSec: d.lastSendRate,
+		LastSendAt:     d.lastSendAt,
+	}
+	d.metricsMu.RUnlock()
 	if storeStats.OldestPendingCreatedAt > 0 {
-		stats.OldestPendingAgeMs = nowMillis() - storeStats.OldestPendingCreatedAt
+		result.OldestPendingAgeMs = nowMillis() - storeStats.OldestPendingCreatedAt
 	}
-	return stats, nil
+	return result, nil
 }
 
-func (d *Dispatcher) enqueuePersist(event outevent.TelemetryEvent) error {
-	if !d.enabled || d.store == nil {
-		return fmt.Errorf("reliable queue is disabled")
-	}
+func (d *TelemetryDispatcher) run() {
+	defer close(d.doneCh)
+	cleanupTicker := time.NewTicker(telemetryCleanupInterval)
+	defer cleanupTicker.Stop()
 
-	req := persistRequest{event: event}
-	select {
-	case d.persistCh <- req:
-		return nil
-	default:
-		return d.store.AppendBatch([]outevent.TelemetryEvent{event})
-	}
-}
+	retryDelay := d.cfg.retryInitial()
+	retryTimer := time.NewTimer(0)
+	retryC := retryTimer.C
+	defer retryTimer.Stop()
 
-func (d *Dispatcher) persistLoop() {
-	ticker := time.NewTicker(d.cfg.flushInterval())
-	defer ticker.Stop()
-
-	buffer := make([]outevent.TelemetryEvent, 0, d.cfg.batchSize())
-	flush := func() {
-		if len(buffer) == 0 {
-			return
-		}
-		if err := d.store.AppendBatch(buffer); err != nil {
-			d.logger.Errorf("Failed to persist telemetry buffer batch: %v", err)
-			return
-		}
-		d.logQueueStats("persisted telemetry batch")
-		buffer = buffer[:0]
-	}
-
-	for {
-		select {
-		case <-d.stopCh:
-			flush()
-			return
-		case req := <-d.persistCh:
-			buffer = append(buffer, req.event)
-			if len(buffer) >= d.cfg.batchSize() {
-				flush()
+	stopRetry := func() {
+		if !retryTimer.Stop() {
+			select {
+			case <-retryTimer.C:
+			default:
 			}
-		case <-ticker.C:
-			flush()
 		}
+		retryC = nil
 	}
-}
-
-func (d *Dispatcher) replayLoop() {
-	ticker := time.NewTicker(d.cfg.replayInterval())
-	defer ticker.Stop()
+	scheduleRetry := func(delay time.Duration) {
+		stopRetry()
+		retryTimer.Reset(delay)
+		retryC = retryTimer.C
+	}
 
 	for {
+		attempt := false
 		select {
 		case <-d.stopCh:
 			return
-		case <-ticker.C:
-			d.replayOnce()
+		case <-d.connectCh:
+			d.acceptanceMu.Lock()
+			d.refreshRecoveryCutoff()
+			d.setOnline(true)
+			d.acceptanceMu.Unlock()
+			retryDelay = d.cfg.retryInitial()
+			attempt = true
+		case <-d.wakeCh:
+			if d.isOnline() {
+				attempt = true
+			} else if retryC == nil {
+				scheduleRetry(0)
+			}
+		case <-retryC:
+			retryC = nil
+			if !d.isOnline() {
+				if !transportIsHealthy(d.transport) {
+					scheduleRetry(retryDelay)
+					retryDelay *= 2
+					if maxDelay := d.cfg.retryMax(); retryDelay > maxDelay {
+						retryDelay = maxDelay
+					}
+					continue
+				}
+				d.acceptanceMu.Lock()
+				d.refreshRecoveryCutoff()
+				d.setOnline(true)
+				d.acceptanceMu.Unlock()
+			}
+			attempt = true
+		case <-cleanupTicker.C:
+			d.purgeExpired()
+			attempt = d.isOnline()
+		}
+
+		if !attempt {
+			continue
+		}
+		failed := d.drain()
+		if failed {
+			scheduleRetry(retryDelay)
+			retryDelay *= 2
+			if maxDelay := d.cfg.retryMax(); retryDelay > maxDelay {
+				retryDelay = maxDelay
+			}
+			continue
+		}
+		stopRetry()
+		retryDelay = d.cfg.retryInitial()
+	}
+}
+
+// drain returns true when delivery must pause and retry later.
+func (d *TelemetryDispatcher) drain() bool {
+	d.purgeExpired()
+	startedAt := time.Now()
+	sent := 0
+	for {
+		select {
+		case <-d.stopCh:
+			d.recordSendMetrics(sent, startedAt)
+			return false
+		default:
+		}
+
+		cutoff := d.currentRecoveryCutoff()
+		records, err := d.store.FetchPending(d.cfg.SendBatchSize, cutoff)
+		if err != nil {
+			d.logErrorf("Failed to fetch telemetry outbox: %v", err)
+			d.recordSendMetrics(sent, startedAt)
+			return true
+		}
+		if len(records) == 0 {
+			if cutoff > 0 {
+				d.clearRecoveryCutoff(cutoff)
+				continue
+			}
+			d.recordSendMetrics(sent, startedAt)
+			return false
+		}
+
+		for _, record := range records {
+			sendAt := nowMillis()
+			if err := d.store.MarkAttempt(record.ID, sendAt, record.IsReplayed); err != nil {
+				d.logErrorf("Failed to persist telemetry send attempt: id=%d err=%v", record.ID, err)
+				d.recordSendMetrics(sent, startedAt)
+				return true
+			}
+			if err := d.publish(record.Event, record.IsReplayed, sendAt); err != nil {
+				d.acceptanceMu.Lock()
+				d.setOnline(false)
+				if markErr := d.store.MarkFailed(record.ID, boundedError(err)); markErr != nil {
+					d.logErrorf("Failed to mark telemetry replay after publish failure: id=%d err=%v", record.ID, markErr)
+				}
+				if _, markErr := d.store.MarkAllReplayed(); markErr != nil {
+					d.logErrorf("Failed to mark pending telemetry as replayed after publish failure: %v", markErr)
+				}
+				d.acceptanceMu.Unlock()
+				d.logWarnf("Telemetry delivery paused: id=%d device=%s traceId=%s err=%v", record.ID, record.Event.DeviceName, record.Event.TraceID, err)
+				d.recordSendMetrics(sent, startedAt)
+				return true
+			}
+			if err := d.store.Ack(record.ID); err != nil {
+				if markErr := d.store.MarkFailed(record.ID, boundedError(err)); markErr != nil {
+					d.logErrorf("Failed to preserve telemetry after ack failure: id=%d err=%v", record.ID, markErr)
+				}
+				d.logErrorf("MQTT accepted telemetry but SQLite ack failed: id=%d traceId=%s err=%v", record.ID, record.Event.TraceID, err)
+				d.recordSendMetrics(sent, startedAt)
+				return true
+			}
+			d.setOnline(true)
+			sent++
+			if !d.waitSendRate() {
+				d.recordSendMetrics(sent, startedAt)
+				return false
+			}
 		}
 	}
 }
 
-func (d *Dispatcher) replayOnce() {
-	if d.store == nil {
+func (d *TelemetryDispatcher) publish(event outevent.TelemetryEvent, replayed bool, sendAt int64) error {
+	return d.transport.PublishTelemetryEventAt(event, replayed, sendAt)
+}
+
+func (d *TelemetryDispatcher) waitSendRate() bool {
+	if d.cfg.MaxSendRatePerSec <= 0 {
+		return true
+	}
+	delay := time.Second / time.Duration(d.cfg.MaxSendRatePerSec)
+	if delay <= 0 {
+		return true
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-d.stopCh:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func (d *TelemetryDispatcher) purgeExpired() {
+	cutoff := d.retentionCutoff()
+	if cutoff <= 0 {
 		return
 	}
-
-	if removed, err := d.store.PurgeExpired(d.retentionCutoff()); err != nil {
-		d.logger.Warnf("Failed to purge expired telemetry records: %v", err)
-	} else if removed > 0 {
-		d.logger.Infof("Purged expired telemetry records: removed=%d", removed)
-	}
-
-	limit := d.availableReplayBudget(time.Now())
-	if limit <= 0 {
-		return
-	}
-
-	records, err := d.store.FetchPending(limit)
+	removed, err := d.store.PurgeExpired(cutoff)
 	if err != nil {
-		d.logger.Warnf("Failed to fetch pending telemetry records: %v", err)
+		d.logWarnf("Failed to purge expired telemetry outbox records: %v", err)
 		return
 	}
-	if len(records) == 0 {
-		return
-	}
-
-	acked := make([]int64, 0, len(records))
-	for _, record := range records {
-		if err := d.transport.PublishTelemetryEvent(record.Event, true); err != nil {
-			d.logger.Warnf("Telemetry replay paused on publish failure: device=%s traceId=%s err=%v", record.Event.DeviceName, record.Event.TraceID, err)
-			break
-		}
-		acked = append(acked, record.ID)
-		d.consumeReplayToken()
-	}
-
-	if err := d.store.Ack(acked); err != nil {
-		d.logger.Warnf("Failed to ack replayed telemetry records: %v", err)
-		return
-	}
-
-	if len(acked) > 0 {
-		intervalSeconds := d.cfg.replayInterval().Seconds()
-		if intervalSeconds <= 0 {
-			intervalSeconds = 1
-		}
-		d.lastReplayRate = int(math.Ceil(float64(len(acked)) / intervalSeconds))
-		d.lastReplayAt = nowMillis()
-
-		stats, statsErr := d.Stats()
-		if statsErr != nil {
-			d.logger.Infof("Replayed telemetry records: acked=%d replayRate=%d/s", len(acked), d.lastReplayRate)
-			return
-		}
-		d.logger.Infof(
-			"Replayed telemetry records: acked=%d replayRate=%d/s bufferDepth=%d oldestPendingAgeMs=%d",
-			len(acked),
-			d.lastReplayRate,
-			stats.BufferDepth,
-			stats.OldestPendingAgeMs,
-		)
+	if removed > 0 {
+		d.logWarnf("Purged expired unsent telemetry: removed=%d retentionDays=%d", removed, d.cfg.RetentionDays)
 	}
 }
 
-func (c Config) memoryQueueSize() int {
-	if c.MemoryQueueSize > 0 {
-		return c.MemoryQueueSize
-	}
-	return 2048
-}
-
-func (c Config) batchSize() int {
-	if c.BatchSize > 0 {
-		return c.BatchSize
-	}
-	return 100
-}
-
-func (c Config) flushInterval() time.Duration {
-	if c.FlushIntervalMs > 0 {
-		return time.Duration(c.FlushIntervalMs) * time.Millisecond
-	}
-	return time.Second
-}
-
-func (c Config) replayInterval() time.Duration {
-	if c.ReplayIntervalMs > 0 {
-		return time.Duration(c.ReplayIntervalMs) * time.Millisecond
-	}
-	return 3 * time.Second
-}
-
-func (c Config) replayRatePerSec() int {
-	if c.ReplayRatePerSec > 0 {
-		return c.ReplayRatePerSec
-	}
-	return 20
-}
-
-func normalizeConfig(cfg Config) Config {
-	if cfg.SQLitePath == "" {
-		cfg.SQLitePath = "./data/reliable-queue.db"
-	}
-	return cfg
-}
-
-func (d *Dispatcher) retentionCutoff() int64 {
+func (d *TelemetryDispatcher) retentionCutoff() int64 {
 	if d.cfg.RetentionDays <= 0 {
 		return 0
 	}
 	return time.Now().Add(-time.Duration(d.cfg.RetentionDays) * 24 * time.Hour).UnixMilli()
 }
 
+func (d *TelemetryDispatcher) notifyConnected() {
+	select {
+	case <-d.stopCh:
+		return
+	default:
+	}
+	select {
+	case d.connectCh <- struct{}{}:
+	default:
+	}
+}
+
+func (d *TelemetryDispatcher) signalWake() {
+	select {
+	case <-d.stopCh:
+		return
+	default:
+	}
+	select {
+	case d.wakeCh <- struct{}{}:
+	default:
+	}
+}
+
+func (d *TelemetryDispatcher) refreshRecoveryCutoff() {
+	cutoff, err := d.store.MaxID()
+	if err != nil {
+		d.logWarnf("Failed to refresh telemetry recovery cutoff: %v", err)
+		return
+	}
+	d.stateMu.Lock()
+	if cutoff > d.recoveryCutoff {
+		d.recoveryCutoff = cutoff
+	}
+	d.stateMu.Unlock()
+}
+
+func (d *TelemetryDispatcher) currentRecoveryCutoff() int64 {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	return d.recoveryCutoff
+}
+
+func (d *TelemetryDispatcher) clearRecoveryCutoff(expected int64) {
+	d.stateMu.Lock()
+	if d.recoveryCutoff == expected {
+		d.recoveryCutoff = 0
+	}
+	d.stateMu.Unlock()
+}
+
+func (d *TelemetryDispatcher) isOnline() bool {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	return d.online
+}
+
+func (d *TelemetryDispatcher) setOnline(value bool) {
+	d.stateMu.Lock()
+	d.online = value
+	d.stateMu.Unlock()
+}
+
+func (d *TelemetryDispatcher) recordSendMetrics(sent int, startedAt time.Time) {
+	if sent <= 0 {
+		return
+	}
+	elapsed := time.Since(startedAt).Seconds()
+	if elapsed < 1 {
+		elapsed = 1
+	}
+	d.metricsMu.Lock()
+	d.lastSendRate = int(math.Ceil(float64(sent) / elapsed))
+	d.lastSendAt = nowMillis()
+	d.metricsMu.Unlock()
+}
+
+func (d *TelemetryDispatcher) logWarnf(format string, args ...interface{}) {
+	if d.logger != nil {
+		d.logger.Warnf(format, args...)
+	}
+}
+
+func (d *TelemetryDispatcher) logErrorf(format string, args ...interface{}) {
+	if d.logger != nil {
+		d.logger.Errorf(format, args...)
+	}
+}
+
+func (c TelemetryOutboxConfig) retryInitial() time.Duration {
+	return time.Duration(c.RetryInitialMs) * time.Millisecond
+}
+
+func (c TelemetryOutboxConfig) retryMax() time.Duration {
+	return time.Duration(c.RetryMaxMs) * time.Millisecond
+}
+
+func transportIsHealthy(transport any) bool {
+	health, ok := transport.(transportHealth)
+	return !ok || health.HealthCheck() == nil
+}
+
+func boundedError(err error) string {
+	if err == nil {
+		return ""
+	}
+	const maxLength = 2_048
+	message := err.Error()
+	if len(message) > maxLength {
+		return message[:maxLength]
+	}
+	return message
+}
+
 func nowMillis() int64 {
 	return time.Now().UnixMilli()
-}
-
-func (d *Dispatcher) availableReplayBudget(now time.Time) int {
-	rate := d.cfg.replayRatePerSec()
-	if rate <= 0 {
-		return d.cfg.batchSize()
-	}
-
-	lastRefill := time.UnixMilli(d.lastReplayRefill)
-	if lastRefill.IsZero() {
-		lastRefill = now
-	}
-	elapsed := now.Sub(lastRefill).Seconds()
-	if elapsed > 0 {
-		d.replayTokens = math.Min(float64(rate), d.replayTokens+elapsed*float64(rate))
-		d.lastReplayRefill = now.UnixMilli()
-	}
-
-	available := int(math.Floor(d.replayTokens))
-	if available <= 0 {
-		return 0
-	}
-	if available > d.cfg.batchSize() {
-		return d.cfg.batchSize()
-	}
-	return available
-}
-
-func (d *Dispatcher) consumeReplayToken() {
-	if d.cfg.replayRatePerSec() <= 0 {
-		return
-	}
-	if d.replayTokens >= 1 {
-		d.replayTokens -= 1
-	}
-}
-
-func (d *Dispatcher) logQueueStats(context string) {
-	stats, err := d.Stats()
-	if err != nil {
-		d.logger.Warnf("Failed to collect queue stats after %s: %v", context, err)
-		return
-	}
-	d.logger.Infof(
-		"Reliable queue stats: context=%s bufferDepth=%d oldestPendingAgeMs=%d replayRate=%d/s",
-		context,
-		stats.BufferDepth,
-		stats.OldestPendingAgeMs,
-		stats.ReplayRatePerSec,
-	)
 }

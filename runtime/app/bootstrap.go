@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -41,16 +41,14 @@ import (
 
 type DeviceSDK struct {
 	logger         logger.LoggingClient
-	asyncCh        chan *contracts.AsyncValues
-	asyncStopCh    chan struct{}
-	asyncDoneCh    chan struct{}
-	asyncStopOnce  sync.Once
+	telemetrySink  reliable.TelemetrySink
 	devices        []contracts.Device
 	deviceConfigs  map[string]contracts.DeviceConfig
 	productDevices map[string][]contracts.DeviceConfig
 	nameIndex      map[string]string
 	statusTracker  *rtstatus.Tracker
 	eventService   *eventruntime.Service
+	shuttingDown   atomic.Bool
 
 	// Ops services
 	configService   *configsvc.ConfigService
@@ -76,8 +74,6 @@ func NewDeviceSDK(config rtconfig.Config, logClient logger.LoggingClient, tracke
 	if logClient == nil {
 		logClient = logger.NewLogger("edge-device-service", rtconfig.EffectiveLoggerConfig(config))
 	}
-	asyncCh := make(chan *contracts.AsyncValues, 100)
-
 	devices := make([]contracts.Device, 0, len(config.Devices))
 	deviceConfigs := make(map[string]contracts.DeviceConfig, len(config.Devices))
 	productDevices := make(map[string][]contracts.DeviceConfig)
@@ -102,9 +98,6 @@ func NewDeviceSDK(config rtconfig.Config, logClient logger.LoggingClient, tracke
 
 	return &DeviceSDK{
 		logger:         logClient,
-		asyncCh:        asyncCh,
-		asyncStopCh:    make(chan struct{}),
-		asyncDoneCh:    make(chan struct{}),
 		devices:        devices,
 		deviceConfigs:  deviceConfigs,
 		productDevices: productDevices,
@@ -117,8 +110,34 @@ func (s *DeviceSDK) LoggingClient() logger.LoggingClient {
 	return s.logger
 }
 
-func (s *DeviceSDK) AsyncValuesChannel() chan<- *contracts.AsyncValues {
-	return s.asyncCh
+func (s *DeviceSDK) ReportAsyncValues(asyncValues *contracts.AsyncValues) error {
+	if s == nil {
+		return fmt.Errorf("device SDK is nil")
+	}
+	if asyncValues == nil {
+		return nil
+	}
+	if s.isShuttingDown() {
+		return fmt.Errorf("device SDK is shutting down")
+	}
+	if s.telemetrySink == nil {
+		return fmt.Errorf("telemetry outbox is not initialized")
+	}
+	device, ok := s.DeviceConfigByName(asyncValues.DeviceName)
+	if !ok {
+		return fmt.Errorf("unknown telemetry device %s", asyncValues.DeviceName)
+	}
+	// SQLite COMMIT is the telemetry acceptance boundary. EVENT observation is
+	// intentionally after persistence so it cannot delay or prevent durability.
+	if err := s.telemetrySink.PublishAsyncValues(device, asyncValues); err != nil {
+		return err
+	}
+	if s.eventService != nil {
+		if err := s.eventService.ObserveTelemetry(device.InternalName, asyncValues.CollectedAt, asyncValues.Values); err != nil && s.logger != nil {
+			s.logger.Warnf("Failed to process EVENT telemetry for %s: %v", asyncValues.DeviceName, err)
+		}
+	}
+	return nil
 }
 
 func (s *DeviceSDK) Devices() []contracts.Device {
@@ -219,14 +238,6 @@ func (s *DeviceSDK) SetEventService(service *eventruntime.Service) {
 	s.eventService = service
 }
 
-func (s *DeviceSDK) stopAsyncProcessing() {
-	if s == nil {
-		return
-	}
-	s.asyncStopOnce.Do(func() { close(s.asyncStopCh) })
-	<-s.asyncDoneCh
-}
-
 func (s *DeviceSDK) EventService() *eventruntime.Service {
 	if s == nil {
 		return nil
@@ -257,15 +268,7 @@ func (s *DeviceSDK) observeConnection(deviceName string, online bool, state stri
 }
 
 func (s *DeviceSDK) isShuttingDown() bool {
-	if s == nil {
-		return true
-	}
-	select {
-	case <-s.asyncStopCh:
-		return true
-	default:
-		return false
-	}
+	return s == nil || s.shuttingDown.Load()
 }
 
 func errorString(err error) string {
@@ -384,9 +387,14 @@ func BootstrapWithOptions(serviceName, version string, driver contracts.Protocol
 	if mqttObserver != nil {
 		defer mqttObserver.Close()
 	}
-	telemetrySink, err := reliable.NewDispatcher(config.ReliableQueue, publisher, logClient)
+	telemetryTransport, ok := publisher.(reliable.TelemetryTransport)
+	if !ok {
+		logClient.Errorf("MQTT publisher does not preserve telemetry outbox send_at")
+		return
+	}
+	telemetrySink, err := reliable.NewTelemetryDispatcher(config.TelemetryOutbox, telemetryTransport, logClient)
 	if err != nil {
-		logClient.Errorf("Failed to initialize reliable telemetry dispatcher: %v", err)
+		logClient.Errorf("Failed to initialize telemetry outbox: %v", err)
 		return
 	}
 
@@ -403,6 +411,7 @@ func BootstrapWithOptions(serviceName, version string, driver contracts.Protocol
 	}
 
 	sdk := NewDeviceSDK(config, logClient, statusTracker)
+	sdk.telemetrySink = telemetrySink
 	eventService, err := eventruntime.NewService(config, publisher, logClient)
 	if err != nil {
 		logClient.Errorf("Failed to initialize EVENT service: %v", err)
@@ -453,10 +462,16 @@ func BootstrapWithOptions(serviceName, version string, driver contracts.Protocol
 	dependencyManager := dependency.NewDependencyManager(logClient)
 	dependencyManager.Register(dependency.NamedDependency("driver", func() error { return nil }))
 	dependencyManager.Register(dependency.NamedDependency("auth", authService.HealthCheck))
-	dependencyManager.Register(dependency.NamedDependency("mqtt", publisher.HealthCheck))
 	if err := dependencyManager.CheckAll(); err != nil {
 		logClient.Errorf("Dependency check failed: %v", err)
 		return
+	}
+	if err := publisher.HealthCheck(); err != nil {
+		// MQTT is recoverable: continue collecting into telemetry_outbox and let
+		// the publisher reconnect in the background. Readiness remains degraded.
+		logClient.Warnf("MQTT unavailable at startup; continuing with SQLite outbox until reconnect: %v", err)
+	} else {
+		logClient.Infof("Dependency ready: mqtt")
 	}
 
 	controlStore, err := rtcontrol.NewSQLiteStore(config.ControlStore.SQLitePath)
@@ -502,8 +517,6 @@ func BootstrapWithOptions(serviceName, version string, driver contracts.Protocol
 	}
 
 	sdk.statusPublisher = installStatusPublisher(statusTracker, sdk, publisher, config.StatusReport, logClient)
-
-	go processAsyncValues(sdk, telemetrySink, logClient)
 
 	super := supervisor.NewSupervisor(logClient, 5*time.Second)
 	workerCount := 0
@@ -551,21 +564,21 @@ func BootstrapWithOptions(serviceName, version string, driver contracts.Protocol
 	}
 
 	httpRuntime := httpserver.New(httpserver.Config{
-		ServiceName:          serviceName,
-		Version:              version,
-		Host:                 config.Service.Host,
-		Port:                 config.Service.Port,
-		PortEnd:              config.Service.PortEnd,
-		StartupMsg:           config.Service.StartupMsg,
-		ServiceType:          config.Service.Type,
-		StartedAt:            time.Now(),
-		DeviceCount:          len(config.Devices),
-		TelemetryWorkerCount: workerCount,
-		ReliableQueueEnabled: config.ReliableQueue.Enabled,
-		Readiness:            buildRuntimeReadiness(authService, publisher),
-		QueueStats:           telemetrySink.Stats,
-		DeviceStates:         statusTracker.Snapshot,
-		AuthService:          authService,
+		ServiceName:            serviceName,
+		Version:                version,
+		Host:                   config.Service.Host,
+		Port:                   config.Service.Port,
+		PortEnd:                config.Service.PortEnd,
+		StartupMsg:             config.Service.StartupMsg,
+		ServiceType:            config.Service.Type,
+		StartedAt:              time.Now(),
+		DeviceCount:            len(config.Devices),
+		TelemetryWorkerCount:   workerCount,
+		TelemetryOutboxEnabled: strings.TrimSpace(config.TelemetryReport.Topic) != "",
+		Readiness:              buildRuntimeReadiness(authService, publisher),
+		TelemetryOutboxStats:   telemetrySink.Stats,
+		DeviceStates:           statusTracker.Snapshot,
+		AuthService:            authService,
 		PropertyGet: func(req rtapi.PropertyRequest) (rtapi.PropertyResponse, int) {
 			return propertyService.ExecuteGet(req, "")
 		},
@@ -610,57 +623,20 @@ func BootstrapWithOptions(serviceName, version string, driver contracts.Protocol
 	// Stop device production first, then flush EVENT state/outbox before
 	// closing transports. The supervisor goroutines terminate with the
 	// process after Bootstrap returns.
+	sdk.shuttingDown.Store(true)
 	if err := driver.Stop(false); err != nil {
 		logClient.Warnf("Failed to stop driver cleanly: %v", err)
 	}
-	sdk.stopAsyncProcessing()
 	if eventService != nil {
 		if err := eventService.Close(); err != nil {
 			logClient.Warnf("Failed to close EVENT service cleanly: %v", err)
 		}
 	}
 	if err := telemetrySink.Close(); err != nil {
-		logClient.Warnf("Failed to close reliable telemetry dispatcher cleanly: %v", err)
+		logClient.Warnf("Failed to close telemetry outbox cleanly: %v", err)
 	}
 	if err := publisher.Close(); err != nil {
 		logClient.Warnf("Failed to close MQTT publisher cleanly: %v", err)
-	}
-}
-
-func processAsyncValues(sdk *DeviceSDK, telemetrySink reliable.TelemetrySink, logClient logger.LoggingClient) {
-	defer close(sdk.asyncDoneCh)
-	handle := func(asyncValues *contracts.AsyncValues) {
-		if asyncValues == nil {
-			return
-		}
-		device, ok := sdk.DeviceConfigByName(asyncValues.DeviceName)
-		if !ok {
-			logClient.Warnf("Dropping async values for unknown device %s", asyncValues.DeviceName)
-			return
-		}
-		if sdk.eventService != nil {
-			if err := sdk.eventService.ObserveTelemetry(device.InternalName, asyncValues.CollectedAt, asyncValues.Values); err != nil {
-				logClient.Warnf("Failed to process EVENT telemetry for %s: %v", asyncValues.DeviceName, err)
-			}
-		}
-		if err := telemetrySink.PublishAsyncValues(device, asyncValues); err != nil {
-			logClient.Errorf("Failed to publish async values for %s: %v", asyncValues.DeviceName, err)
-		}
-	}
-	for {
-		select {
-		case asyncValues := <-sdk.asyncCh:
-			handle(asyncValues)
-		case <-sdk.asyncStopCh:
-			for {
-				select {
-				case asyncValues := <-sdk.asyncCh:
-					handle(asyncValues)
-				default:
-					return
-				}
-			}
-		}
 	}
 }
 
@@ -870,10 +846,8 @@ func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.
 						CollectedAt: now.UnixMilli(),
 						Values:      mergedValues,
 					}
-					select {
-					case sdk.asyncCh <- asyncValues:
-					default:
-						logClient.Warnf("Async channel full; dropping telemetry for %s", device.InternalName)
+					if err := sdk.ReportAsyncValues(asyncValues); err != nil {
+						return fmt.Errorf("persist telemetry for device %s: %w", device.InternalName, err)
 					}
 				}
 			}

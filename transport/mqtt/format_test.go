@@ -19,13 +19,14 @@ func TestRuleFormatUsesTimeAsCollectedAtAndAddsSendAt(t *testing.T) {
 		CollectedAt: 1710000000000,
 	}
 
-	body, err := publisher.formatTelemetry(event, map[string]interface{}{
+	const sendAt int64 = 1710000001234
+	body, err := publisher.formatTelemetryAt(event, map[string]interface{}{
 		"temperature": map[string]interface{}{
 			"value":  36.5,
 			"type":   "Float32",
 			"origin": int64(1710000000000),
 		},
-	}, true)
+	}, true, sendAt)
 	if err != nil {
 		t.Fatalf("formatTelemetry() error = %v", err)
 	}
@@ -41,8 +42,8 @@ func TestRuleFormatUsesTimeAsCollectedAtAndAddsSendAt(t *testing.T) {
 	if got, ok := payload["trace_id"].(string); !ok || got != event.TraceID {
 		t.Fatalf("trace_id = %#v, want %q", payload["trace_id"], event.TraceID)
 	}
-	if _, ok := payload["send_at"]; !ok {
-		t.Fatal("expected send_at field")
+	if got := int64(payload["send_at"].(float64)); got != sendAt {
+		t.Fatalf("send_at = %d, want %d", got, sendAt)
 	}
 	if got, ok := payload["is_replayed"].(bool); !ok || !got {
 		t.Fatalf("is_replayed = %#v, want true", payload["is_replayed"])
@@ -61,5 +62,29 @@ func TestRuleFormatUsesTimeAsCollectedAtAndAddsSendAt(t *testing.T) {
 	}
 	if _, ok := payload["collectedAt"]; ok {
 		t.Fatal("did not expect collectedAt field in rule payload")
+	}
+}
+
+func TestCompactFormatIncludesReplayMetadata(t *testing.T) {
+	publisher := &MQTTPublisher{telemetry: TopicConfig{DataFormat: "compact"}}
+	event := outevent.TelemetryEvent{
+		TraceID:     "trace-compact",
+		DeviceName:  "device-01",
+		CollectedAt: 1710000000000,
+	}
+	const sendAt int64 = 1710000001234
+	body, err := publisher.formatTelemetryAt(event, map[string]interface{}{"count": 3}, true, sendAt)
+	if err != nil {
+		t.Fatalf("formatTelemetryAt() error = %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if replayed, ok := payload["is_replayed"].(bool); !ok || !replayed {
+		t.Fatalf("is_replayed = %#v, want true", payload["is_replayed"])
+	}
+	if got := int64(payload["send_at"].(float64)); got != sendAt {
+		t.Fatalf("send_at = %d, want %d", got, sendAt)
 	}
 }

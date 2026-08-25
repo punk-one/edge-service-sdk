@@ -57,12 +57,18 @@ func (p *MQTTPublisher) PublishTelemetry(device contracts.DeviceConfig, data map
 }
 
 func (p *MQTTPublisher) PublishTelemetryEvent(event outevent.TelemetryEvent, replayed bool) error {
+	return p.PublishTelemetryEventAt(event, replayed, time.Now().UnixMilli())
+}
+
+// PublishTelemetryEventAt publishes telemetry with an outbox-selected send_at
+// so the persisted attempt metadata and public MQTT envelope match exactly.
+func (p *MQTTPublisher) PublishTelemetryEventAt(event outevent.TelemetryEvent, replayed bool, sendAt int64) error {
 	data, err := event.DataMap()
 	if err != nil {
 		return err
 	}
 
-	body, err := p.formatTelemetry(event, data, replayed)
+	body, err := p.formatTelemetryAt(event, data, replayed, sendAt)
 	if err != nil {
 		return err
 	}
@@ -212,12 +218,26 @@ func (p *MQTTPublisher) HealthCheck() error {
 	return p.client.HealthCheck()
 }
 
+// RegisterOnConnect exposes MQTT reconnect notifications to durable outboxes.
+func (p *MQTTPublisher) RegisterOnConnect(hook func()) {
+	if p == nil || p.client == nil || hook == nil {
+		return
+	}
+	p.client.RegisterOnConnect(hook)
+}
+
 func (p *MQTTPublisher) Close() error {
 	return p.client.Close()
 }
 
 func (p *MQTTPublisher) formatTelemetry(event outevent.TelemetryEvent, data map[string]interface{}, replayed bool) ([]byte, error) {
-	sendAt := time.Now().UnixMilli()
+	return p.formatTelemetryAt(event, data, replayed, time.Now().UnixMilli())
+}
+
+func (p *MQTTPublisher) formatTelemetryAt(event outevent.TelemetryEvent, data map[string]interface{}, replayed bool, sendAt int64) ([]byte, error) {
+	if sendAt <= 0 {
+		sendAt = time.Now().UnixMilli()
+	}
 	sourceName := strings.TrimSpace(event.SourceName)
 	if sourceName == "" {
 		sourceName = "telemetry"
@@ -311,6 +331,7 @@ func (p *MQTTPublisher) convertToCompactFormat(event outevent.TelemetryEvent, da
 		"trace_id":       event.TraceID,
 		"time":           event.CollectedAt,
 		"send_at":        sendAt,
+		"is_replayed":    replayed,
 		event.DeviceName: deviceData,
 	})
 }

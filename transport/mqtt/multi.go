@@ -105,6 +105,17 @@ func (m *multiPublisher) PublishTelemetryEvent(event outevent.TelemetryEvent, re
 	return lastErr
 }
 
+func (m *multiPublisher) PublishTelemetryEventAt(event outevent.TelemetryEvent, replayed bool, sendAt int64) error {
+	var lastErr error
+	for _, g := range m.groups {
+		if err := g.PublishTelemetryEventAt(event, replayed, sendAt); err != nil {
+			m.logger.Warnf("[mqtt] group %s: PublishTelemetryEventAt failed: %v", g.name, err)
+			lastErr = err
+		}
+	}
+	return lastErr
+}
+
 func firstTopic(topics []TopicConfig) TopicConfig {
 	if len(topics) == 0 {
 		return TopicConfig{}
@@ -204,6 +215,15 @@ func (m *multiPublisher) HealthCheck() error {
 	return nil
 }
 
+func (m *multiPublisher) RegisterOnConnect(hook func()) {
+	if hook == nil {
+		return
+	}
+	for _, group := range m.groups {
+		group.RegisterOnConnect(hook)
+	}
+}
+
 func (m *multiPublisher) Close() error {
 	var lastErr error
 	for _, g := range m.groups {
@@ -266,6 +286,7 @@ type groupPublisher struct {
 	active        *MQTTPublisher
 	activeIndex   int
 	subscriptions []subscriptionRecord
+	connectHooks  []func()
 	stopCh        chan struct{}
 	started       bool
 }
@@ -315,7 +336,7 @@ func (g *groupPublisher) activateSingle() {
 	g.mu.Unlock()
 
 	p := NewMQTTPublisher(cfg, g.telemetry, g.propertyResult, g.propertyReport, g.commandResult, g.statusReport, g.logger, g.eventReport)
-	p.setObserver(g.observer)
+	g.preparePublisher(p)
 
 	g.mu.Lock()
 	old := g.active
@@ -344,7 +365,7 @@ func (g *groupPublisher) activateFailover() {
 
 	for i := 0; i < len(brokers); i++ {
 		p := NewMQTTPublisher(brokers[i], g.telemetry, g.propertyResult, g.propertyReport, g.commandResult, g.statusReport, g.logger, g.eventReport)
-		p.setObserver(g.observer)
+		g.preparePublisher(p)
 		if err := p.HealthCheck(); err != nil {
 			g.logger.Warnf("[mqtt] group %s: broker[%d] %s initial health check failed: %v", g.name, i, brokers[i].URL, err)
 			p.Close()
@@ -432,7 +453,7 @@ func (g *groupPublisher) switchToNext() {
 			cfg := brokers[nextIdx]
 
 			p := NewMQTTPublisher(cfg, g.telemetry, g.propertyResult, g.propertyReport, g.commandResult, g.statusReport, g.logger, g.eventReport)
-			p.setObserver(g.observer)
+			g.preparePublisher(p)
 			if err := p.HealthCheck(); err != nil {
 				g.logger.Warnf("[mqtt] group %s: broker[%d] %s health check failed: %v", g.name, nextIdx, cfg.URL, err)
 				p.Close()
@@ -506,6 +527,13 @@ func (g *groupPublisher) PublishTelemetryEvent(event outevent.TelemetryEvent, re
 	return fmt.Errorf("group %s: no active publisher", g.name)
 }
 
+func (g *groupPublisher) PublishTelemetryEventAt(event outevent.TelemetryEvent, replayed bool, sendAt int64) error {
+	if p := g.getActive(); p != nil {
+		return p.PublishTelemetryEventAt(event, replayed, sendAt)
+	}
+	return fmt.Errorf("group %s: no active publisher", g.name)
+}
+
 func (g *groupPublisher) PublishEvent(event events.Event, replayed bool) error {
 	if p := g.getActive(); p != nil {
 		return p.PublishEvent(event, replayed)
@@ -564,6 +592,30 @@ func (g *groupPublisher) HealthCheck() error {
 		return p.HealthCheck()
 	}
 	return fmt.Errorf("group %s: no active publisher", g.name)
+}
+
+func (g *groupPublisher) RegisterOnConnect(hook func()) {
+	if hook == nil {
+		return
+	}
+	g.mu.Lock()
+	g.connectHooks = append(g.connectHooks, hook)
+	active := g.active
+	g.mu.Unlock()
+	if active != nil {
+		active.RegisterOnConnect(hook)
+	}
+}
+
+func (g *groupPublisher) preparePublisher(p *MQTTPublisher) {
+	g.mu.RLock()
+	observer := g.observer
+	hooks := append([]func(){}, g.connectHooks...)
+	g.mu.RUnlock()
+	p.setObserver(observer)
+	for _, hook := range hooks {
+		p.RegisterOnConnect(hook)
+	}
 }
 
 func (g *groupPublisher) Close() error {

@@ -17,9 +17,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// EventTransport is implemented by the SDK MQTT publisher. It is separate
-// from TelemetryTransport so event buffering never inherits telemetry's
-// latest-only behavior.
+// EventTransport is implemented by the SDK MQTT publisher. EVENT keeps its
+// own runtime.db outbox and lifecycle independently of telemetry delivery.
 type EventTransport interface {
 	PublishEvent(event events.Event, replayed bool) error
 }
@@ -32,7 +31,7 @@ type EventQueueStats struct {
 }
 
 type EventDispatcher struct {
-	cfg       Config
+	cfg       EventOutboxConfig
 	logger    logger.LoggingClient
 	transport EventTransport
 	store     *eventSQLiteStore
@@ -70,13 +69,13 @@ type eventSQLiteStore struct {
 }
 
 // NewEventDispatcher creates an event-specific durable dispatcher. It uses a
-// separate SQLite table and never applies telemetry keepLatestOnly semantics.
-func NewEventDispatcher(cfg Config, transport EventTransport, logClient logger.LoggingClient) (*EventDispatcher, error) {
+// separate SQLite table and lifecycle from the telemetry outbox.
+func NewEventDispatcher(cfg EventOutboxConfig, transport EventTransport, logClient logger.LoggingClient) (*EventDispatcher, error) {
 	if transport == nil {
 		return nil, fmt.Errorf("event transport is nil")
 	}
 	dispatcher := &EventDispatcher{
-		cfg:       normalizeConfig(cfg),
+		cfg:       normalizeEventOutboxConfig(cfg),
 		logger:    logClient,
 		transport: transport,
 		enabled:   cfg.Enabled,
@@ -276,6 +275,43 @@ func (d *EventDispatcher) consumeReplayToken() {
 	if d.replayTokens >= 1 {
 		d.replayTokens--
 	}
+}
+
+func normalizeEventOutboxConfig(cfg EventOutboxConfig) EventOutboxConfig {
+	if strings.TrimSpace(cfg.SQLitePath) == "" {
+		cfg.SQLitePath = "./data/runtime.db"
+	}
+	if cfg.BatchSize <= 0 {
+		cfg.BatchSize = 100
+	}
+	if cfg.ReplayIntervalMs <= 0 {
+		cfg.ReplayIntervalMs = 3_000
+	}
+	if cfg.ReplayRatePerSec <= 0 {
+		cfg.ReplayRatePerSec = 20
+	}
+	return cfg
+}
+
+func (c EventOutboxConfig) batchSize() int {
+	if c.BatchSize > 0 {
+		return c.BatchSize
+	}
+	return 100
+}
+
+func (c EventOutboxConfig) replayInterval() time.Duration {
+	if c.ReplayIntervalMs > 0 {
+		return time.Duration(c.ReplayIntervalMs) * time.Millisecond
+	}
+	return 3 * time.Second
+}
+
+func (c EventOutboxConfig) replayRatePerSec() int {
+	if c.ReplayRatePerSec > 0 {
+		return c.ReplayRatePerSec
+	}
+	return 20
 }
 
 func newEventSQLiteStore(path string) (*eventSQLiteStore, error) {

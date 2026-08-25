@@ -120,7 +120,6 @@ type PointConfig struct {
 	Deadband          float64 `yaml:"deadband"`
 	DeadbandPercent   float64 `yaml:"deadbandPercent"`
 	HeartbeatInterval string  `yaml:"heartbeatInterval"`
-	KeepLatestOnly    bool    `yaml:"keepLatestOnly"`
 }
 
 // PropertyStruct describes a structured property collection such as wheels[1..450].

@@ -43,8 +43,9 @@ type DeviceServiceSDK interface {
 	// LoggingClient returns the logging client
 	LoggingClient() logger.LoggingClient
 
-	// AsyncValuesChannel returns the async values channel
-	AsyncValuesChannel() chan<- *AsyncValues
+	// ReportAsyncValues synchronously hands telemetry to the SDK acceptance
+	// path. A nil error means the report has been committed to SQLite.
+	ReportAsyncValues(values *AsyncValues) error
 
 	// Devices returns the list of devices
 	Devices() []Device

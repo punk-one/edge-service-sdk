@@ -607,7 +607,6 @@ func pointViews(points []contracts.PointConfig) []map[string]interface{} {
 			"deadband":           point.Deadband,
 			"deadband_percent":   point.DeadbandPercent,
 			"heartbeat_interval": point.HeartbeatInterval,
-			"keep_latest_only":   point.KeepLatestOnly,
 		})
 	}
 	return items

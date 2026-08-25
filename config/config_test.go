@@ -4,6 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	reliable "github.com/punk-one/edge-service-sdk/telemetry/reliable"
+	mqtt "github.com/punk-one/edge-service-sdk/transport/mqtt"
 )
 
 func TestLoadConfigParsesLowerCamelCaseConfig(t *testing.T) {
@@ -59,16 +62,13 @@ mqtt:
   privateKeyPath: ""
   qos: 0
   retain: false
-reliableQueue:
-  enabled: true
-  sqlitePath: "./data/runtime.db"
-  memoryQueueSize: 2048
-  batchSize: 100
-  flushIntervalMs: 1000
-  replayIntervalMs: 3000
-  replayRatePerSec: 20
+telemetryOutbox:
+  sqlitePath: "./data/telemetry-outbox.db"
   retentionDays: 7
-  keepLatestOnly: false
+  sendBatchSize: 100
+  maxSendRatePerSec: 100
+  retryInitialMs: 1000
+  retryMaxMs: 30000
 device:
   profilesDir: "` + filepath.ToSlash(profilesDir) + `"
   devicesDir: "` + filepath.ToSlash(devicesDir) + `"
@@ -115,8 +115,8 @@ statusReport:
 	if config.MQTT.KeepAliveSec != 60 {
 		t.Fatalf("unexpected mqtt config: %#v", config.MQTT)
 	}
-	if config.Storage.SQLitePath != "./data/runtime.db" || config.ReliableQueue.SQLitePath != "./data/runtime.db" {
-		t.Fatalf("unexpected sqlite config: storage=%#v reliable=%#v", config.Storage, config.ReliableQueue)
+	if config.Storage.SQLitePath != filepath.FromSlash("./data/runtime.db") || config.TelemetryOutbox.SQLitePath != filepath.FromSlash("./data/telemetry-outbox.db") {
+		t.Fatalf("unexpected sqlite config: storage=%#v telemetryOutbox=%#v", config.Storage, config.TelemetryOutbox)
 	}
 	if config.Auth.AccessTokenTTLMin != 10 || config.Auth.KeyFile != "./data/auth.key" {
 		t.Fatalf("unexpected auth config: %#v", config.Auth)
@@ -139,5 +139,43 @@ func TestNormalizeConfigSetsDefaultStatusHeartbeatInterval(t *testing.T) {
 	config := NormalizeConfig(Config{})
 	if config.StatusReport.HeartbeatInterval != "30s" {
 		t.Fatalf("unexpected default status heartbeat interval: %#v", config.StatusReport)
+	}
+}
+
+func TestLoadMainConfigUsesTelemetryOutboxDefaults(t *testing.T) {
+	config, err := loadMainConfig(filepath.Join(t.TempDir(), "missing-config.yaml"))
+	if err != nil {
+		t.Fatalf("loadMainConfig() error = %v", err)
+	}
+	want := reliable.DefaultTelemetryOutboxConfig()
+	want.SQLitePath = filepath.FromSlash(want.SQLitePath)
+	if config.TelemetryOutbox != want {
+		t.Fatalf("telemetryOutbox defaults = %#v, want %#v", config.TelemetryOutbox, want)
+	}
+	if config.TelemetryReport.QoS != 1 {
+		t.Fatalf("default telemetry QoS = %d, want 1", config.TelemetryReport.QoS)
+	}
+}
+
+func TestLoadConfigRejectsReliableQueue(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("reliableQueue:\n  retentionDays: 7\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if _, err := LoadConfig(configPath); err == nil {
+		t.Fatal("LoadConfig() accepted removed reliableQueue configuration")
+	}
+}
+
+func TestValidateConfigRequiresIndependentTelemetryDatabase(t *testing.T) {
+	config := NormalizeConfig(Config{
+		Storage:         StorageConfig{SQLitePath: "./data/runtime.db"},
+		TelemetryOutbox: reliable.DefaultTelemetryOutboxConfig(),
+		TelemetryReport: mqtt.TopicConfig{Topic: "telemetry"},
+	})
+	config.TelemetryOutbox.SQLitePath = config.Storage.SQLitePath
+	if err := ValidateConfig(config); err == nil {
+		t.Fatal("ValidateConfig() accepted shared runtime and telemetry database")
 	}
 }

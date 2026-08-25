@@ -109,12 +109,10 @@ func TestEventSQLiteStorePreservesOrderAndInternalMetadata(t *testing.T) {
 
 func TestEventDispatcherPersistsOfflineEventsImmediatelyAndReplaysThem(t *testing.T) {
 	transport := &eventTransportStub{failing: true}
-	dispatcher, err := NewEventDispatcher(Config{
+	dispatcher, err := NewEventDispatcher(EventOutboxConfig{
 		Enabled:          true,
 		SQLitePath:       filepath.Join(t.TempDir(), "events.db"),
-		MemoryQueueSize:  1,
 		BatchSize:        1,
-		FlushIntervalMs:  5,
 		ReplayIntervalMs: 10,
 		ReplayRatePerSec: 100,
 		RetentionDays:    0,
@@ -151,7 +149,7 @@ func TestEventDispatcherPersistsOfflineEventsImmediatelyAndReplaysThem(t *testin
 func TestEventDispatcherAcksSuccessfulPublish(t *testing.T) {
 	transport := &eventTransportStub{}
 	path := filepath.Join(t.TempDir(), "events.db")
-	dispatcher, err := NewEventDispatcher(Config{
+	dispatcher, err := NewEventDispatcher(EventOutboxConfig{
 		Enabled:          true,
 		SQLitePath:       path,
 		BatchSize:        1,
@@ -188,12 +186,10 @@ func TestEventDispatcherAcksSuccessfulPublish(t *testing.T) {
 func TestEventDispatcherCloseKeepsUnpublishedOutbox(t *testing.T) {
 	transport := &eventTransportStub{failing: true}
 	path := filepath.Join(t.TempDir(), "events.db")
-	dispatcher, err := NewEventDispatcher(Config{
+	dispatcher, err := NewEventDispatcher(EventOutboxConfig{
 		Enabled:          true,
 		SQLitePath:       path,
-		MemoryQueueSize:  8,
 		BatchSize:        100,
-		FlushIntervalMs:  1_000,
 		ReplayIntervalMs: 1_000,
 		ReplayRatePerSec: 1,
 	}, transport, nil)

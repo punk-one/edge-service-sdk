@@ -2,6 +2,19 @@
 
 ## v0.9.2
 
+- Replaced the telemetry realtime/fallback split with one SQLite-first
+  `telemetry_outbox`: every telemetry report that passes collection filtering
+  is committed before MQTT and deleted only after a successful send.
+- Removed the process-memory `AsyncValuesChannel`; drivers now use synchronous
+  `ReportAsyncValues`, whose successful return means SQLite commit completed.
+- Added independent `telemetryOutbox` configuration and the default
+  `./data/telemetry-outbox.db`; the removed `reliableQueue` configuration and
+  legacy `reliable_queue` rows are intentionally not accepted or migrated.
+- Network recovery now drains the recovery backlog in `time, id` order before
+  post-recovery telemetry. Telemetry payloads preserve collection `time` and
+  publish `send_at` plus `is_replayed`; pending startup/failure rows are replayed.
+- Added configurable 7-day retention, batch size, send-rate limit, and bounded
+  retry backoff. The default telemetry MQTT QoS is now 1.
 - EVENT payload uses the existing `data.event_code` and `data.type` fields.
 - Added required lifecycle fields: `raise` is `phase=start, status=active`,
   `clear` is `phase=end, status=resolved`, and `pulse` is
@@ -12,7 +25,7 @@
   is persisted before MQTT delivery and removed only after a successful send.
   The legacy event queue is not migrated.
 - Added signal-driven graceful shutdown for driver, EVENT state/outbox,
-  telemetry queue, and MQTT resources.
+  telemetry outbox, and MQTT resources.
 
 ## v0.9.1
 

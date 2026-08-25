@@ -166,22 +166,22 @@ func TestHandleRuntimeStatusUsesSnakeCaseFields(t *testing.T) {
 	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/v1/runtime/status", nil)
 
 	server := New(Config{
-		ServiceName:          "device-s7",
-		Version:              "1.0.0",
-		ServiceType:          "sensor",
-		Host:                 "localhost",
-		Port:                 59994,
-		StartupMsg:           "S7 device service started",
-		StartedAt:            time.Unix(1710000000, 0),
-		DeviceCount:          1,
-		TelemetryWorkerCount: 2,
-		ReliableQueueEnabled: true,
-		QueueStats: func() (reliable.QueueStats, error) {
-			return reliable.QueueStats{
-				BufferDepth:        3,
+		ServiceName:            "device-s7",
+		Version:                "1.0.0",
+		ServiceType:            "sensor",
+		Host:                   "localhost",
+		Port:                   59994,
+		StartupMsg:             "S7 device service started",
+		StartedAt:              time.Unix(1710000000, 0),
+		DeviceCount:            1,
+		TelemetryWorkerCount:   2,
+		TelemetryOutboxEnabled: true,
+		TelemetryOutboxStats: func() (reliable.TelemetryOutboxStats, error) {
+			return reliable.TelemetryOutboxStats{
+				PendingCount:       3,
 				OldestPendingAgeMs: 1200,
-				ReplayRatePerSec:   5,
-				LastReplayAt:       1710000000000,
+				SendRatePerSec:     5,
+				LastSendAt:         1710000000000,
 			}, nil
 		},
 		DeviceStates: func() []rtstatus.DeviceState {
@@ -222,8 +222,8 @@ func TestHandleRuntimeStatusUsesSnakeCaseFields(t *testing.T) {
 	if _, ok := runtimeBody["telemetry_worker_count"]; !ok {
 		t.Fatalf("expected runtime.telemetry_worker_count in payload: %#v", runtimeBody)
 	}
-	if _, ok := runtimeBody["reliable_queue"]; !ok {
-		t.Fatalf("expected runtime.reliable_queue in payload: %#v", runtimeBody)
+	if _, ok := runtimeBody["telemetry_outbox"]; !ok {
+		t.Fatalf("expected runtime.telemetry_outbox in payload: %#v", runtimeBody)
 	}
 	if _, ok := runtimeBody["deviceCount"]; ok {
 		t.Fatalf("did not expect runtime.deviceCount in payload: %#v", runtimeBody)
@@ -231,8 +231,11 @@ func TestHandleRuntimeStatusUsesSnakeCaseFields(t *testing.T) {
 	if _, ok := runtimeBody["telemetryWorkerCount"]; ok {
 		t.Fatalf("did not expect runtime.telemetryWorkerCount in payload: %#v", runtimeBody)
 	}
-	if _, ok := runtimeBody["reliableQueue"]; ok {
-		t.Fatalf("did not expect runtime.reliableQueue in payload: %#v", runtimeBody)
+	if _, ok := runtimeBody["telemetryOutbox"]; ok {
+		t.Fatalf("did not expect runtime.telemetryOutbox in payload: %#v", runtimeBody)
+	}
+	if _, ok := runtimeBody["reliable_queue"]; ok {
+		t.Fatalf("did not expect removed runtime.reliable_queue in payload: %#v", runtimeBody)
 	}
 
 	devices, ok := payload["devices"].([]interface{})

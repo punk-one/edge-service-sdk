@@ -27,8 +27,8 @@ import (
 // ReadinessFunc checks whether the runtime is ready to serve.
 type ReadinessFunc func() error
 
-// QueueStatsFunc retrieves reliable queue runtime metrics.
-type QueueStatsFunc func() (reliable.QueueStats, error)
+// TelemetryOutboxStatsFunc retrieves durable telemetry runtime metrics.
+type TelemetryOutboxStatsFunc func() (reliable.TelemetryOutboxStats, error)
 
 // DeviceStatesFunc returns the current device states.
 type DeviceStatesFunc func() []rtstatus.DeviceState
@@ -96,9 +96,9 @@ type Config struct {
 	StartedAt                  time.Time
 	DeviceCount                int
 	TelemetryWorkerCount       int
-	ReliableQueueEnabled       bool
+	TelemetryOutboxEnabled     bool
 	Readiness                  ReadinessFunc
-	QueueStats                 QueueStatsFunc
+	TelemetryOutboxStats       TelemetryOutboxStatsFunc
 	DeviceStates               DeviceStatesFunc
 	AuthService                *rtauth.Service
 	PropertyGet                PropertyGetFunc
@@ -292,7 +292,7 @@ func (s *Server) handleReady(c *gin.Context) {
 
 func (s *Server) handleRuntimeStatus(c *gin.Context) {
 	ready, readyErr := s.readyState()
-	queueStats, queueErr := s.queueStats()
+	outboxStats, outboxErr := s.telemetryOutboxStats()
 	credentialInfo := gin.H{"initialized": false}
 	if s.cfg.AuthService != nil {
 		if info, err := s.cfg.AuthService.CredentialInfo(); err == nil {
@@ -330,18 +330,18 @@ func (s *Server) handleRuntimeStatus(c *gin.Context) {
 		response["runtime"].(gin.H)["error"] = readyErr.Error()
 	}
 
-	queueBody := gin.H{
-		"enabled": s.cfg.ReliableQueueEnabled,
+	outboxBody := gin.H{
+		"enabled": s.cfg.TelemetryOutboxEnabled,
 	}
-	if queueErr != nil {
-		queueBody["error"] = queueErr.Error()
+	if outboxErr != nil {
+		outboxBody["error"] = outboxErr.Error()
 	} else {
-		queueBody["buffer_depth"] = queueStats.BufferDepth
-		queueBody["oldest_pending_age_ms"] = queueStats.OldestPendingAgeMs
-		queueBody["replay_rate_per_sec"] = queueStats.ReplayRatePerSec
-		queueBody["last_replay_at"] = millisToRFC3339(queueStats.LastReplayAt)
+		outboxBody["pending_count"] = outboxStats.PendingCount
+		outboxBody["oldest_pending_age_ms"] = outboxStats.OldestPendingAgeMs
+		outboxBody["send_rate_per_sec"] = outboxStats.SendRatePerSec
+		outboxBody["last_send_at"] = millisToRFC3339(outboxStats.LastSendAt)
 	}
-	response["runtime"].(gin.H)["reliable_queue"] = queueBody
+	response["runtime"].(gin.H)["telemetry_outbox"] = outboxBody
 
 	statusCode := http.StatusOK
 	if !ready {
@@ -959,11 +959,11 @@ func (s *Server) readyState() (bool, error) {
 	return true, nil
 }
 
-func (s *Server) queueStats() (reliable.QueueStats, error) {
-	if s == nil || s.cfg.QueueStats == nil {
-		return reliable.QueueStats{}, nil
+func (s *Server) telemetryOutboxStats() (reliable.TelemetryOutboxStats, error) {
+	if s == nil || s.cfg.TelemetryOutboxStats == nil {
+		return reliable.TelemetryOutboxStats{}, nil
 	}
-	return s.cfg.QueueStats()
+	return s.cfg.TelemetryOutboxStats()
 }
 
 func (s *Server) deviceStates() []gin.H {

@@ -17,28 +17,28 @@ import (
 
 // Config represents the application configuration.
 type Config struct {
-	Logging         logger.Config            `yaml:"logging"`
-	Service         ServiceConfig            `yaml:"service"`
-	Storage         StorageConfig            `yaml:"storage"`
-	Auth            AuthConfig               `yaml:"auth"`
-	MQTT            mqtt.MQTTConfig          `yaml:"mqtt"`
-	ReliableQueue   reliable.Config          `yaml:"reliableQueue"`
-	Device          DeviceConfig             `yaml:"device"`
-	TelemetryReport mqtt.TopicConfig         `yaml:"telemetryReport"`
-	PropertySet     mqtt.TopicConfig         `yaml:"propertySet"`
-	PropertyGet     mqtt.TopicConfig         `yaml:"propertyGet"`
-	PropertyResult  mqtt.TopicConfig         `yaml:"propertyResult"`
-	PropertyReport  mqtt.TopicConfig         `yaml:"propertyReport"`
-	CommandCall     mqtt.TopicConfig         `yaml:"commandCall"`
-	CommandResult   mqtt.TopicConfig         `yaml:"commandResult"`
-	QueryRequest    mqtt.TopicConfig         `yaml:"queryRequest"`
-	QueryResult     mqtt.TopicConfig         `yaml:"queryResult"`
-	StatusReport    mqtt.TopicConfig         `yaml:"statusReport"`
-	EventReport     mqtt.TopicConfig         `yaml:"eventReport"`
-	ControlStore    ControlStoreConfig       `yaml:"controlStore"`
-	NATSBus         NATSBusConfig            `yaml:"natsBus"`
-	Devices         []contracts.DeviceConfig `yaml:"deviceList"`
-	LogLevel        string                   `yaml:"logLevel"`
+	Logging         logger.Config                  `yaml:"logging"`
+	Service         ServiceConfig                  `yaml:"service"`
+	Storage         StorageConfig                  `yaml:"storage"`
+	Auth            AuthConfig                     `yaml:"auth"`
+	MQTT            mqtt.MQTTConfig                `yaml:"mqtt"`
+	TelemetryOutbox reliable.TelemetryOutboxConfig `yaml:"telemetryOutbox"`
+	Device          DeviceConfig                   `yaml:"device"`
+	TelemetryReport mqtt.TopicConfig               `yaml:"telemetryReport"`
+	PropertySet     mqtt.TopicConfig               `yaml:"propertySet"`
+	PropertyGet     mqtt.TopicConfig               `yaml:"propertyGet"`
+	PropertyResult  mqtt.TopicConfig               `yaml:"propertyResult"`
+	PropertyReport  mqtt.TopicConfig               `yaml:"propertyReport"`
+	CommandCall     mqtt.TopicConfig               `yaml:"commandCall"`
+	CommandResult   mqtt.TopicConfig               `yaml:"commandResult"`
+	QueryRequest    mqtt.TopicConfig               `yaml:"queryRequest"`
+	QueryResult     mqtt.TopicConfig               `yaml:"queryResult"`
+	StatusReport    mqtt.TopicConfig               `yaml:"statusReport"`
+	EventReport     mqtt.TopicConfig               `yaml:"eventReport"`
+	ControlStore    ControlStoreConfig             `yaml:"controlStore"`
+	NATSBus         NATSBusConfig                  `yaml:"natsBus"`
+	Devices         []contracts.DeviceConfig       `yaml:"deviceList"`
+	LogLevel        string                         `yaml:"logLevel"`
 }
 
 // NATSBusConfig controls the optional embedded JetStream server. Subjects and the
@@ -146,17 +146,7 @@ func loadMainConfig(configPath string) (Config, error) {
 			// they explicitly opt in.
 			EventDir: "",
 		},
-		ReliableQueue: reliable.Config{
-			Enabled:          true,
-			SQLitePath:       "./data/runtime.db",
-			MemoryQueueSize:  2048,
-			BatchSize:        100,
-			FlushIntervalMs:  1000,
-			ReplayIntervalMs: 3000,
-			ReplayRatePerSec: 20,
-			RetentionDays:    7,
-			KeepLatestOnly:   false,
-		},
+		TelemetryOutbox: reliable.DefaultTelemetryOutboxConfig(),
 		MQTT: mqtt.MQTTConfig{
 			CAPath:                  "",
 			CertPath:                "",
@@ -176,7 +166,7 @@ func loadMainConfig(configPath string) (Config, error) {
 		},
 		TelemetryReport: mqtt.TopicConfig{
 			Topic:      "v1/gateway/{productCode}/telemetry/report",
-			QoS:        0,
+			QoS:        1,
 			Retain:     false,
 			DataFormat: "rule",
 		},
@@ -238,12 +228,23 @@ func loadMainConfig(configPath string) (Config, error) {
 		if err != nil {
 			return config, fmt.Errorf("failed to read config file: %v", err)
 		}
+		var raw map[string]interface{}
+		if err := yaml.Unmarshal(data, &raw); err != nil {
+			return config, fmt.Errorf("failed to parse config file: %v", err)
+		}
+		if _, exists := raw["reliableQueue"]; exists {
+			return config, fmt.Errorf("unsupported configuration %q; use %q", "reliableQueue", "telemetryOutbox")
+		}
 		if err := yaml.Unmarshal(data, &config); err != nil {
 			return config, fmt.Errorf("failed to parse config file: %v", err)
 		}
 	}
 
-	return NormalizeConfig(config), nil
+	config = NormalizeConfig(config)
+	if err := ValidateConfig(config); err != nil {
+		return config, err
+	}
+	return config, nil
 }
 
 func loadDeviceConfigs(devicesDir string) ([]contracts.DeviceConfig, error) {
@@ -410,13 +411,11 @@ func NormalizeConfig(config Config) Config {
 		config.StatusReport.HeartbeatInterval = "30s"
 	}
 	if strings.TrimSpace(config.Storage.SQLitePath) == "" {
-		if strings.TrimSpace(config.ReliableQueue.SQLitePath) != "" {
-			config.Storage.SQLitePath = config.ReliableQueue.SQLitePath
-		} else {
-			config.Storage.SQLitePath = "./data/runtime.db"
-		}
+		config.Storage.SQLitePath = "./data/runtime.db"
 	}
-	config.ReliableQueue.SQLitePath = config.Storage.SQLitePath
+	config.Storage.SQLitePath = filepath.FromSlash(config.Storage.SQLitePath)
+	config.TelemetryOutbox = reliable.NormalizeTelemetryOutboxConfig(config.TelemetryOutbox)
+	config.TelemetryOutbox.SQLitePath = filepath.FromSlash(config.TelemetryOutbox.SQLitePath)
 	if strings.TrimSpace(config.ControlStore.SQLitePath) == "" {
 		config.ControlStore.SQLitePath = config.Storage.SQLitePath
 	}
@@ -430,6 +429,29 @@ func NormalizeConfig(config Config) Config {
 		config.Auth.KeyFile = "./data/auth.key"
 	}
 	return config
+}
+
+// ValidateConfig checks invariants that cannot be represented by YAML types.
+func ValidateConfig(config Config) error {
+	outbox := config.TelemetryOutbox
+	if err := reliable.ValidateTelemetryOutboxConfig(outbox); err != nil {
+		return err
+	}
+	if strings.TrimSpace(config.TelemetryReport.Topic) == "" {
+		return nil
+	}
+	runtimePath, err := filepath.Abs(filepath.Clean(config.Storage.SQLitePath))
+	if err != nil {
+		return fmt.Errorf("resolve storage.sqlitePath: %w", err)
+	}
+	outboxPath, err := filepath.Abs(filepath.Clean(outbox.SQLitePath))
+	if err != nil {
+		return fmt.Errorf("resolve telemetryOutbox.sqlitePath: %w", err)
+	}
+	if strings.EqualFold(runtimePath, outboxPath) {
+		return fmt.Errorf("telemetryOutbox.sqlitePath must use a database file separate from storage.sqlitePath")
+	}
+	return nil
 }
 
 func normalizeConfig(config Config) Config {

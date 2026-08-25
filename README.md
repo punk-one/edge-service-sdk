@@ -10,7 +10,7 @@ It extracts the common runtime, control, and transport capabilities out of proto
 - auth bootstrap, token issuance, credential query, and protected request verification
 - ops HTTP runtime endpoints for health, readiness, runtime status, model query, and control tracing
 - device status tracking and optional MQTT status reporting
-- telemetry event normalization and reliable replay via SQLite
+- telemetry event normalization and a SQLite-first durable telemetry outbox
 - built-in EVENT engine for connection, OEE, alarm, fault, pulse and rise-clear rules
 - event profile loading from `device.eventDir`, device-level `eventProfile` binding, state persistence, summary windows, and a separate durable event outbox
 - MQTT lifecycle management with explicit reconnect, subscription recovery, and health checks
@@ -21,6 +21,12 @@ It extracts the common runtime, control, and transport capabilities out of proto
 
 ## What's New In v0.9.2
 
+- **Single telemetry outbox path** — every telemetry report that passes the
+  configured collection filter is committed to a dedicated SQLite database
+  before MQTT delivery. Recovery rows are drained before newly collected rows.
+- **Stable delivery metadata** — telemetry uses collection `time`, exact
+  attempt `send_at`, and boolean `is_replayed`; dynamic point data is retained
+  as JSON. The removed `reliableQueue` config and old cache are not migrated.
 - **EVENT payload fields** — the existing `data.event_code` and `data.type`
   fields remain the wire identifiers for event code and lifecycle action.
 - **Explicit EVENT lifecycle** — `raise` emits `phase=start,
@@ -30,7 +36,7 @@ It extracts the common runtime, control, and transport capabilities out of proto
   MQTT delivery and acknowledged only after a successful send. The old event
   queue is intentionally not migrated.
 - **Graceful shutdown** — process signals stop the driver, flush EVENT state,
-  close the event outbox and telemetry queue, and then close MQTT.
+  close the event outbox and telemetry outbox, and then close MQTT.
 
 ## What's New In v0.9.1
 
@@ -68,6 +74,42 @@ state separately from the durable event outbox, preserves the original event
 `is_replayed`. EVENT profiles do not contain middleware pipelines or MQTT
 connection settings. The v0.9.2 wire contract keeps `event_code` and `type`,
 and does not migrate the legacy SQLite event queue.
+
+## Telemetry Outbox Configuration
+
+Telemetry is persisted after `onChange`, deadband, watched-field, and heartbeat
+filtering. Therefore `onChange: false` persists every due report, while
+`onChange: true` persists only reports selected by that filter strategy. There
+is no direct MQTT bypass: SQLite commit is the telemetry acceptance boundary.
+Protocol drivers use `ReportAsyncValues`; its nil return confirms that commit,
+so the SDK no longer exposes a process-memory telemetry channel.
+
+```yaml
+telemetryOutbox:
+  sqlitePath: "./data/telemetry-outbox.db"
+  retentionDays: 7
+  sendBatchSize: 100
+  maxSendRatePerSec: 100
+  retryInitialMs: 1000
+  retryMaxMs: 30000
+
+telemetryReport:
+  topic: "v1/gateway/{productCode}/telemetry/report"
+  qos: 1
+```
+
+The outbox database must be different from `storage.sqlitePath`. Dynamic
+telemetry points are stored in a JSON column, so each report may have a
+different `data` shape. Pending rows are selected by `time, id`; after startup
+or network recovery, an ID cutoff keeps the recovery backlog ahead of records
+collected after recovery. `time` never changes, `send_at` is the exact current
+MQTT attempt time, and `is_replayed` is true for startup, offline, and failed
+delivery rows. A new online row waiting behind recovery data remains false.
+
+The outbox is at-least-once: a crash after MQTT acceptance but before SQLite
+acknowledgement can produce a duplicate, so consumers should deduplicate by
+`trace_id`. QoS 1 is the default. The old `reliableQueue` key and
+`reliable_queue` table are neither read nor migrated.
 
 ## What's New In v0.7.5
 
@@ -111,11 +153,11 @@ func main() {
     registry := cmdapi.NewRegistry()
     // registry.MustRegister(yourCommand)
 
-    app.Bootstrap("edge-service-yourproto", "v0.6.7", newDriver(), registry)
+    app.Bootstrap("edge-service-yourproto", "v0.9.2", newDriver(), registry)
 }
 ```
 
-The bootstrap flow loads config, initializes auth/MQTT/reliable queue/control store, wires property + command + query handlers, starts runtime HTTP APIs, and then supervises protocol workers.
+The bootstrap flow loads config, initializes auth/MQTT/telemetry outbox/control store, wires property + command + query handlers, starts runtime HTTP APIs, and then supervises protocol workers.
 
 ## Integration Checklist
 
@@ -236,7 +278,7 @@ application process API and lifecycle contract.
 - `telemetry`
   Unified telemetry event model and trace identifiers.
 - `telemetry/reliable`
-  Durable telemetry queueing and replay plus the independent event outbox namespace.
+  SQLite-first telemetry delivery plus the independent event outbox namespace.
 - `transport/mqtt`
   MQTT client lifecycle, publishing, subscriptions, and health checks.
 - `logging`
@@ -267,7 +309,7 @@ MQTT runtime capabilities include telemetry/property/status publishing, property
 
 ## Current Consumers
 
-- `edge-service-s7` boots from `runtime/app` and reuses the shared runtime, telemetry, MQTT, reliable queue, property, command, and control capabilities.
+- `edge-service-s7` boots from `runtime/app` and reuses the shared runtime, telemetry, MQTT, telemetry outbox, property, command, and control capabilities.
 - `edge-service-fanuc` reuses SDK runtime/config/property/auth/http/status/reliable modules and keeps only protocol-specific driver logic locally.
 
 ## Documentation
@@ -279,4 +321,4 @@ MQTT runtime capabilities include telemetry/property/status publishing, property
 
 ## Version
 
-This repository is being published as `v0.9.1`.
+This repository version is `v0.9.2`.
