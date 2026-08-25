@@ -19,7 +19,7 @@ It extracts the common runtime, control, and transport capabilities out of proto
 - control job persistence, result history, diagnostics, export, and MQTT query handling
 - dependency checks, worker supervision, and shared logging contracts
 
-## What's New In v0.9.2
+## What's New In v0.9.9
 
 - **Single telemetry outbox path** — every telemetry report that passes the
   configured collection filter is committed to a dedicated SQLite database
@@ -72,7 +72,7 @@ evaluates telemetry snapshots and standard connection observations, keeps
 state separately from the durable event outbox, preserves the original event
 `time` during replay, and updates only transport metadata such as `send_at` and
 `is_replayed`. EVENT profiles do not contain middleware pipelines or MQTT
-connection settings. The v0.9.2 wire contract keeps `event_code` and `type`,
+connection settings. The v0.9.9 wire contract keeps `event_code` and `type`,
 and does not migrate the legacy SQLite event queue.
 
 ## Telemetry Outbox Configuration
@@ -153,7 +153,7 @@ func main() {
     registry := cmdapi.NewRegistry()
     // registry.MustRegister(yourCommand)
 
-    app.Bootstrap("edge-service-yourproto", "v0.9.2", newDriver(), registry)
+    app.Bootstrap("edge-service-yourproto", "v0.9.9", newDriver(), registry)
 }
 ```
 
@@ -321,4 +321,4 @@ MQTT runtime capabilities include telemetry/property/status publishing, property
 
 ## Version
 
-This repository version is `v0.9.2`.
+This repository version is `v0.9.9`.

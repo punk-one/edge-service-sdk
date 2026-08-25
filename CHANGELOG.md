@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.9.2
+## v0.9.9
 
 - Replaced the telemetry realtime/fallback split with one SQLite-first
   `telemetry_outbox`: every telemetry report that passes collection filtering
