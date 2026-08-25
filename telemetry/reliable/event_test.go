@@ -53,9 +53,11 @@ func testReliableEvent() coreevent.Event {
 		TraceID:     "trace-event-1",
 		CreatedAt:   1710000000999,
 		Data: coreevent.EventData{
-			EventCode:       "EVENT_TEST",
+			EventIdentifier: "EVENT_TEST",
 			Category:        coreevent.CategoryOEE,
-			Type:            coreevent.EventTypePulse,
+			EventType:       coreevent.EventTypePulse,
+			Phase:           coreevent.EventPhaseRecord,
+			Status:          coreevent.EventStatusRecorded,
 			EventInstanceID: "evt-test-1",
 			Payload:         map[string]interface{}{"value": 42},
 		},
@@ -105,7 +107,7 @@ func TestEventSQLiteStorePreservesOrderAndInternalMetadata(t *testing.T) {
 	}
 }
 
-func TestEventDispatcherQueuesOfflineEventsAndReplaysThem(t *testing.T) {
+func TestEventDispatcherPersistsOfflineEventsImmediatelyAndReplaysThem(t *testing.T) {
 	transport := &eventTransportStub{failing: true}
 	dispatcher, err := NewEventDispatcher(Config{
 		Enabled:          true,
@@ -146,7 +148,44 @@ func TestEventDispatcherQueuesOfflineEventsAndReplaysThem(t *testing.T) {
 	}
 }
 
-func TestEventDispatcherCloseDrainsMemoryQueue(t *testing.T) {
+func TestEventDispatcherAcksSuccessfulPublish(t *testing.T) {
+	transport := &eventTransportStub{}
+	path := filepath.Join(t.TempDir(), "events.db")
+	dispatcher, err := NewEventDispatcher(Config{
+		Enabled:          true,
+		SQLitePath:       path,
+		BatchSize:        1,
+		ReplayIntervalMs: 1_000,
+		ReplayRatePerSec: 1,
+	}, transport, nil)
+	if err != nil {
+		t.Fatalf("NewEventDispatcher() error = %v", err)
+	}
+	defer dispatcher.Close()
+
+	event := testReliableEvent()
+	event.Data.Phase = ""
+	event.Data.Status = ""
+	if err := dispatcher.Publish(event); err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+	stats, err := dispatcher.Stats()
+	if err != nil {
+		t.Fatalf("Stats() error = %v", err)
+	}
+	if stats.BufferDepth != 0 {
+		t.Fatalf("buffer depth after successful publish = %d, want 0", stats.BufferDepth)
+	}
+	received := transport.snapshot()
+	if len(received) != 1 || received[0].replayed {
+		t.Fatalf("unexpected realtime delivery: %#v", received)
+	}
+	if received[0].event.Data.Phase != coreevent.EventPhaseRecord || received[0].event.Data.Status != coreevent.EventStatusRecorded {
+		t.Fatalf("lifecycle fields were not normalized before delivery: %#v", received[0].event.Data)
+	}
+}
+
+func TestEventDispatcherCloseKeepsUnpublishedOutbox(t *testing.T) {
 	transport := &eventTransportStub{failing: true}
 	path := filepath.Join(t.TempDir(), "events.db")
 	dispatcher, err := NewEventDispatcher(Config{

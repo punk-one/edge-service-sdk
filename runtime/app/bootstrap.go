@@ -2,9 +2,13 @@ package app
 
 import (
 	"fmt"
+	"os"
+	"os/signal"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	rtauth "github.com/punk-one/edge-service-sdk/auth"
@@ -38,6 +42,9 @@ import (
 type DeviceSDK struct {
 	logger         logger.LoggingClient
 	asyncCh        chan *contracts.AsyncValues
+	asyncStopCh    chan struct{}
+	asyncDoneCh    chan struct{}
+	asyncStopOnce  sync.Once
 	devices        []contracts.Device
 	deviceConfigs  map[string]contracts.DeviceConfig
 	productDevices map[string][]contracts.DeviceConfig
@@ -96,6 +103,8 @@ func NewDeviceSDK(config rtconfig.Config, logClient logger.LoggingClient, tracke
 	return &DeviceSDK{
 		logger:         logClient,
 		asyncCh:        asyncCh,
+		asyncStopCh:    make(chan struct{}),
+		asyncDoneCh:    make(chan struct{}),
 		devices:        devices,
 		deviceConfigs:  deviceConfigs,
 		productDevices: productDevices,
@@ -210,6 +219,14 @@ func (s *DeviceSDK) SetEventService(service *eventruntime.Service) {
 	s.eventService = service
 }
 
+func (s *DeviceSDK) stopAsyncProcessing() {
+	if s == nil {
+		return
+	}
+	s.asyncStopOnce.Do(func() { close(s.asyncStopCh) })
+	<-s.asyncDoneCh
+}
+
 func (s *DeviceSDK) EventService() *eventruntime.Service {
 	if s == nil {
 		return nil
@@ -218,14 +235,14 @@ func (s *DeviceSDK) EventService() *eventruntime.Service {
 }
 
 func (s *DeviceSDK) ObserveEventProperty(deviceName string, observedAt int64, values map[string]interface{}) error {
-	if s == nil || s.eventService == nil {
+	if s == nil || s.eventService == nil || s.isShuttingDown() {
 		return nil
 	}
 	return s.eventService.ObserveProperty(deviceName, observedAt, values)
 }
 
 func (s *DeviceSDK) observeConnection(deviceName string, online bool, state string, observedAt, lastSeenAt int64, errMessage string) {
-	if s == nil || s.eventService == nil {
+	if s == nil || s.eventService == nil || s.isShuttingDown() {
 		return
 	}
 	if observedAt == 0 {
@@ -236,6 +253,18 @@ func (s *DeviceSDK) observeConnection(deviceName string, online bool, state stri
 	}
 	if err := s.eventService.ObserveConnection(coreevent.ConnectionObservation{DeviceCode: deviceName, Online: online, State: state, ObservedAt: observedAt, LastSeenAt: lastSeenAt, Error: errMessage, Known: true}); err != nil && s.logger != nil {
 		s.logger.Warnf("EVENT connection observation failed for device %s: %v", deviceName, err)
+	}
+}
+
+func (s *DeviceSDK) isShuttingDown() bool {
+	if s == nil {
+		return true
+	}
+	select {
+	case <-s.asyncStopCh:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -571,15 +600,43 @@ func BootstrapWithOptions(serviceName, version string, driver contracts.Protocol
 	}
 
 	logClient.Infof("Device service %s started successfully with %d devices and %d telemetry workers", serviceName, len(config.Devices), workerCount)
-	select {}
+
+	shutdownCh := make(chan os.Signal, 1)
+	signal.Notify(shutdownCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(shutdownCh)
+	sig := <-shutdownCh
+	logClient.Infof("Shutdown signal received: %s", sig)
+
+	// Stop device production first, then flush EVENT state/outbox before
+	// closing transports. The supervisor goroutines terminate with the
+	// process after Bootstrap returns.
+	if err := driver.Stop(false); err != nil {
+		logClient.Warnf("Failed to stop driver cleanly: %v", err)
+	}
+	sdk.stopAsyncProcessing()
+	if eventService != nil {
+		if err := eventService.Close(); err != nil {
+			logClient.Warnf("Failed to close EVENT service cleanly: %v", err)
+		}
+	}
+	if err := telemetrySink.Close(); err != nil {
+		logClient.Warnf("Failed to close reliable telemetry dispatcher cleanly: %v", err)
+	}
+	if err := publisher.Close(); err != nil {
+		logClient.Warnf("Failed to close MQTT publisher cleanly: %v", err)
+	}
 }
 
 func processAsyncValues(sdk *DeviceSDK, telemetrySink reliable.TelemetrySink, logClient logger.LoggingClient) {
-	for asyncValues := range sdk.asyncCh {
+	defer close(sdk.asyncDoneCh)
+	handle := func(asyncValues *contracts.AsyncValues) {
+		if asyncValues == nil {
+			return
+		}
 		device, ok := sdk.DeviceConfigByName(asyncValues.DeviceName)
 		if !ok {
 			logClient.Warnf("Dropping async values for unknown device %s", asyncValues.DeviceName)
-			continue
+			return
 		}
 		if sdk.eventService != nil {
 			if err := sdk.eventService.ObserveTelemetry(device.InternalName, asyncValues.CollectedAt, asyncValues.Values); err != nil {
@@ -588,6 +645,21 @@ func processAsyncValues(sdk *DeviceSDK, telemetrySink reliable.TelemetrySink, lo
 		}
 		if err := telemetrySink.PublishAsyncValues(device, asyncValues); err != nil {
 			logClient.Errorf("Failed to publish async values for %s: %v", asyncValues.DeviceName, err)
+		}
+	}
+	for {
+		select {
+		case asyncValues := <-sdk.asyncCh:
+			handle(asyncValues)
+		case <-sdk.asyncStopCh:
+			for {
+				select {
+				case asyncValues := <-sdk.asyncCh:
+					handle(asyncValues)
+				default:
+					return
+				}
+			}
 		}
 	}
 }

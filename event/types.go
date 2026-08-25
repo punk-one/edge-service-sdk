@@ -23,6 +23,14 @@ const (
 	EventActionRaise = "raise"
 	EventActionClear = "clear"
 
+	EventPhaseStart  = "start"
+	EventPhaseEnd    = "end"
+	EventPhaseRecord = "record"
+
+	EventStatusActive   = "active"
+	EventStatusResolved = "resolved"
+	EventStatusRecorded = "recorded"
+
 	ReportModeImmediate = "immediate"
 	ReportModeSummary   = "summary"
 )
@@ -40,11 +48,15 @@ type Event struct {
 }
 
 // EventData contains the event-specific data required by the event contract.
+// EventType is the lifecycle action (raise, clear, or pulse); the rule
+// definition type remains in Meta under rule_type.
 type EventData struct {
-	EventCode       string                 `json:"event_code"`
+	EventIdentifier string                 `json:"event_identifier"`
 	Category        string                 `json:"category"`
 	Level           interface{}            `json:"level,omitempty"`
-	Type            string                 `json:"type"`
+	EventType       string                 `json:"event_type"`
+	Phase           string                 `json:"phase"`
+	Status          string                 `json:"status"`
 	Message         string                 `json:"message,omitempty"`
 	Payload         map[string]interface{} `json:"payload,omitempty"`
 	Meta            map[string]interface{} `json:"meta,omitempty"`
@@ -52,10 +64,47 @@ type EventData struct {
 	EventInstanceID string                 `json:"event_instance_id"`
 }
 
+// EventLifecycle returns the normalized phase and status for one event
+// lifecycle action. All public events must use one of these mappings.
+func EventLifecycle(eventType string) (phase, status string, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(eventType)) {
+	case EventActionRaise:
+		return EventPhaseStart, EventStatusActive, true
+	case EventActionClear:
+		return EventPhaseEnd, EventStatusResolved, true
+	case EventTypePulse:
+		return EventPhaseRecord, EventStatusRecorded, true
+	default:
+		return "", "", false
+	}
+}
+
+func lifecyclePhase(eventType string) string {
+	phase, _, _ := EventLifecycle(eventType)
+	return phase
+}
+
+func lifecycleStatus(eventType string) string {
+	_, status, _ := EventLifecycle(eventType)
+	return status
+}
+
+// NormalizeLifecycle fills the public lifecycle fields from EventType. The
+// mapping is authoritative so callers cannot accidentally publish a
+// contradictory phase or status.
+func (d EventData) NormalizeLifecycle() EventData {
+	if phase, status, ok := EventLifecycle(d.EventType); ok {
+		d.Phase = phase
+		d.Status = status
+	}
+	return d
+}
+
 // PublicMap returns the cloud-facing envelope. send_at and is_replayed are
 // delivery metadata; time, data and event_instance_id remain unchanged during
 // replay.
 func (e Event) PublicMap(replayed bool, sendAt int64) map[string]interface{} {
+	e.Data = e.Data.NormalizeLifecycle()
 	result := map[string]interface{}{
 		"time":        e.Time,
 		"device_code": e.DeviceCode,
@@ -71,6 +120,9 @@ func (e Event) PublicMap(replayed bool, sendAt int64) map[string]interface{} {
 
 // MarshalPublicJSON serializes the public event envelope.
 func (e Event) MarshalPublicJSON(replayed bool, sendAt int64) ([]byte, error) {
+	if _, _, ok := EventLifecycle(e.Data.EventType); !ok {
+		return nil, fmt.Errorf("unsupported event_type %q", e.Data.EventType)
+	}
 	return json.Marshal(e.PublicMap(replayed, sendAt))
 }
 

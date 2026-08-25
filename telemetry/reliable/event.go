@@ -38,10 +38,10 @@ type EventDispatcher struct {
 	store     *eventSQLiteStore
 	enabled   bool
 
-	persistCh   chan events.Event
 	stopCh      chan struct{}
 	closeOnce   sync.Once
 	wg          sync.WaitGroup
+	publishMu   sync.Mutex
 	metricsMu   sync.RWMutex
 	lifecycleMu sync.Mutex
 	closed      bool
@@ -90,14 +90,9 @@ func NewEventDispatcher(cfg Config, transport EventTransport, logClient logger.L
 		return nil, err
 	}
 	dispatcher.store = store
-	dispatcher.persistCh = make(chan events.Event, dispatcher.cfg.memoryQueueSize())
 	dispatcher.replayTokens = float64(dispatcher.cfg.replayRatePerSec())
 	dispatcher.lastReplayRefill = time.Now().UnixMilli()
-	dispatcher.wg.Add(2)
-	go func() {
-		defer dispatcher.wg.Done()
-		dispatcher.persistLoop()
-	}()
+	dispatcher.wg.Add(1)
 	go func() {
 		defer dispatcher.wg.Done()
 		dispatcher.replayLoop()
@@ -115,18 +110,36 @@ func (d *EventDispatcher) Publish(event events.Event) error {
 	if closed {
 		return fmt.Errorf("event dispatcher is closed")
 	}
+	if _, _, ok := events.EventLifecycle(event.Data.EventType); !ok {
+		return fmt.Errorf("unsupported event_type %q", event.Data.EventType)
+	}
+	event.Data = event.Data.NormalizeLifecycle()
 	if event.CreatedAt == 0 {
 		event.CreatedAt = time.Now().UnixMilli()
 	}
-	if err := d.transport.PublishEvent(event, false); err == nil {
+	if !d.enabled || d.store == nil {
+		return d.transport.PublishEvent(event, false)
+	}
+
+	// Write the event to SQLite before attempting MQTT delivery. This removes
+	// the process-memory-only window that could lose a failed event on restart.
+	d.publishMu.Lock()
+	defer d.publishMu.Unlock()
+	rowID, err := d.store.append(event)
+	if err != nil {
+		return fmt.Errorf("persist event before publish: %w", err)
+	}
+	if err := d.transport.PublishEvent(event, false); err != nil {
+		if d.logger != nil {
+			d.logger.Warnf("Realtime event publish failed, kept in outbox: device=%s category=%s event=%s instance=%s", event.DeviceCode, event.Data.Category, event.Data.EventIdentifier, event.Data.EventInstanceID)
+		}
 		return nil
-	} else if !d.enabled {
-		return err
-	} else if persistErr := d.enqueuePersist(event); persistErr != nil {
-		return fmt.Errorf("publish realtime event: %w; persist event: %v", err, persistErr)
+	}
+	if err := d.store.ack([]int64{rowID}); err != nil {
+		return fmt.Errorf("ack published event: %w", err)
 	}
 	if d.logger != nil {
-		d.logger.Warnf("Realtime event publish failed, queued for replay: device=%s category=%s event=%s instance=%s", event.DeviceCode, event.Data.Category, event.Data.EventCode, event.Data.EventInstanceID)
+		d.logger.Debugf("Event published and acked from outbox: device=%s category=%s event=%s instance=%s", event.DeviceCode, event.Data.Category, event.Data.EventIdentifier, event.Data.EventInstanceID)
 	}
 	return nil
 }
@@ -142,6 +155,8 @@ func (d *EventDispatcher) Close() error {
 	}
 	d.lifecycleMu.Unlock()
 	d.wg.Wait()
+	d.publishMu.Lock()
+	d.publishMu.Unlock()
 	if d.store != nil {
 		return d.store.close()
 	}
@@ -169,62 +184,6 @@ func (d *EventDispatcher) Stats() (EventQueueStats, error) {
 	return result, nil
 }
 
-func (d *EventDispatcher) enqueuePersist(event events.Event) error {
-	if !d.enabled || d.store == nil {
-		return fmt.Errorf("event reliable queue is disabled")
-	}
-	d.lifecycleMu.Lock()
-	defer d.lifecycleMu.Unlock()
-	if d.closed {
-		return fmt.Errorf("event dispatcher is closed")
-	}
-	select {
-	case d.persistCh <- event:
-		return nil
-	default:
-		return d.store.appendBatch([]events.Event{event})
-	}
-}
-
-func (d *EventDispatcher) persistLoop() {
-	ticker := time.NewTicker(d.cfg.flushInterval())
-	defer ticker.Stop()
-	buffer := make([]events.Event, 0, d.cfg.batchSize())
-	flush := func() {
-		if len(buffer) == 0 {
-			return
-		}
-		if err := d.store.appendBatch(buffer); err != nil {
-			if d.logger != nil {
-				d.logger.Errorf("Failed to persist event buffer batch: %v", err)
-			}
-			return
-		}
-		buffer = buffer[:0]
-	}
-	for {
-		select {
-		case <-d.stopCh:
-			for {
-				select {
-				case event := <-d.persistCh:
-					buffer = append(buffer, event)
-				default:
-					flush()
-					return
-				}
-			}
-		case event := <-d.persistCh:
-			buffer = append(buffer, event)
-			if len(buffer) >= d.cfg.batchSize() {
-				flush()
-			}
-		case <-ticker.C:
-			flush()
-		}
-	}
-}
-
 func (d *EventDispatcher) replayLoop() {
 	ticker := time.NewTicker(d.cfg.replayInterval())
 	defer ticker.Stop()
@@ -242,6 +201,8 @@ func (d *EventDispatcher) replayOnce() {
 	if d.store == nil {
 		return
 	}
+	d.publishMu.Lock()
+	defer d.publishMu.Unlock()
 	if removed, err := d.store.purgeExpired(d.retentionCutoff()); err != nil {
 		if d.logger != nil {
 			d.logger.Warnf("Failed to purge expired event records: %v", err)
@@ -264,7 +225,7 @@ func (d *EventDispatcher) replayOnce() {
 	for _, record := range records {
 		if err := d.transport.PublishEvent(record.Event, true); err != nil {
 			if d.logger != nil {
-				d.logger.Warnf("Event replay paused on publish failure: device=%s event=%s err=%v", record.Event.DeviceCode, record.Event.Data.EventCode, err)
+				d.logger.Warnf("Event replay paused on publish failure: device=%s event=%s err=%v", record.Event.DeviceCode, record.Event.Data.EventIdentifier, err)
 			}
 			break
 		}
@@ -336,24 +297,56 @@ func newEventSQLiteStore(path string) (*eventSQLiteStore, error) {
 		}
 	}
 	if _, err := db.Exec(`
-CREATE TABLE IF NOT EXISTS event_reliable_queue (
+CREATE TABLE IF NOT EXISTS event_outbox (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	device_code TEXT NOT NULL,
 	product_code TEXT NOT NULL,
 	category TEXT NOT NULL,
-	event_code TEXT NOT NULL,
+	event_identifier TEXT NOT NULL,
 	event_instance_id TEXT NOT NULL,
 	event_time INTEGER NOT NULL,
 	created_at INTEGER NOT NULL,
 	payload_json BLOB NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_event_reliable_created_at ON event_reliable_queue(created_at);
-CREATE INDEX IF NOT EXISTS idx_event_reliable_order ON event_reliable_queue(device_code, category, event_time, id);
+CREATE INDEX IF NOT EXISTS idx_event_outbox_created_at ON event_outbox(created_at);
+CREATE INDEX IF NOT EXISTS idx_event_outbox_order ON event_outbox(device_code, category, event_time, id);
 `); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return store, nil
+}
+
+func (s *eventSQLiteStore) append(item events.Event) (int64, error) {
+	createdAt := item.CreatedAt
+	if createdAt == 0 {
+		createdAt = time.Now().UnixMilli()
+	}
+	payload, err := json.Marshal(storedEventPayload{Event: item, ProductCode: item.ProductCode, TraceID: item.TraceID, CreatedAt: createdAt})
+	if err != nil {
+		return 0, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	result, err := tx.Exec(`INSERT INTO event_outbox(device_code, product_code, category, event_identifier, event_instance_id, event_time, created_at, payload_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, item.DeviceCode, item.ProductCode, item.Data.Category, item.Data.EventIdentifier, item.Data.EventInstanceID, item.Time, createdAt, payload)
+	if err != nil {
+		return 0, err
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	return id, nil
 }
 
 func (s *eventSQLiteStore) appendBatch(items []events.Event) error {
@@ -369,7 +362,7 @@ func (s *eventSQLiteStore) appendBatch(items []events.Event) error {
 			_ = tx.Rollback()
 		}
 	}()
-	stmt, err := tx.Prepare(`INSERT INTO event_reliable_queue(device_code, product_code, category, event_code, event_instance_id, event_time, created_at, payload_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`)
+	stmt, err := tx.Prepare(`INSERT INTO event_outbox(device_code, product_code, category, event_identifier, event_instance_id, event_time, created_at, payload_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return err
 	}
@@ -384,7 +377,7 @@ func (s *eventSQLiteStore) appendBatch(items []events.Event) error {
 			err = marshalErr
 			return err
 		}
-		if _, err = stmt.Exec(item.DeviceCode, item.ProductCode, item.Data.Category, item.Data.EventCode, item.Data.EventInstanceID, item.Time, createdAt, payload); err != nil {
+		if _, err = stmt.Exec(item.DeviceCode, item.ProductCode, item.Data.Category, item.Data.EventIdentifier, item.Data.EventInstanceID, item.Time, createdAt, payload); err != nil {
 			return err
 		}
 	}
@@ -396,7 +389,7 @@ func (s *eventSQLiteStore) fetchPending(limit int) ([]storedEvent, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := s.db.Query(`SELECT id, created_at, payload_json FROM event_reliable_queue ORDER BY event_time ASC, id ASC LIMIT ?`, limit)
+	rows, err := s.db.Query(`SELECT id, created_at, payload_json FROM event_outbox ORDER BY event_time ASC, id ASC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -434,7 +427,7 @@ func (s *eventSQLiteStore) ack(ids []int64) error {
 			_ = tx.Rollback()
 		}
 	}()
-	stmt, err := tx.Prepare(`DELETE FROM event_reliable_queue WHERE id = ?`)
+	stmt, err := tx.Prepare(`DELETE FROM event_outbox WHERE id = ?`)
 	if err != nil {
 		return err
 	}
@@ -452,7 +445,7 @@ func (s *eventSQLiteStore) purgeExpired(cutoff int64) (int64, error) {
 	if cutoff <= 0 {
 		return 0, nil
 	}
-	result, err := s.db.Exec(`DELETE FROM event_reliable_queue WHERE created_at < ?`, cutoff)
+	result, err := s.db.Exec(`DELETE FROM event_outbox WHERE created_at < ?`, cutoff)
 	if err != nil {
 		return 0, err
 	}
@@ -465,7 +458,7 @@ type eventStoreStats struct {
 }
 
 func (s *eventSQLiteStore) stats() (eventStoreStats, error) {
-	row := s.db.QueryRow(`SELECT COUNT(1), COALESCE(MIN(created_at), 0) FROM event_reliable_queue`)
+	row := s.db.QueryRow(`SELECT COUNT(1), COALESCE(MIN(created_at), 0) FROM event_outbox`)
 	var result eventStoreStats
 	if err := row.Scan(&result.pendingCount, &result.oldestPendingCreatedAt); err != nil {
 		return eventStoreStats{}, err

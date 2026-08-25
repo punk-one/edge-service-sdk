@@ -83,6 +83,10 @@ func NewService(config appconfig.Config, publisher interface{}, logClient logger
 			return nil, fmt.Errorf("eventReport is configured but MQTT publisher does not support events")
 		}
 		queueConfig := config.ReliableQueue
+		// EVENT delivery always uses the durable outbox. The telemetry queue
+		// switch must not reintroduce a process-memory-only loss window for
+		// event lifecycle records.
+		queueConfig.Enabled = true
 		queueConfig.SQLitePath = config.Storage.SQLitePath
 		dispatcher, err := reliable.NewEventDispatcher(queueConfig, eventPublisher, logClient)
 		if err != nil {
@@ -235,10 +239,10 @@ func (s *Service) publishAndPersist(items []coreevent.Event) error {
 				return err
 			}
 		} else if s.log != nil {
-			s.log.Infof("EVENT generated without eventReport: device=%s category=%s event=%s type=%s instance=%s", item.DeviceCode, item.Data.Category, item.Data.EventCode, item.Data.Type, item.Data.EventInstanceID)
+			s.log.Infof("EVENT generated without eventReport: device=%s category=%s event=%s event_type=%s instance=%s", item.DeviceCode, item.Data.Category, item.Data.EventIdentifier, item.Data.EventType, item.Data.EventInstanceID)
 		}
 		if s.log != nil {
-			s.log.Debugf("EVENT processed: device=%s category=%s event=%s type=%s instance=%s time=%d", item.DeviceCode, item.Data.Category, item.Data.EventCode, item.Data.Type, item.Data.EventInstanceID, item.Time)
+			s.log.Debugf("EVENT processed: device=%s category=%s event=%s event_type=%s instance=%s time=%d", item.DeviceCode, item.Data.Category, item.Data.EventIdentifier, item.Data.EventType, item.Data.EventInstanceID, item.Time)
 		}
 	}
 	return s.saveState()

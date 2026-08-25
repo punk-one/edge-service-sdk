@@ -15,9 +15,11 @@ func TestEventPublicEnvelopeOmitsSourceAndKeepsTraceMetadata(t *testing.T) {
 		ProductCode: "P1",
 		TraceID:     "trace-1",
 		Data: EventData{
-			EventCode:       "EVENT_TEST",
+			EventIdentifier: "EVENT_TEST",
 			Category:        CategoryOEE,
-			Type:            EventTypePulse,
+			EventType:       EventTypePulse,
+			Phase:           EventPhaseRecord,
+			Status:          EventStatusRecorded,
 			Payload:         map[string]interface{}{"x": 1},
 			EventInstanceID: "evt-1",
 		},
@@ -33,11 +35,28 @@ func TestEventPublicEnvelopeOmitsSourceAndKeepsTraceMetadata(t *testing.T) {
 	if decoded["device_code"] != "D1" || decoded["trace_id"] != "trace-1" || decoded["send_at"] != float64(2000) {
 		t.Fatalf("unexpected envelope: %#v", decoded)
 	}
+	data, ok := decoded["data"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("event data has unexpected type: %#v", decoded["data"])
+	}
+	if data["event_identifier"] != "EVENT_TEST" || data["event_type"] != EventTypePulse || data["phase"] != EventPhaseRecord || data["status"] != EventStatusRecorded {
+		t.Fatalf("unexpected event lifecycle fields: %#v", data)
+	}
+	if _, ok := data["event_code"]; ok {
+		t.Fatal("event payload must not contain event_code")
+	}
 	if _, ok := decoded["source"]; ok {
 		t.Fatal("event envelope must not contain source")
 	}
 	if _, ok := decoded["product_code"]; ok {
 		t.Fatal("transport product code must not be exposed")
+	}
+}
+
+func TestEventPublicEnvelopeRejectsUnknownLifecycle(t *testing.T) {
+	event := Event{Data: EventData{EventIdentifier: "EVENT_TEST", EventType: "unknown"}}
+	if _, err := event.MarshalPublicJSON(false, 2000); err == nil {
+		t.Fatal("MarshalPublicJSON() must reject an unknown event_type")
 	}
 }
 
@@ -128,6 +147,9 @@ func TestEngineGeneratesConnectOEEAndAggregatedAlarmEvents(t *testing.T) {
 	if alarmRaise == nil || alarmRaise.Data.Payload["alarm_codes_text"] != "ALARM_12" {
 		t.Fatalf("unexpected aggregate payload: %#v", alarmRaise)
 	}
+	if alarmRaise.Data.Phase != EventPhaseStart || alarmRaise.Data.Status != EventStatusActive {
+		t.Fatalf("unexpected raise lifecycle: %#v", alarmRaise.Data)
+	}
 	update, err := engine.ObserveTelemetry(device.Name, 3000, []*contracts.CommandValue{value("alarm_code", "Uint16", uint16(13))})
 	if err != nil {
 		t.Fatalf("ObserveTelemetry() update error = %v", err)
@@ -135,6 +157,9 @@ func TestEngineGeneratesConnectOEEAndAggregatedAlarmEvents(t *testing.T) {
 	alarmUpdate := findEvent(update, "EVENT_TOTAL_ALARM", EventTypePulse)
 	if alarmUpdate == nil || alarmUpdate.Data.EventInstanceID != alarmRaise.Data.EventInstanceID {
 		t.Fatalf("expected aggregate update to reuse instance, raise=%#v update=%#v", alarmRaise, alarmUpdate)
+	}
+	if alarmUpdate.Data.Phase != EventPhaseRecord || alarmUpdate.Data.Status != EventStatusRecorded {
+		t.Fatalf("unexpected pulse lifecycle: %#v", alarmUpdate.Data)
 	}
 	idle, err := engine.ObserveTelemetry(device.Name, 4000, []*contracts.CommandValue{value("mode", "String", "idle")})
 	if err != nil {
@@ -149,6 +174,9 @@ func TestEngineGeneratesConnectOEEAndAggregatedAlarmEvents(t *testing.T) {
 	}
 	if containsEvent(offline, "EVENT_TOTAL_ALARM", EventActionClear) {
 		t.Fatal("connection loss must not clear alarm without an alarm observation")
+	}
+	if cleared := findEvent(idle, "EVENT_OEE_RUNNING", EventActionClear); cleared == nil || cleared.Data.Phase != EventPhaseEnd || cleared.Data.Status != EventStatusResolved {
+		t.Fatalf("unexpected clear lifecycle: %#v", cleared)
 	}
 }
 
@@ -249,7 +277,7 @@ func containsEvent(items []Event, code, eventType string) bool {
 
 func findEvent(items []Event, code, eventType string) *Event {
 	for i := range items {
-		if items[i].Data.EventCode == code && items[i].Data.Type == eventType {
+		if items[i].Data.EventIdentifier == code && items[i].Data.EventType == eventType {
 			return &items[i]
 		}
 	}
@@ -259,7 +287,7 @@ func findEvent(items []Event, code, eventType string) *Event {
 func eventSummaries(items []Event) []string {
 	result := make([]string, 0, len(items))
 	for _, item := range items {
-		result = append(result, item.Data.EventCode+":"+item.Data.Type)
+		result = append(result, item.Data.EventIdentifier+":"+item.Data.EventType)
 	}
 	return result
 }

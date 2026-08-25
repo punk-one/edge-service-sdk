@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.9.2
+
+- Breaking EVENT payload contract: renamed `data.event_code` to
+  `data.event_identifier` and `data.type` to `data.event_type`.
+- Added required lifecycle fields: `raise` is `phase=start, status=active`,
+  `clear` is `phase=end, status=resolved`, and `pulse` is
+  `phase=record, status=recorded`.
+- Renamed EVENT metadata's rule-definition field to `meta.rule_type` so it is
+  not confused with the lifecycle `data.event_type`.
+- Changed EVENT delivery to a write-ahead SQLite `event_outbox`: every event
+  is persisted before MQTT delivery and removed only after a successful send.
+  The legacy event queue is not migrated.
+- Added signal-driven graceful shutdown for driver, EVENT state/outbox,
+  telemetry queue, and MQTT resources.
+
 ## v0.9.1
 
 - Added fixed-width `String` property write normalization: short values are

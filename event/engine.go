@@ -396,7 +396,7 @@ func (e *Engine) standardConnectionEvent(device *compiledDevice, observation Con
 	}
 	meta := map[string]interface{}{
 		"config_hash":  device.hash,
-		"event_type":   EventTypeRiseClear,
+		"rule_type":    EventTypeRiseClear,
 		"time_quality": timeQualityForProfile(device.binding.Profile, initial),
 		"processed_at": e.now().UnixMilli(),
 	}
@@ -406,10 +406,12 @@ func (e *Engine) standardConnectionEvent(device *compiledDevice, observation Con
 		ProductCode: device.binding.Device.ProductCode,
 		TraceID:     newEventTraceID(device.binding.Device.Name),
 		Data: EventData{
-			EventCode:       code,
+			EventIdentifier: code,
 			Category:        CategoryConnect,
 			Level:           "info",
-			Type:            action,
+			EventType:       action,
+			Phase:           lifecyclePhase(action),
+			Status:          lifecycleStatus(action),
 			Message:         message,
 			Payload:         data,
 			Meta:            meta,
@@ -752,7 +754,7 @@ func (e *Engine) ruleEvent(device *compiledDevice, state *runtimeDeviceState, co
 		"rule_name":    compiled.rule.Name,
 		"time_quality": quality,
 		"processed_at": e.now().UnixMilli(),
-		"event_type":   compiled.rule.EventType,
+		"rule_type":    compiled.rule.EventType,
 		"report_mode":  effectiveReportMode(compiled.rule.Report),
 	}
 	if compiled.rule.State != "" {
@@ -764,10 +766,12 @@ func (e *Engine) ruleEvent(device *compiledDevice, state *runtimeDeviceState, co
 		ProductCode: device.binding.Device.ProductCode,
 		TraceID:     newEventTraceID(device.binding.Device.Name),
 		Data: EventData{
-			EventCode:       compiled.rule.EventCode,
+			EventIdentifier: compiled.rule.EventCode,
 			Category:        compiled.category,
 			Level:           compiled.rule.Level,
-			Type:            eventType,
+			EventType:       eventType,
+			Phase:           lifecyclePhase(eventType),
+			Status:          lifecycleStatus(eventType),
 			Message:         message,
 			Payload:         payload,
 			Meta:            meta,
@@ -795,7 +799,7 @@ func (e *Engine) summaryEvent(device *compiledDevice, bucket durationBucket, rul
 		"config_hash":     device.hash,
 		"rule_name":       rule.rule.Name,
 		"time_quality":    "window",
-		"event_type":      rule.rule.EventType,
+		"rule_type":       rule.rule.EventType,
 		"report_mode":     ReportModeSummary,
 		"window_timezone": device.binding.Profile.Config.Time.Timezone,
 		"window_start":    bucket.WindowStart,
@@ -808,10 +812,12 @@ func (e *Engine) summaryEvent(device *compiledDevice, bucket durationBucket, rul
 		ProductCode: device.binding.Device.ProductCode,
 		TraceID:     newEventTraceID(device.binding.Device.Name),
 		Data: EventData{
-			EventCode:       rule.rule.EventCode,
+			EventIdentifier: rule.rule.EventCode,
 			Category:        rule.category,
 			Level:           rule.rule.Level,
-			Type:            EventTypePulse,
+			EventType:       EventTypePulse,
+			Phase:           EventPhaseRecord,
+			Status:          EventStatusRecorded,
 			Message:         summaryMessage(rule.rule),
 			Payload:         payload,
 			Meta:            meta,

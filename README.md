@@ -19,6 +19,19 @@ It extracts the common runtime, control, and transport capabilities out of proto
 - control job persistence, result history, diagnostics, export, and MQTT query handling
 - dependency checks, worker supervision, and shared logging contracts
 
+## What's New In v0.9.2
+
+- **Breaking EVENT payload contract** — `data.event_code` is now
+  `data.event_identifier`, and `data.type` is now `data.event_type`.
+- **Explicit EVENT lifecycle** — `raise` emits `phase=start,
+  status=active`; `clear` emits `phase=end, status=resolved`; `pulse` emits
+  `phase=record, status=recorded`.
+- **Write-ahead EVENT outbox** — every event is committed to SQLite before
+  MQTT delivery and acknowledged only after a successful send. The old event
+  queue is intentionally not migrated.
+- **Graceful shutdown** — process signals stop the driver, flush EVENT state,
+  close the event outbox and telemetry queue, and then close MQTT.
+
 ## What's New In v0.9.1
 
 - **Multi-MQTT broker support** — group-based architecture: top-level parallel groups, each group with its own failover broker chain. Per-group `dataFormat` overrides, per-group `heartbeatInterval`, and per-broker `clientId`/`username`/`password`. `NewPublisher()` factory auto-detects groups vs single-broker mode.
@@ -53,7 +66,8 @@ evaluates telemetry snapshots and standard connection observations, keeps
 state separately from the durable event outbox, preserves the original event
 `time` during replay, and updates only transport metadata such as `send_at` and
 `is_replayed`. EVENT profiles do not contain middleware pipelines or MQTT
-connection settings.
+connection settings. The v0.9.2 wire contract does not read the legacy
+`event_code`/`type` fields or migrate the legacy SQLite event queue.
 
 ## What's New In v0.7.5
 
