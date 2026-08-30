@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.10.0 - 2026-08-30
+
+- Added a SQLite-first MQTT destination outbox. Telemetry, EVENT, property
+  reports, property results, and command results are now persisted once per
+  configured MQTT group and acknowledged independently, so a failed group no
+  longer causes duplicate retries to groups that already succeeded.
+- Made periodic property reports durable in both single-broker and multi-group
+  deployments, with stable trace IDs and restart replay.
+- Added per-destination queue depth/age and dead-letter diagnostics to runtime
+  status. Startup fails safely if pending rows reference a removed or renamed
+  MQTT group instead of silently abandoning them.
+- Added a driver stuck-operation watchdog. Calls that remain blocked after
+  their deadline trigger graceful hard restart (exit code 75); driver shutdown
+  itself is bounded so a broken adapter cannot prevent process recovery.
+- Multi-group MQTT readiness now requires every configured group to be healthy.
+
+- Added error-returning `app.Run` / `RunWithOptions`; startup failures now exit
+  non-zero and restart requests perform graceful teardown before exit code 75.
+- Added context-aware, deadline-bounded driver calls, per-device legacy-call
+  serialization, ambiguous-write results, bounded custom-command concurrency,
+  and cancellation-aware shutdown.
+- Added transactional control execution claims, atomic final result/outbox
+  commits, durable MQTT result replay, interrupted-operation recovery as
+  `ambiguous`, and cleanup of orphaned pending work.
+- Changed SQLite durability to WAL + `synchronous=FULL`; added malformed-row
+  dead-letter quarantine, schema migration tests, database size ceilings, and
+  readiness capacity checks.
+- Hardened MQTT subscription restoration, stable client IDs, half-open
+  connection replacement, and idempotent close behavior.
+- Added bounded HTTP request bodies, headers, concurrency and query sizes,
+  server timeouts, loopback-only default binding, and graceful shutdown.
+- Fixed status change detection and goroutine cleanup; added bounded parallel
+  connectivity probes and per-group heartbeat ownership.
+- Changed config/event state and downloads to atomic replacement; downloads
+  now have a 1 GiB default limit and never truncate the destination on failure.
+- Updated Go to the 1.25.13 toolchain and upgraded vulnerable MQTT, WebSocket,
+  QUIC and Go support modules.
+
 ## v0.9.9
 
 - Replaced the telemetry realtime/fallback split with one SQLite-first

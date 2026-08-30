@@ -1,6 +1,7 @@
 package property
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
@@ -25,6 +26,10 @@ type DeviceCatalog interface {
 	ProductCodes() []string
 }
 
+type driverFaultReporter interface {
+	ReportDriverFault(deviceName, operation string, err error)
+}
+
 type Service struct {
 	catalog               DeviceCatalog
 	driver                contracts.ProtocolDriver
@@ -35,7 +40,12 @@ type Service struct {
 	setPostDelay          time.Duration
 
 	mu          sync.Mutex
+	deliveryMu  sync.Mutex
 	activeAsync map[string]struct{}
+	closed      bool
+	wg          sync.WaitGroup
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
 type propertyProgressEvent struct {
@@ -57,6 +67,7 @@ const (
 )
 
 func NewService(catalog DeviceCatalog, driver contracts.ProtocolDriver, publisher mqtt.Publisher, store rtcontrol.Store, logClient logger.LoggingClient) *Service {
+	serviceCtx, cancel := context.WithCancel(context.Background())
 	return &Service{
 		catalog:      catalog,
 		driver:       driver,
@@ -65,10 +76,17 @@ func NewService(catalog DeviceCatalog, driver contracts.ProtocolDriver, publishe
 		logger:       logClient,
 		setPostDelay: time.Second,
 		activeAsync:  make(map[string]struct{}),
+		ctx:          serviceCtx,
+		cancel:       cancel,
 	}
 }
 
 func (s *Service) ExecuteGet(req rtapi.PropertyRequest, expectedProductCode string) (rtapi.PropertyResponse, int) {
+	if !s.beginRequest() {
+		result := newControlResult(req.TraceID, ctl.CodeBusy, "property service is shutting down", nil)
+		return result, httpStatusForCode(result.Code)
+	}
+	defer s.wg.Done()
 	if existing, ok := s.loadExistingResult(req.TraceID); ok {
 		return existing, httpStatusForCode(existing.Code)
 	}
@@ -108,8 +126,16 @@ func (s *Service) ExecuteGet(req rtapi.PropertyRequest, expectedProductCode stri
 		s.record(normalized.DeviceCode, device.ProductCode, normalized.TraceID, result, propertyOperationGet)
 		return result, httpStatusForCode(result.Code)
 	}
+	processing := newControlResult(normalized.TraceID, ctl.CodeProcessing, "processing", map[string]interface{}{})
+	if !s.claimExecution(normalized.DeviceCode, device.ProductCode, normalized.TraceID, processing, propertyOperationGet) {
+		if existing, ok := s.loadExistingResult(normalized.TraceID); ok {
+			return existing, httpStatusForCode(existing.Code)
+		}
+		busy := newControlResult(normalized.TraceID, ctl.CodeBusy, "property read could not be claimed", nil)
+		return busy, httpStatusForCode(busy.Code)
+	}
 
-	values, err := s.driver.HandleReadCommands(device.InternalName, cfg.ProtocolPropertiesFromConfig(device), commandReqs)
+	values, err := s.readDriver(device, commandReqs, normalized.Metadata)
 	if err != nil {
 		result := newControlResult(normalized.TraceID, ctl.CodeDriverError, err.Error(), nil)
 		s.record(normalized.DeviceCode, device.ProductCode, normalized.TraceID, result, propertyOperationGet)
@@ -122,6 +148,11 @@ func (s *Service) ExecuteGet(req rtapi.PropertyRequest, expectedProductCode stri
 }
 
 func (s *Service) ExecuteSet(req rtapi.PropertyRequest, expectedProductCode string) (rtapi.PropertySetResponse, int) {
+	if !s.beginRequest() {
+		result := newControlResult(req.TraceID, ctl.CodeBusy, "property service is shutting down", nil)
+		return result, httpStatusForCode(result.Code)
+	}
+	defer s.wg.Done()
 	if existing, ok := s.loadExistingResult(req.TraceID); ok {
 		return existing, httpStatusForCode(existing.Code)
 	}
@@ -154,9 +185,17 @@ func (s *Service) ExecuteSet(req rtapi.PropertyRequest, expectedProductCode stri
 		s.record(normalized.DeviceCode, device.ProductCode, normalized.TraceID, result, propertyOperationSet)
 		return result, httpStatusForCode(result.Code)
 	}
+	processing := newControlResult(normalized.TraceID, ctl.CodeProcessing, "processing", map[string]interface{}{})
+	if !s.claimExecution(normalized.DeviceCode, device.ProductCode, normalized.TraceID, processing, propertyOperationSet) {
+		if existing, ok := s.loadExistingResult(normalized.TraceID); ok {
+			return existing, httpStatusForCode(existing.Code)
+		}
+		busy := newControlResult(normalized.TraceID, ctl.CodeBusy, "property write could not be claimed", nil)
+		return busy, httpStatusForCode(busy.Code)
+	}
 
-	if err := s.driver.HandleWriteCommands(device.InternalName, cfg.ProtocolPropertiesFromConfig(device), commandReqs, params); err != nil {
-		result := newControlResult(normalized.TraceID, ctl.CodeDriverError, err.Error(), nil)
+	if err := s.writeDriver(device, commandReqs, params, normalized.Metadata); err != nil {
+		result := driverFailureResult(normalized.TraceID, err)
 		s.record(normalized.DeviceCode, device.ProductCode, normalized.TraceID, result, propertyOperationSet)
 		return result, httpStatusForCode(result.Code)
 	}
@@ -170,11 +209,18 @@ func (s *Service) RegisterMQTTHandlers(config rtconfig.Config) {
 		return
 	}
 	s.propertyResultEnabled = strings.TrimSpace(config.PropertyResult.Topic) != ""
+	if registrar, ok := s.publisher.(interface{ RegisterOnConnect(func()) }); ok {
+		registrar.RegisterOnConnect(func() {
+			if err := s.ResumeResultDeliveries(); err != nil && s.logger != nil {
+				s.logger.Warnf("Failed to replay property results after MQTT reconnect: %v", err)
+			}
+		})
+	}
 
 	for _, productCode := range s.catalog.ProductCodes() {
 		if config.PropertySet.Topic != "" {
 			topic := cfg.StringsReplaceProductCode(config.PropertySet.Topic, productCode)
-			_ = s.publisher.Subscribe(topic, byte(config.PropertySet.QoS), func(actualTopic string, payload []byte) {
+			if err := s.publisher.Subscribe(topic, byte(config.PropertySet.QoS), func(actualTopic string, payload []byte) {
 				mqtt.ObserveInbound(s.publisher, mqtt.Observation{
 					Type:        busapi.PropertySet,
 					Topic:       actualTopic,
@@ -184,12 +230,14 @@ func (s *Service) RegisterMQTTHandlers(config rtconfig.Config) {
 					ProductCode: productCode,
 				})
 				s.handlePropertySet(productCode, payload)
-			})
+			}); err != nil && s.logger != nil {
+				s.logger.Warnf("Property-set subscription is pending retry: topic=%s err=%v", topic, err)
+			}
 		}
 
 		if config.PropertyGet.Topic != "" && config.PropertyResult.Topic != "" {
 			topic := cfg.StringsReplaceProductCode(config.PropertyGet.Topic, productCode)
-			_ = s.publisher.Subscribe(topic, byte(config.PropertyGet.QoS), func(actualTopic string, payload []byte) {
+			if err := s.publisher.Subscribe(topic, byte(config.PropertyGet.QoS), func(actualTopic string, payload []byte) {
 				mqtt.ObserveInbound(s.publisher, mqtt.Observation{
 					Type:        busapi.PropertyGet,
 					Topic:       actualTopic,
@@ -199,7 +247,9 @@ func (s *Service) RegisterMQTTHandlers(config rtconfig.Config) {
 					ProductCode: productCode,
 				})
 				s.handlePropertyGet(productCode, payload)
-			})
+			}); err != nil && s.logger != nil {
+				s.logger.Warnf("Property-get subscription is pending retry: topic=%s err=%v", topic, err)
+			}
 		} else if config.PropertyGet.Topic != "" && config.PropertyResult.Topic == "" && s.logger != nil {
 			s.logger.Warnf("PropertyGet configured but PropertyResult topic is empty; disabling property get for product %s", productCode)
 		}
@@ -233,9 +283,37 @@ func (s *Service) ResumePending() error {
 		if !s.markAsyncActive(item.TraceID) {
 			continue
 		}
-		go s.runAsyncProperty(item)
+		s.startAsyncProperty(item)
 	}
 	return nil
+}
+
+// ResumeResultDeliveries replays durable final property results.
+func (s *Service) ResumeResultDeliveries() error {
+	if !s.beginRequest() {
+		return fmt.Errorf("property service is shutting down")
+	}
+	defer s.wg.Done()
+	outbox, ok := s.store.(rtcontrol.ResultOutbox)
+	if !ok {
+		return nil
+	}
+	s.deliveryMu.Lock()
+	defer s.deliveryMu.Unlock()
+	for {
+		items, err := outbox.ListResultDeliveries("property", 100)
+		if err != nil {
+			return err
+		}
+		if len(items) == 0 {
+			return nil
+		}
+		for _, item := range items {
+			if err := s.publishPropertyResultLocked(item.ProductCode, item.DeviceCode, rtapi.PropertyResponse(item.Result)); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 func (s *Service) resolvePropertyDevice(req rtapi.PropertyRequest, expectedProductCode string) (contracts.DeviceConfig, rtapi.PropertyRequest, int, error) {
@@ -257,6 +335,10 @@ func (s *Service) resolvePropertyDevice(req rtapi.PropertyRequest, expectedProdu
 }
 
 func (s *Service) handlePropertySet(productCode string, payload []byte) {
+	if !s.beginRequest() {
+		return
+	}
+	defer s.wg.Done()
 	req, err := cfg.ParsePropertyRequest(payload)
 	if err != nil {
 		if s.logger != nil {
@@ -289,6 +371,10 @@ func (s *Service) handlePropertySet(productCode string, payload []byte) {
 }
 
 func (s *Service) handlePropertyGet(productCode string, payload []byte) {
+	if !s.beginRequest() {
+		return
+	}
+	defer s.wg.Done()
 	req, err := cfg.ParsePropertyRequest(payload)
 	if err != nil {
 		if s.logger != nil {
@@ -314,18 +400,38 @@ func (s *Service) schedulePropertySetResult(productCode string, req rtapi.Proper
 	if s == nil || s.publisher == nil {
 		return
 	}
-
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.wg.Add(1)
+	s.mu.Unlock()
 	go func() {
-		time.Sleep(s.setPostDelay)
+		defer s.wg.Done()
+		timer := time.NewTimer(s.setPostDelay)
+		defer timer.Stop()
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-timer.C:
+		}
 		post := s.executePropertySetReadback(productCode, req, response.TraceID)
 		s.record(req.DeviceCode, productCode, response.TraceID, post, propertyOperationSet)
 		s.publishPropertyResult(productCode, resolvedDeviceCode(req.DeviceCode, req.DeviceCode), post)
 	}()
 }
 
-func (s *Service) publishPropertyResult(productCode string, deviceCode string, response rtapi.PropertyResponse) {
+func (s *Service) publishPropertyResult(productCode string, deviceCode string, response rtapi.PropertyResponse) error {
+	s.deliveryMu.Lock()
+	defer s.deliveryMu.Unlock()
+	return s.publishPropertyResultLocked(productCode, deviceCode, response)
+}
+
+func (s *Service) publishPropertyResultLocked(productCode string, deviceCode string, response rtapi.PropertyResponse) error {
 	if s == nil || s.publisher == nil || !s.propertyResultEnabled {
-		return
+		s.finishResultDelivery(response.TraceID, nil)
+		return nil
 	}
 	device := contracts.DeviceConfig{
 		Name:        deviceCode,
@@ -334,13 +440,29 @@ func (s *Service) publishPropertyResult(productCode string, deviceCode string, r
 	if resolved, ok := s.catalog.DeviceConfigByName(deviceCode); ok && resolved.ProductCode == productCode {
 		device = resolved
 	}
-	_ = s.publisher.PublishPropertyResult(device, map[string]interface{}{
+	err := s.publisher.PublishPropertyResult(device, map[string]interface{}{
 		"trace_id": response.TraceID,
 		"code":     response.Code,
 		"message":  response.Message,
 		"data":     response.Data,
 		"time":     response.Time,
 	})
+	s.finishResultDelivery(response.TraceID, err)
+	return err
+}
+
+func (s *Service) finishResultDelivery(traceID string, publishErr error) {
+	outbox, ok := s.store.(rtcontrol.ResultOutbox)
+	if !ok {
+		return
+	}
+	if publishErr != nil {
+		_ = outbox.MarkResultDeliveryFailed(traceID, publishErr.Error())
+		return
+	}
+	if err := outbox.AckResultDelivery(traceID); err != nil && s.logger != nil {
+		s.logger.Warnf("Failed to ack property result delivery trace=%s: %v", traceID, err)
+	}
 }
 
 func clonePropertyProgressData(data map[string]interface{}) map[string]interface{} {
@@ -469,6 +591,8 @@ func httpStatusForCode(code int) int {
 		return 202
 	case ctl.CodeBadRequest:
 		return 400
+	case ctl.CodeAmbiguous:
+		return 409
 	case 401:
 		return 401
 	case 403:
@@ -558,13 +682,17 @@ func (s *Service) executeAsyncProperty(device contracts.DeviceConfig, req rtapi.
 	}
 	s.record(req.DeviceCode, device.ProductCode, req.TraceID, accepted, operation)
 	if s.markAsyncActive(req.TraceID) {
-		go s.runAsyncProperty(pending)
+		s.startAsyncProperty(pending)
 	}
 	return accepted, httpStatusForCode(accepted.Code)
 }
 
 func (s *Service) runAsyncProperty(pending rtcontrol.PendingProperty) {
 	defer s.clearAsyncActive(pending.TraceID)
+	processing := newControlResult(pending.TraceID, ctl.CodeProcessing, "processing", map[string]interface{}{})
+	if !s.claimExecution(pending.DeviceCode, pending.ProductCode, pending.TraceID, processing, pending.Operation) {
+		return
+	}
 	result := s.executePendingProperty(pending, func(event propertyProgressEvent) {
 		s.recordPropertyProgress(pending, event)
 	})
@@ -581,6 +709,44 @@ func (s *Service) runAsyncProperty(pending rtcontrol.PendingProperty) {
 		return
 	}
 	s.publishPropertyResult(pending.ProductCode, pending.DeviceCode, result)
+}
+
+func (s *Service) startAsyncProperty(pending rtcontrol.PendingProperty) {
+	go func() {
+		defer s.wg.Done()
+		s.runAsyncProperty(pending)
+	}()
+}
+
+// Close stops accepting new asynchronous work and waits for active requests.
+func (s *Service) Close(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	s.BeginShutdown()
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// BeginShutdown rejects new work and cancels context-aware in-flight work
+// without waiting. It is safe to call before stopping the protocol driver.
+func (s *Service) BeginShutdown() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
+	s.cancel()
 }
 
 func (s *Service) executePendingProperty(pending rtcontrol.PendingProperty, progress func(propertyProgressEvent)) rtapi.PropertyResponse {
@@ -609,15 +775,24 @@ func (s *Service) executePendingPropertySet(pending rtcontrol.PendingProperty, p
 		result := newControlResult(req.TraceID, ctl.CodeBadRequest, err.Error(), nil)
 		return enrichPropertyFailure(result, newPropertyProgressEvent("write", "failed", 10, propertyNames, nil, taskStart, writeStart))
 	}
-	if err := s.driver.HandleWriteCommands(device.InternalName, cfg.ProtocolPropertiesFromConfig(device), commandReqs, params); err != nil {
-		result := newControlResult(req.TraceID, ctl.CodeDriverError, err.Error(), nil)
+	if err := s.writeDriver(device, commandReqs, params, req.Metadata); err != nil {
+		result := driverFailureResult(req.TraceID, err)
 		return enrichPropertyFailure(result, newPropertyProgressEvent("write", "failed", 10, propertyNames, nil, taskStart, writeStart))
 	}
 	if progress != nil {
 		progress(newPropertyProgressEvent("write", "completed", 55, propertyNames, req.Data, taskStart, writeStart))
 	}
 	if s.setPostDelay > 0 {
-		time.Sleep(s.setPostDelay)
+		timer := time.NewTimer(s.setPostDelay)
+		select {
+		case <-s.ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			result := newControlResult(req.TraceID, ctl.CodeAmbiguous, "property write completed but readback was cancelled", nil)
+			return enrichPropertyFailure(result, newPropertyProgressEvent("readback", "cancelled", 55, propertyNames, req.Data, taskStart, writeStart))
+		case <-timer.C:
+		}
 	}
 
 	readbackStart := time.Now()
@@ -660,7 +835,7 @@ func (s *Service) executePendingPropertyGet(pending rtcontrol.PendingProperty, p
 		result := newControlResult(req.TraceID, ctl.CodeBadRequest, err.Error(), nil)
 		return enrichPropertyFailure(result, newPropertyProgressEvent("read", "failed", 10, propertyNames, nil, taskStart, readStart))
 	}
-	values, err := s.driver.HandleReadCommands(device.InternalName, cfg.ProtocolPropertiesFromConfig(device), commandReqs)
+	values, err := s.readDriver(device, commandReqs, req.Metadata)
 	if err != nil {
 		result := newControlResult(req.TraceID, ctl.CodeDriverError, err.Error(), nil)
 		return enrichPropertyFailure(result, newPropertyProgressEvent("read", "failed", 10, propertyNames, nil, taskStart, readStart))
@@ -687,7 +862,7 @@ func (s *Service) executePropertySetReadback(productCode string, req rtapi.Prope
 		post.Message = err.Error()
 		return post
 	}
-	values, err := s.driver.HandleReadCommands(device.InternalName, cfg.ProtocolPropertiesFromConfig(device), commandReqs)
+	values, err := s.readDriver(device, commandReqs, normalized.Metadata)
 	if err != nil {
 		post.Code = ctl.CodeDriverError
 		post.Message = err.Error()
@@ -748,6 +923,13 @@ func (s *Service) record(deviceCode string, productCode string, traceID string, 
 	if rtcontrol.IsFinalCode(result.Code) {
 		job.FinishedAt = now
 	}
+	if recorder, ok := s.store.(rtcontrol.AtomicRecorder); ok {
+		applied, err := recorder.RecordJobResult(job, ctl.Result(result), rtcontrol.IsFinalCode(result.Code))
+		if err != nil && s.logger != nil {
+			s.logger.Warnf("Failed to atomically record property result trace=%s: %v", traceID, err)
+		}
+		return err == nil && applied
+	}
 	applied, err := s.store.UpsertJob(job)
 	if err != nil {
 		if s.logger != nil {
@@ -764,6 +946,37 @@ func (s *Service) record(deviceCode string, productCode string, traceID string, 
 	return true
 }
 
+func (s *Service) claimExecution(deviceCode, productCode, traceID string, result rtapi.PropertyResponse, operation string) bool {
+	if strings.TrimSpace(traceID) == "" {
+		return false
+	}
+	if s.store == nil {
+		return true
+	}
+	now := result.Time
+	if now <= 0 {
+		now = time.Now().UnixMilli()
+	}
+	job := rtcontrol.JobState{
+		TraceID:     traceID,
+		DeviceCode:  strings.TrimSpace(deviceCode),
+		ProductCode: strings.TrimSpace(productCode),
+		Kind:        "property:" + normalizePropertyOperation(operation),
+		Code:        ctl.CodeProcessing,
+		Message:     result.Message,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if claimer, ok := s.store.(rtcontrol.ExecutionClaimer); ok {
+		claimed, err := claimer.ClaimExecution(job)
+		if err != nil && s.logger != nil {
+			s.logger.Warnf("Failed to claim property execution trace=%s: %v", traceID, err)
+		}
+		return err == nil && claimed
+	}
+	return s.record(deviceCode, productCode, traceID, result, operation)
+}
+
 func normalizePropertyOperation(operation string) string {
 	switch strings.TrimSpace(operation) {
 	case propertyOperationGet:
@@ -773,13 +986,82 @@ func normalizePropertyOperation(operation string) string {
 	}
 }
 
+func (s *Service) readDriver(device contracts.DeviceConfig, reqs []contracts.CommandRequest, metadata *ctl.Metadata) ([]*contracts.CommandValue, error) {
+	ctx, cancel := controlOperationContext(s.ctx, metadata)
+	defer cancel()
+	values, err := contracts.HandleReadCommandsWithContext(ctx, s.driver, device.InternalName, cfg.ProtocolPropertiesFromConfig(device), reqs)
+	s.reportDriverFault(device.InternalName, "property-read", err)
+	return values, err
+}
+
+func (s *Service) writeDriver(device contracts.DeviceConfig, reqs []contracts.CommandRequest, params []*contracts.CommandValue, metadata *ctl.Metadata) error {
+	ctx, cancel := controlOperationContext(s.ctx, metadata)
+	defer cancel()
+	err := contracts.HandleWriteCommandsWithContext(ctx, s.driver, device.InternalName, cfg.ProtocolPropertiesFromConfig(device), reqs, params)
+	s.reportDriverFault(device.InternalName, "property-write", err)
+	return err
+}
+
+func (s *Service) reportDriverFault(deviceName, operation string, err error) {
+	if err == nil || !errors.Is(err, contracts.ErrOperationStuck) {
+		return
+	}
+	if reporter, ok := s.catalog.(driverFaultReporter); ok {
+		reporter.ReportDriverFault(deviceName, operation, err)
+	}
+}
+
+func controlOperationContext(parent context.Context, metadata *ctl.Metadata) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	timeout := contracts.DefaultOperationTimeout
+	if metadata != nil && metadata.ExpiryTime > 0 {
+		remaining := time.Until(time.UnixMilli(metadata.ExpiryTime))
+		if remaining > 0 && remaining < timeout {
+			timeout = remaining
+		}
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
+func driverFailureResult(traceID string, err error) rtapi.PropertyResponse {
+	code := ctl.CodeDriverError
+	switch {
+	case contracts.IsAmbiguousWrite(err):
+		code = ctl.CodeAmbiguous
+	case errors.Is(err, contracts.ErrLegacyOperationBusy):
+		code = ctl.CodeBusy
+	case errors.Is(err, contracts.ErrOperationTimeout):
+		code = ctl.CodeTimeout
+	}
+	return newControlResult(traceID, code, err.Error(), nil)
+}
+
 func (s *Service) markAsyncActive(traceID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
 	if _, ok := s.activeAsync[traceID]; ok {
 		return false
 	}
 	s.activeAsync[traceID] = struct{}{}
+	s.wg.Add(1)
+	return true
+}
+
+func (s *Service) beginRequest() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
+	s.wg.Add(1)
 	return true
 }
 

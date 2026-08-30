@@ -78,6 +78,7 @@ type EventPublisher interface {
 type MultiGroupPublisher interface {
 	Publisher
 	GroupPublishers() []Publisher
+	GroupName(i int) string
 	GroupStatusTopic(i int) TopicConfig
 }
 
@@ -193,6 +194,7 @@ type mqttClient struct {
 	reconnecting   bool
 	lastConnectErr error
 	onConnectHooks []func()
+	clientID       string
 
 	healthMu sync.Mutex
 	healthy  bool

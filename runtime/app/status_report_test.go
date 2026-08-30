@@ -120,6 +120,7 @@ func TestInstallStatusPublisherUsesIncrementalAndHeartbeat(t *testing.T) {
 		Topic:             "v1/gateway/{productCode}/status/report",
 		HeartbeatInterval: "50ms",
 	}, &statusTestLogger{})
+	t.Cleanup(sp.Close)
 
 	waitForStatusMessages(t, publisher, 1, 300*time.Millisecond)
 	initial := publisher.Message(0).Message

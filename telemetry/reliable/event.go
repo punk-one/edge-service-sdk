@@ -12,6 +12,7 @@ import (
 	"time"
 
 	events "github.com/punk-one/edge-service-sdk/event"
+	"github.com/punk-one/edge-service-sdk/internal/sqliteutil"
 	logger "github.com/punk-one/edge-service-sdk/logging"
 
 	_ "modernc.org/sqlite"
@@ -81,12 +82,19 @@ func NewEventDispatcher(cfg EventOutboxConfig, transport EventTransport, logClie
 		enabled:   cfg.Enabled,
 		stopCh:    make(chan struct{}),
 	}
+	if dispatcher.cfg.MaxDatabaseBytes < sqliteutil.MinimumMaxBytes {
+		return nil, fmt.Errorf("event outbox max database bytes must be >= %d", sqliteutil.MinimumMaxBytes)
+	}
 	if !dispatcher.enabled {
 		return dispatcher, nil
 	}
 	store, err := newEventSQLiteStore(dispatcher.cfg.SQLitePath)
 	if err != nil {
 		return nil, err
+	}
+	if err := sqliteutil.ConfigureMaxBytes(store.db, dispatcher.cfg.MaxDatabaseBytes); err != nil {
+		_ = store.close()
+		return nil, fmt.Errorf("configure event sqlite capacity: %w", err)
 	}
 	dispatcher.store = store
 	dispatcher.replayTokens = float64(dispatcher.cfg.replayRatePerSec())
@@ -181,6 +189,28 @@ func (d *EventDispatcher) Stats() (EventQueueStats, error) {
 		result.OldestPendingAgeMs = time.Now().UnixMilli() - stats.oldestPendingCreatedAt
 	}
 	return result, nil
+}
+
+// HealthCheck verifies that the durable EVENT queue is readable and has
+// capacity remaining. Disabled EVENT delivery is healthy by definition.
+func (d *EventDispatcher) HealthCheck() error {
+	if d == nil {
+		return nil
+	}
+	if !d.enabled {
+		return nil
+	}
+	if d.store == nil || d.store.db == nil {
+		return fmt.Errorf("event sqlite store is not initialized")
+	}
+	var result string
+	if err := d.store.db.QueryRow(`PRAGMA quick_check(1);`).Scan(&result); err != nil {
+		return err
+	}
+	if result != "ok" {
+		return fmt.Errorf("event sqlite quick_check: %s", result)
+	}
+	return sqliteutil.CheckCapacity(d.store.db)
 }
 
 func (d *EventDispatcher) replayLoop() {
@@ -290,6 +320,9 @@ func normalizeEventOutboxConfig(cfg EventOutboxConfig) EventOutboxConfig {
 	if cfg.ReplayRatePerSec <= 0 {
 		cfg.ReplayRatePerSec = 20
 	}
+	if cfg.MaxDatabaseBytes == 0 {
+		cfg.MaxDatabaseBytes = sqliteutil.DefaultMaxBytes
+	}
 	return cfg
 }
 
@@ -325,8 +358,12 @@ func newEventSQLiteStore(path string) (*eventSQLiteStore, error) {
 	if err != nil {
 		return nil, err
 	}
+	// EVENT writes are serialized by the dispatcher; one connection prevents
+	// connection-local pragmas from being lost on a newly opened connection.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	store := &eventSQLiteStore{db: db}
-	for _, statement := range []string{"PRAGMA journal_mode = WAL;", "PRAGMA synchronous = NORMAL;", "PRAGMA busy_timeout = 5000;"} {
+	for _, statement := range []string{"PRAGMA journal_mode = WAL;", "PRAGMA synchronous = FULL;", "PRAGMA busy_timeout = 5000;"} {
 		if _, err := db.Exec(statement); err != nil {
 			_ = db.Close()
 			return nil, err
@@ -346,6 +383,12 @@ CREATE TABLE IF NOT EXISTS event_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_event_outbox_created_at ON event_outbox(created_at);
 CREATE INDEX IF NOT EXISTS idx_event_outbox_order ON event_outbox(device_code, category, event_time, id);
+CREATE TABLE IF NOT EXISTS event_outbox_dead_letter (
+	id INTEGER PRIMARY KEY,
+	payload_json BLOB NOT NULL,
+	reason TEXT NOT NULL,
+	quarantined_at INTEGER NOT NULL
+);
 `); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -422,6 +465,9 @@ func (s *eventSQLiteStore) appendBatch(items []events.Event) error {
 }
 
 func (s *eventSQLiteStore) fetchPending(limit int) ([]storedEvent, error) {
+	if err := s.quarantineMalformed(); err != nil {
+		return nil, fmt.Errorf("quarantine malformed event rows: %w", err)
+	}
 	if limit <= 0 {
 		limit = 100
 	}
@@ -448,6 +494,25 @@ func (s *eventSQLiteStore) fetchPending(limit int) ([]storedEvent, error) {
 		result = append(result, item)
 	}
 	return result, rows.Err()
+}
+
+func (s *eventSQLiteStore) quarantineMalformed() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`
+INSERT OR IGNORE INTO event_outbox_dead_letter(id, payload_json, reason, quarantined_at)
+SELECT id, payload_json, 'invalid payload_json', ?
+FROM event_outbox
+WHERE json_valid(payload_json) = 0`, time.Now().UnixMilli()); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM event_outbox WHERE json_valid(payload_json) = 0`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *eventSQLiteStore) ack(ids []int64) error {

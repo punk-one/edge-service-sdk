@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -8,6 +9,25 @@ import (
 	cmdapi "github.com/punk-one/edge-service-sdk/command"
 	contracts "github.com/punk-one/edge-service-sdk/driver"
 )
+
+func TestDeviceSDKDriverWatchdogOnlyReportsStuckOperations(t *testing.T) {
+	sdk := &DeviceSDK{}
+	called := 0
+	sdk.SetDriverFaultHandler(func(deviceName, operation string, err error) {
+		called++
+		if deviceName != "D1" || operation != "read" || !errors.Is(err, contracts.ErrOperationStuck) {
+			t.Fatalf("unexpected watchdog report: device=%s operation=%s err=%v", deviceName, operation, err)
+		}
+	})
+	sdk.ReportDriverFault("D1", "read", errors.New("ordinary protocol error"))
+	if called != 0 {
+		t.Fatalf("ordinary error triggered watchdog %d times", called)
+	}
+	sdk.ReportDriverFault("D1", "read", contracts.ErrOperationStuck)
+	if called != 1 {
+		t.Fatalf("stuck error triggered watchdog %d times, want 1", called)
+	}
+}
 
 type bootstrapTestCommand struct {
 	identifier string

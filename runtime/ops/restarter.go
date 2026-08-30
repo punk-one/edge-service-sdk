@@ -3,8 +3,6 @@ package ops
 
 import (
 	"fmt"
-	"os"
-	"time"
 )
 
 // RestartMode defines the type of service restart.
@@ -19,8 +17,9 @@ const (
 
 // Restarter provides service restart capabilities.
 type Restarter struct {
-	serviceName string
+	serviceName   string
 	onSoftRestart func() error // called before soft restart
+	onHardRestart func() error // requests an orderly process restart
 }
 
 // NewRestarter creates a new Restarter.
@@ -28,6 +27,17 @@ func NewRestarter(serviceName string, onSoftRestart func() error) *Restarter {
 	return &Restarter{
 		serviceName:   serviceName,
 		onSoftRestart: onSoftRestart,
+	}
+}
+
+// NewRestarterWithHooks creates a restarter whose hard-restart hook is owned
+// by the application lifecycle. The hook must initiate graceful shutdown and
+// let the process supervisor restart the service.
+func NewRestarterWithHooks(serviceName string, onSoftRestart, onHardRestart func() error) *Restarter {
+	return &Restarter{
+		serviceName:   serviceName,
+		onSoftRestart: onSoftRestart,
+		onHardRestart: onHardRestart,
 	}
 }
 
@@ -62,12 +72,13 @@ func (r *Restarter) softRestart() (*RestartResult, error) {
 }
 
 func (r *Restarter) hardRestart() (*RestartResult, error) {
-	msg := fmt.Sprintf("%s hard restart triggered — process will exit in 1 second", r.serviceName)
-	// Schedule exit after a brief delay so the response can be sent
-	go func() {
-		time.Sleep(1 * time.Second)
-		os.Exit(0)
-	}()
+	if r.onHardRestart == nil {
+		return nil, fmt.Errorf("hard restart is unavailable: no graceful shutdown hook configured")
+	}
+	if err := r.onHardRestart(); err != nil {
+		return nil, fmt.Errorf("hard restart request failed: %w", err)
+	}
+	msg := fmt.Sprintf("%s hard restart requested; graceful shutdown is starting", r.serviceName)
 	return &RestartResult{
 		Mode:    "hard",
 		Message: msg,

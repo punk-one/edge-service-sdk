@@ -1,7 +1,9 @@
 package command
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -25,6 +27,12 @@ type DeviceCatalog interface {
 	ProductCodes() []string
 }
 
+type driverFaultReporter interface {
+	ReportDriverFault(deviceName, operation string, err error)
+}
+
+const maxConcurrentCommandExecutions = 64
+
 type Service struct {
 	catalog              DeviceCatalog
 	driver               contracts.ProtocolDriver
@@ -35,27 +43,42 @@ type Service struct {
 	commandResultEnabled bool
 	fileClient           file.Client
 
-	mu          sync.Mutex
-	activeAsync map[string]struct{}
+	mu           sync.Mutex
+	deliveryMu   sync.Mutex
+	activeAsync  map[string]struct{}
+	closed       bool
+	wg           sync.WaitGroup
+	ctx          context.Context
+	cancel       context.CancelFunc
+	commandSlots chan struct{}
 }
 
 func NewService(catalog DeviceCatalog, driver contracts.ProtocolDriver, publisher mqtt.Publisher, store rtcontrol.Store, logClient logger.LoggingClient, registry cmdapi.Registry, fileClient file.Client) *Service {
 	if registry == nil {
 		registry = cmdapi.NewRegistry()
 	}
+	serviceCtx, cancel := context.WithCancel(context.Background())
 	return &Service{
-		catalog:     catalog,
-		driver:      driver,
-		publisher:   publisher,
-		store:       store,
-		registry:    registry,
-		logger:      logClient,
-		fileClient:  fileClient,
-		activeAsync: make(map[string]struct{}),
+		catalog:      catalog,
+		driver:       driver,
+		publisher:    publisher,
+		store:        store,
+		registry:     registry,
+		logger:       logClient,
+		fileClient:   fileClient,
+		activeAsync:  make(map[string]struct{}),
+		ctx:          serviceCtx,
+		cancel:       cancel,
+		commandSlots: make(chan struct{}, maxConcurrentCommandExecutions),
 	}
 }
 
 func (s *Service) Execute(identifier string, req cmdapi.CommandRequest, expectedProductCode string) (cmdapi.CommandResponse, int) {
+	if !s.beginRequest() {
+		result := newControlResult(req.TraceID, ctl.CodeBusy, "command service is shutting down", nil)
+		return result, httpStatusForCode(result.Code)
+	}
+	defer s.wg.Done()
 	if existing, ok := s.loadExistingResult(req.TraceID); ok {
 		return existing, httpStatusForCode(existing.Code)
 	}
@@ -110,6 +133,13 @@ func (s *Service) RegisterMQTTHandlers(config rtconfig.Config) {
 		return
 	}
 	s.commandResultEnabled = strings.TrimSpace(config.CommandResult.Topic) != ""
+	if registrar, ok := s.publisher.(interface{ RegisterOnConnect(func()) }); ok {
+		registrar.RegisterOnConnect(func() {
+			if err := s.ResumeResultDeliveries(); err != nil && s.logger != nil {
+				s.logger.Warnf("Failed to replay command results after MQTT reconnect: %v", err)
+			}
+		})
+	}
 	if strings.TrimSpace(config.CommandCall.Topic) == "" {
 		return
 	}
@@ -117,7 +147,7 @@ func (s *Service) RegisterMQTTHandlers(config rtconfig.Config) {
 	for _, productCode := range s.catalog.ProductCodes() {
 		subscribeTopic := strings.ReplaceAll(cfg.StringsReplaceProductCode(config.CommandCall.Topic, productCode), "{identifier}", "+")
 		callTemplate := config.CommandCall.Topic
-		_ = s.publisher.Subscribe(subscribeTopic, byte(config.CommandCall.QoS), func(topic string, payload []byte) {
+		if err := s.publisher.Subscribe(subscribeTopic, byte(config.CommandCall.QoS), func(topic string, payload []byte) {
 			identifier, ok := extractIdentifier(callTemplate, productCode, topic)
 			if !ok {
 				if s.logger != nil {
@@ -135,7 +165,9 @@ func (s *Service) RegisterMQTTHandlers(config rtconfig.Config) {
 				Identifier:  identifier,
 			})
 			s.handleCommandCall(productCode, identifier, payload)
-		})
+		}); err != nil && s.logger != nil {
+			s.logger.Warnf("Command subscription is pending retry: topic=%s err=%v", subscribeTopic, err)
+		}
 	}
 }
 
@@ -162,12 +194,56 @@ func (s *Service) ResumePending() error {
 		if !s.markAsyncActive(item.TraceID) {
 			continue
 		}
-		go s.runAsyncPending(item)
+		s.startAsyncPending(item)
 	}
 	return nil
 }
 
+// ResumeResultDeliveries replays durable final command results. A failed row
+// remains in SQLite and is retried on the next MQTT reconnect.
+func (s *Service) ResumeResultDeliveries() error {
+	if !s.beginRequest() {
+		return fmt.Errorf("command service is shutting down")
+	}
+	defer s.wg.Done()
+	outbox, ok := s.store.(rtcontrol.ResultOutbox)
+	if !ok {
+		return nil
+	}
+	s.deliveryMu.Lock()
+	defer s.deliveryMu.Unlock()
+	for {
+		items, err := outbox.ListResultDeliveries("command", 100)
+		if err != nil {
+			return err
+		}
+		if len(items) == 0 {
+			return nil
+		}
+		for _, item := range items {
+			if !s.commandResultEnabled {
+				if err := outbox.AckResultDelivery(item.TraceID); err != nil {
+					return err
+				}
+				continue
+			}
+			pending := rtcontrol.PendingCommand{TraceID: item.TraceID, DeviceCode: item.DeviceCode, ProductCode: item.ProductCode, Identifier: strings.TrimPrefix(item.Kind, "command:")}
+			if err := s.publishAsyncResult(pending, cmdapi.CommandResponse(item.Result)); err != nil {
+				_ = outbox.MarkResultDeliveryFailed(item.TraceID, err.Error())
+				return err
+			}
+			if err := outbox.AckResultDelivery(item.TraceID); err != nil {
+				return err
+			}
+		}
+	}
+}
+
 func (s *Service) handleCommandCall(productCode string, identifier string, payload []byte) {
+	if !s.beginRequest() {
+		return
+	}
+	defer s.wg.Done()
 	var req cmdapi.CommandRequest
 	if err := json.Unmarshal(payload, &req); err != nil {
 		if s.logger != nil {
@@ -195,13 +271,16 @@ func (s *Service) handleCommandCall(productCode string, identifier string, paylo
 	if !s.commandResultEnabled {
 		return
 	}
-	_ = s.publisher.PublishCommandResult(device, map[string]interface{}{
+	s.deliveryMu.Lock()
+	publishErr := s.publisher.PublishCommandResult(device, map[string]interface{}{
 		"trace_id": result.TraceID,
 		"code":     result.Code,
 		"message":  result.Message,
 		"data":     ensureDataMap(result.Data),
 		"time":     result.Time,
 	})
+	s.finishResultDelivery(result.TraceID, publishErr)
+	s.deliveryMu.Unlock()
 }
 
 func (s *Service) resolveCommandDevice(req cmdapi.CommandRequest, expectedProductCode string) (contracts.DeviceConfig, cmdapi.CommandRequest, int, error) {
@@ -271,6 +350,8 @@ func httpStatusForCode(code int) int {
 		return 202
 	case ctl.CodeBadRequest:
 		return 400
+	case ctl.CodeAmbiguous:
+		return 409
 	case 401:
 		return 401
 	case 403:
@@ -314,6 +395,14 @@ func extractIdentifier(template string, productCode string, topic string) (strin
 }
 
 func (s *Service) executeSync(device contracts.DeviceConfig, desc cmdapi.CommandDescriptor, cmd cmdapi.Command, req cmdapi.CommandRequest) (cmdapi.CommandResponse, int) {
+	processing := newControlResult(req.TraceID, ctl.CodeProcessing, "processing", map[string]interface{}{})
+	if !s.claimExecution(req.DeviceCode, device.ProductCode, desc.Identifier, req.TraceID, processing) {
+		if existing, ok := s.loadExistingResult(req.TraceID); ok {
+			return existing, httpStatusForCode(existing.Code)
+		}
+		busy := newControlResult(req.TraceID, ctl.CodeBusy, "command execution could not be claimed", nil)
+		return busy, httpStatusForCode(busy.Code)
+	}
 	resultData, cmdErr := s.executeRegisteredCommand(device, desc, cmd, req, nil)
 	if cmdErr != nil {
 		result := newControlResult(req.TraceID, normalizedErrorCode(cmdErr.Code), cmdErr.Error(), cmdErr.Data)
@@ -349,13 +438,17 @@ func (s *Service) executeAsync(device contracts.DeviceConfig, desc cmdapi.Comman
 	}
 	s.record(req.DeviceCode, device.ProductCode, desc.Identifier, req.TraceID, accepted)
 	if s.markAsyncActive(req.TraceID) {
-		go s.runAsyncPending(pending)
+		s.startAsyncPending(pending)
 	}
 	return accepted, httpStatusForCode(accepted.Code)
 }
 
 func (s *Service) runAsyncPending(pending rtcontrol.PendingCommand) {
 	defer s.clearAsyncActive(pending.TraceID)
+	processing := newControlResult(pending.TraceID, ctl.CodeProcessing, "processing", map[string]interface{}{})
+	if !s.claimExecution(pending.DeviceCode, pending.ProductCode, pending.Identifier, pending.TraceID, processing) {
+		return
+	}
 	result := s.executePendingCommand(pending)
 	applied := s.record(pending.DeviceCode, pending.ProductCode, pending.Identifier, pending.TraceID, result)
 	if rtcontrol.IsFinalCode(result.Code) && s.store != nil {
@@ -366,13 +459,55 @@ func (s *Service) runAsyncPending(pending rtcontrol.PendingCommand) {
 	if !applied || !rtcontrol.IsFinalCode(result.Code) {
 		return
 	}
-	if err := s.publishAsyncResult(pending, result); err != nil && s.logger != nil {
-		s.logger.Warnf("Failed to publish async command result trace=%s: %v", pending.TraceID, err)
+	s.deliveryMu.Lock()
+	publishErr := s.publishAsyncResult(pending, result)
+	s.finishResultDelivery(pending.TraceID, publishErr)
+	s.deliveryMu.Unlock()
+	if publishErr != nil && s.logger != nil {
+		s.logger.Warnf("Failed to publish async command result trace=%s: %v", pending.TraceID, publishErr)
 		return
 	}
 	if s.logger != nil {
 		s.logger.Infof("Async command completed trace=%s identifier=%s code=%d", pending.TraceID, pending.Identifier, result.Code)
 	}
+}
+
+func (s *Service) startAsyncPending(pending rtcontrol.PendingCommand) {
+	go func() {
+		defer s.wg.Done()
+		s.runAsyncPending(pending)
+	}()
+}
+
+// Close stops accepting new asynchronous work and waits for active commands.
+func (s *Service) Close(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	s.BeginShutdown()
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// BeginShutdown rejects new work and cancels context-aware in-flight work
+// without waiting. It is safe to call before stopping the protocol driver.
+func (s *Service) BeginShutdown() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
+	s.cancel()
 }
 
 func (s *Service) executePendingCommand(pending rtcontrol.PendingCommand) cmdapi.CommandResponse {
@@ -406,27 +541,55 @@ func (s *Service) executePendingCommand(pending rtcontrol.PendingCommand) cmdapi
 }
 
 func (s *Service) executeRegisteredCommand(device contracts.DeviceConfig, desc cmdapi.CommandDescriptor, cmd cmdapi.Command, req cmdapi.CommandRequest, progress func(cmdapi.ProgressPayload)) (_ map[string]interface{}, cmdErr *cmdapi.CommandError) {
+	operationCtx, cancelOperation := commandOperationContext(s.ctx, req.Metadata)
+	defer cancelOperation()
+	if err := operationCtx.Err(); err != nil {
+		return nil, cmdapi.BusyError("command service is shutting down", nil)
+	}
+	select {
+	case s.commandSlots <- struct{}{}:
+	default:
+		return nil, cmdapi.BusyError("command execution capacity is exhausted", nil)
+	}
+	s.wg.Add(1)
 	ctx := &runtimeCommandContext{
 		service:    s,
 		device:     device,
 		req:        req,
 		progress:   progress,
 		fileClient: s.fileClient,
+		ctx:        operationCtx,
 	}
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			message := fmt.Sprintf("command %s panicked", desc.Identifier)
-			if s.logger != nil {
-				s.logger.Errorf("%s: %v", message, recovered)
+	type executionResult struct {
+		data map[string]interface{}
+		err  *cmdapi.CommandError
+	}
+	done := make(chan executionResult, 1)
+	go func() {
+		defer func() { <-s.commandSlots }()
+		defer s.wg.Done()
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				message := fmt.Sprintf("command %s panicked", desc.Identifier)
+				if s.logger != nil {
+					s.logger.Errorf("%s: %v", message, recovered)
+				}
+				done <- executionResult{err: &cmdapi.CommandError{Code: 500, Message: message}}
 			}
-			cmdErr = &cmdapi.CommandError{Code: 500, Message: message}
-		}
+		}()
+		result, err := cmd.Execute(ctx, req)
+		done <- executionResult{data: ensureDataMap(result), err: err}
 	}()
-	result, err := cmd.Execute(ctx, req)
-	if err != nil {
-		return nil, err
+	select {
+	case result := <-done:
+		return result.data, result.err
+	case <-operationCtx.Done():
+		return nil, &cmdapi.CommandError{
+			Code:    ctl.CodeAmbiguous,
+			Message: fmt.Sprintf("command %s outcome is ambiguous after timeout", desc.Identifier),
+			Err:     operationCtx.Err(),
+		}
 	}
-	return ensureDataMap(result), nil
 }
 
 func (s *Service) recordProgress(pending rtcontrol.PendingCommand, progress cmdapi.ProgressPayload) {
@@ -454,6 +617,20 @@ func (s *Service) publishAsyncResult(pending rtcontrol.PendingCommand, result cm
 		"data":     ensureDataMap(result.Data),
 		"time":     result.Time,
 	})
+}
+
+func (s *Service) finishResultDelivery(traceID string, publishErr error) {
+	outbox, ok := s.store.(rtcontrol.ResultOutbox)
+	if !ok {
+		return
+	}
+	if publishErr != nil {
+		_ = outbox.MarkResultDeliveryFailed(traceID, publishErr.Error())
+		return
+	}
+	if err := outbox.AckResultDelivery(traceID); err != nil && s.logger != nil {
+		s.logger.Warnf("Failed to ack command result delivery trace=%s: %v", traceID, err)
+	}
 }
 
 func (s *Service) loadExistingResult(traceID string) (cmdapi.CommandResponse, bool) {
@@ -508,6 +685,13 @@ func (s *Service) record(deviceCode string, productCode string, identifier strin
 	if rtcontrol.IsFinalCode(result.Code) {
 		job.FinishedAt = now
 	}
+	if recorder, ok := s.store.(rtcontrol.AtomicRecorder); ok {
+		applied, err := recorder.RecordJobResult(job, ctl.Result(result), rtcontrol.IsFinalCode(result.Code))
+		if err != nil && s.logger != nil {
+			s.logger.Warnf("Failed to atomically record command result trace=%s: %v", traceID, err)
+		}
+		return err == nil && applied
+	}
 	applied, err := s.store.UpsertJob(job)
 	if err != nil {
 		if s.logger != nil {
@@ -524,13 +708,62 @@ func (s *Service) record(deviceCode string, productCode string, identifier strin
 	return true
 }
 
+func (s *Service) claimExecution(deviceCode, productCode, identifier, traceID string, result cmdapi.CommandResponse) bool {
+	if strings.TrimSpace(traceID) == "" {
+		return false
+	}
+	if s.store == nil {
+		return true
+	}
+	now := result.Time
+	if now <= 0 {
+		now = time.Now().UnixMilli()
+	}
+	job := rtcontrol.JobState{
+		TraceID:     traceID,
+		DeviceCode:  strings.TrimSpace(deviceCode),
+		ProductCode: strings.TrimSpace(productCode),
+		Kind:        rtcontrol.NormalizeKind("command", identifier),
+		Identifier:  strings.TrimSpace(identifier),
+		Code:        ctl.CodeProcessing,
+		Message:     result.Message,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if claimer, ok := s.store.(rtcontrol.ExecutionClaimer); ok {
+		claimed, err := claimer.ClaimExecution(job)
+		if err != nil && s.logger != nil {
+			s.logger.Warnf("Failed to claim command execution trace=%s: %v", traceID, err)
+		}
+		return err == nil && claimed
+	}
+	return s.record(deviceCode, productCode, identifier, traceID, result)
+}
+
 func (s *Service) markAsyncActive(traceID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
 	if _, ok := s.activeAsync[traceID]; ok {
 		return false
 	}
 	s.activeAsync[traceID] = struct{}{}
+	s.wg.Add(1)
+	return true
+}
+
+func (s *Service) beginRequest() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
+	s.wg.Add(1)
 	return true
 }
 
@@ -614,6 +847,7 @@ type runtimeCommandContext struct {
 	req        cmdapi.CommandRequest
 	progress   func(cmdapi.ProgressPayload)
 	fileClient file.Client
+	ctx        context.Context
 }
 
 func (c *runtimeCommandContext) TraceID() string {
@@ -648,8 +882,9 @@ func (c *runtimeCommandContext) GetProperties(names []string) (map[string]interf
 	if err != nil {
 		return nil, err
 	}
-	values, err := c.service.driver.HandleReadCommands(c.device.InternalName, rtconfig.ProtocolPropertiesFromConfig(c.device), commandReqs)
+	values, err := contracts.HandleReadCommandsWithContext(c.ctx, c.service.driver, c.device.InternalName, rtconfig.ProtocolPropertiesFromConfig(c.device), commandReqs)
 	if err != nil {
+		c.service.reportDriverFault(c.device.InternalName, "command-property-read", err)
 		return nil, err
 	}
 	return rtconfig.BuildPropertyResponse(values, bindings), nil
@@ -660,7 +895,9 @@ func (c *runtimeCommandContext) SetProperties(values map[string]interface{}) err
 	if err != nil {
 		return err
 	}
-	return c.service.driver.HandleWriteCommands(c.device.InternalName, rtconfig.ProtocolPropertiesFromConfig(c.device), commandReqs, params)
+	err = contracts.HandleWriteCommandsWithContext(c.ctx, c.service.driver, c.device.InternalName, rtconfig.ProtocolPropertiesFromConfig(c.device), commandReqs, params)
+	c.service.reportDriverFault(c.device.InternalName, "command-property-write", err)
+	return err
 }
 
 func (c *runtimeCommandContext) ReadTelemetry(names []string) (map[string]interface{}, error) {
@@ -668,8 +905,9 @@ func (c *runtimeCommandContext) ReadTelemetry(names []string) (map[string]interf
 	if err != nil {
 		return nil, err
 	}
-	values, err := c.service.driver.HandleReadCommands(c.device.InternalName, rtconfig.ProtocolPropertiesFromConfig(c.device), commandReqs)
+	values, err := contracts.HandleReadCommandsWithContext(c.ctx, c.service.driver, c.device.InternalName, rtconfig.ProtocolPropertiesFromConfig(c.device), commandReqs)
 	if err != nil {
+		c.service.reportDriverFault(c.device.InternalName, "command-telemetry-read", err)
 		return nil, err
 	}
 	result := make(map[string]interface{}, len(bindings))
@@ -682,6 +920,15 @@ func (c *runtimeCommandContext) ReadTelemetry(names []string) (map[string]interf
 	return result, nil
 }
 
+func (s *Service) reportDriverFault(deviceName, operation string, err error) {
+	if err == nil || !errors.Is(err, contracts.ErrOperationStuck) {
+		return
+	}
+	if reporter, ok := s.catalog.(driverFaultReporter); ok {
+		reporter.ReportDriverFault(deviceName, operation, err)
+	}
+}
+
 func (c *runtimeCommandContext) ReportProgress(progress cmdapi.ProgressPayload) {
 	if c == nil || c.progress == nil {
 		return
@@ -690,5 +937,19 @@ func (c *runtimeCommandContext) ReportProgress(progress cmdapi.ProgressPayload) 
 }
 
 func (c *runtimeCommandContext) IsCancelled() bool {
-	return false
+	return c == nil || c.ctx == nil || c.ctx.Err() != nil
+}
+
+func commandOperationContext(parent context.Context, metadata *ctl.Metadata) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	timeout := contracts.DefaultOperationTimeout
+	if metadata != nil && metadata.ExpiryTime > 0 {
+		remaining := time.Until(time.UnixMilli(metadata.ExpiryTime))
+		if remaining > 0 && remaining < timeout {
+			timeout = remaining
+		}
+	}
+	return context.WithTimeout(parent, timeout)
 }

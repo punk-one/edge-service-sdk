@@ -18,11 +18,12 @@ const telemetryCleanupInterval = time.Hour
 func DefaultTelemetryOutboxConfig() TelemetryOutboxConfig {
 	return TelemetryOutboxConfig{
 		SQLitePath:        "./data/telemetry-outbox.db",
-		RetentionDays:     7,
+		RetentionDays:     0,
 		SendBatchSize:     100,
 		MaxSendRatePerSec: 100,
 		RetryInitialMs:    1_000,
 		RetryMaxMs:        30_000,
+		MaxDatabaseBytes:  2 << 30,
 	}
 }
 
@@ -41,6 +42,9 @@ func NormalizeTelemetryOutboxConfig(cfg TelemetryOutboxConfig) TelemetryOutboxCo
 	}
 	if cfg.RetryMaxMs == 0 {
 		cfg.RetryMaxMs = defaults.RetryMaxMs
+	}
+	if cfg.MaxDatabaseBytes == 0 {
+		cfg.MaxDatabaseBytes = defaults.MaxDatabaseBytes
 	}
 	return cfg
 }
@@ -63,6 +67,9 @@ func ValidateTelemetryOutboxConfig(cfg TelemetryOutboxConfig) error {
 	if cfg.RetryMaxMs < cfg.RetryInitialMs {
 		return fmt.Errorf("telemetryOutbox.retryMaxMs must be >= telemetryOutbox.retryInitialMs")
 	}
+	if cfg.MaxDatabaseBytes < 64<<20 {
+		return fmt.Errorf("telemetryOutbox.maxDatabaseBytes must be >= 67108864")
+	}
 	return nil
 }
 
@@ -78,6 +85,10 @@ func NewTelemetryDispatcher(cfg TelemetryOutboxConfig, transport TelemetryTransp
 	store, err := newSQLiteStore(cfg.SQLitePath)
 	if err != nil {
 		return nil, err
+	}
+	if err := store.ConfigureMaxBytes(cfg.MaxDatabaseBytes); err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("configure telemetry outbox capacity: %w", err)
 	}
 
 	dispatcher := &TelemetryDispatcher{
@@ -179,10 +190,33 @@ func (d *TelemetryDispatcher) Stats() (TelemetryOutboxStats, error) {
 		LastSendAt:     d.lastSendAt,
 	}
 	d.metricsMu.RUnlock()
+	if sqlite, ok := d.store.(*sqliteStore); ok {
+		result.DeadLetterCount, _ = sqlite.DeadLetterCount()
+	}
 	if storeStats.OldestPendingCreatedAt > 0 {
 		result.OldestPendingAgeMs = nowMillis() - storeStats.OldestPendingCreatedAt
 	}
 	return result, nil
+}
+
+// HealthCheck verifies that the durable acceptance path is open and the
+// SQLite outbox remains structurally readable. MQTT health is checked by the
+// publisher separately.
+func (d *TelemetryDispatcher) HealthCheck() error {
+	if d == nil || d.store == nil {
+		return fmt.Errorf("telemetry dispatcher is not initialized")
+	}
+	d.lifecycleMu.RLock()
+	closed := d.closed
+	d.lifecycleMu.RUnlock()
+	if closed {
+		return fmt.Errorf("telemetry dispatcher is closed")
+	}
+	if checker, ok := d.store.(interface{ HealthCheck() error }); ok {
+		return checker.HealthCheck()
+	}
+	_, err := d.store.Stats()
+	return err
 }
 
 func (d *TelemetryDispatcher) run() {

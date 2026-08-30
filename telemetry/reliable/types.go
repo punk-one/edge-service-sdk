@@ -17,6 +17,7 @@ type TelemetryOutboxConfig struct {
 	MaxSendRatePerSec int    `yaml:"maxSendRatePerSec"`
 	RetryInitialMs    int    `yaml:"retryInitialMs"`
 	RetryMaxMs        int    `yaml:"retryMaxMs"`
+	MaxDatabaseBytes  int64  `yaml:"maxDatabaseBytes"`
 }
 
 // EventOutboxConfig is intentionally separate from telemetry configuration.
@@ -24,6 +25,7 @@ type TelemetryOutboxConfig struct {
 type EventOutboxConfig struct {
 	Enabled          bool
 	SQLitePath       string
+	MaxDatabaseBytes int64
 	BatchSize        int
 	ReplayIntervalMs int
 	ReplayRatePerSec int
@@ -84,10 +86,15 @@ type StoreStats struct {
 
 // TelemetryOutboxStats describes runtime-visible telemetry delivery metrics.
 type TelemetryOutboxStats struct {
-	PendingCount       int64
-	OldestPendingAgeMs int64
-	SendRatePerSec     int
-	LastSendAt         int64
+	PendingCount        int64
+	OldestPendingAgeMs  int64
+	SendRatePerSec      int
+	LastSendAt          int64
+	DeadLetterCount     int64
+	MQTTPendingCount    int64
+	MQTTOldestAgeMs     int64
+	MQTTDeadLetterCount int64
+	MQTTPendingByGroup  map[string]int64
 }
 
 // TelemetryDispatcher owns the single telemetry SQLite-to-MQTT delivery path.

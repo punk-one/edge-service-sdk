@@ -68,11 +68,16 @@ func (c MQTTConfig) disconnectQuiesce() uint {
 }
 
 func newMQTTClient(config MQTTConfig, logger logger.LoggingClient) *mqttClient {
+	clientID := config.ClientId
+	if clientID == "" {
+		clientID = fmt.Sprintf("sdk-%010d", rand.Int63n(10000000000))
+	}
 	client := &mqttClient{
 		config:        config,
 		logger:        logger,
 		subscriptions: make(map[string]subscription),
 		stopCh:        make(chan struct{}),
+		clientID:      clientID,
 	}
 
 	if err := client.connectOnce("bootstrap"); err != nil {
@@ -109,6 +114,10 @@ func (c *mqttClient) buildClientOptions(clientID string) (*paho.ClientOptions, e
 	opts := paho.NewClientOptions()
 	opts.AddBroker(c.config.URL)
 	opts.SetClientID(clientID)
+	if c.config.ClientId != "" {
+		// A configured stable client id opts into persistent inbound sessions.
+		opts.SetCleanSession(false)
+	}
 	opts.SetAutoReconnect(false)
 	opts.SetConnectRetry(false)
 	opts.SetKeepAlive(c.config.keepAlive())
@@ -147,9 +156,6 @@ func (c *mqttClient) buildClientOptions(clientID string) (*paho.ClientOptions, e
 
 	opts.SetOnConnectHandler(func(client paho.Client) {
 		c.logger.Infof("Connected to MQTT broker: %s", c.config.URL)
-		c.markHealthy("connected")
-		c.resubscribeAll(client)
-		c.runOnConnectHooks()
 	})
 
 	return opts, nil
@@ -170,13 +176,7 @@ func (c *mqttClient) connectOnce(mode string) error {
 		return fmt.Errorf("mqtt broker url is empty")
 	}
 
-	clientID := c.config.ClientId
-	if clientID == "" {
-		clientID = fmt.Sprintf("sdk-%010d", rand.Int63n(10000000000))
-	} else {
-		clientID = fmt.Sprintf("%s-%06d", clientID, rand.Intn(1000000))
-	}
-	opts, err := c.buildClientOptions(clientID)
+	opts, err := c.buildClientOptions(c.clientID)
 	if err != nil {
 		return err
 	}
@@ -202,6 +202,14 @@ func (c *mqttClient) connectOnce(mode string) error {
 	if oldClient != nil && oldClient != client && oldClient.IsConnectionOpen() {
 		oldClient.Disconnect(c.config.disconnectQuiesce())
 	}
+	if err := c.resubscribeAll(client); err != nil {
+		c.resetClient(client)
+		client.Disconnect(0)
+		c.markUnhealthy("subscription recovery failed")
+		return fmt.Errorf("restore mqtt subscriptions: %w", err)
+	}
+	c.markHealthy("connected and subscriptions restored")
+	c.runOnConnectHooks()
 
 	return nil
 }
@@ -289,11 +297,10 @@ func (c *mqttClient) Subscribe(topic string, qos byte, handler MessageHandler) e
 	}
 
 	if err := c.subscribeWithClient(client, topic, qos, handler); err != nil {
-		if !mqttClientReady(client) {
-			c.resetClient(client)
-			c.markUnhealthy("subscribe failed on disconnected client")
-			c.startReconnect("subscribe_failure", err)
-		}
+		c.resetClient(client)
+		client.Disconnect(0)
+		c.markUnhealthy("subscribe failed")
+		c.startReconnect("subscribe_failure", err)
 		return err
 	}
 
@@ -316,13 +323,15 @@ func (c *mqttClient) Close() error {
 	return nil
 }
 
-func (c *mqttClient) resubscribeAll(client paho.Client) {
+func (c *mqttClient) resubscribeAll(client paho.Client) error {
 	subscriptions := c.subscriptionSnapshot()
 	for topic, sub := range subscriptions {
 		if err := c.subscribeWithClient(client, topic, sub.qos, sub.handler); err != nil {
 			c.logger.Warnf("Failed to resubscribe topic %s: %v", topic, err)
+			return err
 		}
 	}
+	return nil
 }
 
 func (c *mqttClient) subscribeWithClient(client paho.Client, topic string, qos byte, handler MessageHandler) error {
@@ -356,10 +365,11 @@ func (c *mqttClient) publishMessage(message mqttMessage) error {
 	if err := waitToken(token, c.config.publishTimeout(), "publish"); err != nil {
 		c.markUnhealthy("publish failed")
 		c.logger.Warnf("Failed to publish MQTT topic %s: %v", message.Topic, err)
-		if !mqttClientReady(client) {
-			c.resetClient(client)
-			c.startReconnect("publish_failure", err)
-		}
+		// Token timeout on a half-open socket must force a new TCP/MQTT session;
+		// IsConnected alone is not a sufficient health signal.
+		c.resetClient(client)
+		client.Disconnect(0)
+		c.startReconnect("publish_failure", err)
 		return err
 	}
 

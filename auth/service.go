@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/punk-one/edge-service-sdk/internal/atomicfile"
+	"github.com/punk-one/edge-service-sdk/internal/sqliteutil"
 	rtapi "github.com/punk-one/edge-service-sdk/property"
 
 	_ "modernc.org/sqlite"
@@ -61,6 +63,7 @@ type ProtectedRequest struct {
 // Config controls auth storage and validation.
 type Config struct {
 	SQLitePath       string
+	MaxDatabaseBytes int64
 	KeyFile          string
 	BootstrapToken   string
 	AccessTokenTTL   time.Duration
@@ -95,6 +98,10 @@ func NewService(cfg Config) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
+	// SQLite pragmas are connection-local. Keep the shared auth handle on one
+	// configured connection so FULL durability and busy_timeout always apply.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	svc := &Service{
 		db:  db,
 		key: key,
@@ -120,7 +127,10 @@ func (s *Service) HealthCheck() error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("auth service is not initialized")
 	}
-	return s.db.Ping()
+	if err := s.db.Ping(); err != nil {
+		return err
+	}
+	return sqliteutil.CheckCapacity(s.db)
 }
 
 // IsInitialized reports whether the single credential exists.
@@ -261,13 +271,16 @@ func (s *Service) AuthorizeProtected(req ProtectedRequest) error {
 func (s *Service) init() error {
 	pragmas := []string{
 		"PRAGMA journal_mode = WAL;",
-		"PRAGMA synchronous = NORMAL;",
+		"PRAGMA synchronous = FULL;",
 		"PRAGMA busy_timeout = 5000;",
 	}
 	for _, stmt := range pragmas {
 		if _, err := s.db.Exec(stmt); err != nil {
 			return err
 		}
+	}
+	if err := sqliteutil.ConfigureMaxBytes(s.db, s.cfg.MaxDatabaseBytes); err != nil {
+		return fmt.Errorf("configure auth sqlite capacity: %w", err)
 	}
 
 	_, err := s.db.Exec(`
@@ -406,6 +419,9 @@ func normalizeConfig(cfg Config) Config {
 	if strings.TrimSpace(cfg.KeyFile) == "" {
 		cfg.KeyFile = "./data/auth.key"
 	}
+	if cfg.MaxDatabaseBytes == 0 {
+		cfg.MaxDatabaseBytes = sqliteutil.DefaultMaxBytes
+	}
 	if cfg.AccessTokenTTL <= 0 {
 		cfg.AccessTokenTTL = 10 * time.Minute
 	}
@@ -505,6 +521,8 @@ func ensureKeyFile(path string) ([]byte, error) {
 			return nil, fmt.Errorf("invalid auth key length: %d", len(decoded))
 		}
 		return decoded, nil
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read auth key file: %w", err)
 	}
 
 	buf := make([]byte, 32)
@@ -512,8 +530,14 @@ func ensureKeyFile(path string) ([]byte, error) {
 		return nil, err
 	}
 	encoded := base64.RawURLEncoding.EncodeToString(buf)
-	if err := os.WriteFile(path, []byte(encoded), 0o600); err != nil {
+	created, err := atomicfile.WriteFileIfAbsent(path, []byte(encoded), 0o600)
+	if err != nil {
 		return nil, err
+	}
+	if !created {
+		// Another process won the create race. Always use the durable winner so
+		// encrypted credentials remain decryptable after either process exits.
+		return ensureKeyFile(path)
 	}
 	return buf, nil
 }

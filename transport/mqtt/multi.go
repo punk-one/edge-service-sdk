@@ -2,6 +2,7 @@ package mqtt
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,9 +25,11 @@ func NewPublisher(cfg MQTTConfig, telemetry, propertyResult, propertyReport, com
 // ─── MultiPublisher ───────────────────────────────────────────────────────────
 
 type multiPublisher struct {
-	groups   []*groupPublisher
-	logger   logger.LoggingClient
-	observer Observer
+	groups    []*groupPublisher
+	logger    logger.LoggingClient
+	observer  Observer
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func newMultiPublisher(cfg MQTTConfig, telemetry, propertyResult, propertyReport, commandResult, statusReport TopicConfig, logClient logger.LoggingClient, eventReport ...TopicConfig) *multiPublisher {
@@ -63,6 +66,16 @@ func (m *multiPublisher) GroupPublishers() []Publisher {
 		result[i] = g
 	}
 	return result
+}
+
+// GroupName returns the stable destination identifier used by durable
+// per-group delivery. Names are validated as unique during configuration
+// loading, so pending rows remain bound to the same group across restarts.
+func (m *multiPublisher) GroupName(i int) string {
+	if i < 0 || i >= len(m.groups) {
+		return ""
+	}
+	return m.groups[i].name
 }
 
 func (m *multiPublisher) GroupStatusTopic(i int) TopicConfig {
@@ -201,16 +214,15 @@ func (m *multiPublisher) PublishJSON(topic string, qos byte, retain bool, payloa
 }
 
 func (m *multiPublisher) HealthCheck() error {
-	healthyCount := 0
+	var unhealthy []string
 	for _, g := range m.groups {
 		if err := g.HealthCheck(); err != nil {
 			m.logger.Warnf("[mqtt] group %s: HealthCheck: %v", g.name, err)
-		} else {
-			healthyCount++
+			unhealthy = append(unhealthy, g.name)
 		}
 	}
-	if healthyCount == 0 {
-		return fmt.Errorf("all %d mqtt groups unhealthy", len(m.groups))
+	if len(unhealthy) > 0 {
+		return fmt.Errorf("mqtt groups unhealthy: %s", strings.Join(unhealthy, ","))
 	}
 	return nil
 }
@@ -225,14 +237,15 @@ func (m *multiPublisher) RegisterOnConnect(hook func()) {
 }
 
 func (m *multiPublisher) Close() error {
-	var lastErr error
-	for _, g := range m.groups {
-		if err := g.Close(); err != nil {
-			m.logger.Warnf("[mqtt] group %s: Close failed: %v", g.name, err)
-			lastErr = err
+	m.closeOnce.Do(func() {
+		for _, g := range m.groups {
+			if err := g.Close(); err != nil {
+				m.logger.Warnf("[mqtt] group %s: Close failed: %v", g.name, err)
+				m.closeErr = err
+			}
 		}
-	}
-	return lastErr
+	})
+	return m.closeErr
 }
 
 func (m *multiPublisher) setObserver(observer Observer) {
@@ -289,6 +302,8 @@ type groupPublisher struct {
 	connectHooks  []func()
 	stopCh        chan struct{}
 	started       bool
+	closeOnce     sync.Once
+	closeErr      error
 }
 
 type subscriptionRecord struct {
@@ -619,13 +634,15 @@ func (g *groupPublisher) preparePublisher(p *MQTTPublisher) {
 }
 
 func (g *groupPublisher) Close() error {
-	close(g.stopCh)
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.active != nil {
-		return g.active.Close()
-	}
-	return nil
+	g.closeOnce.Do(func() {
+		close(g.stopCh)
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		if g.active != nil {
+			g.closeErr = g.active.Close()
+		}
+	})
+	return g.closeErr
 }
 
 func (g *groupPublisher) setObserver(observer Observer) {

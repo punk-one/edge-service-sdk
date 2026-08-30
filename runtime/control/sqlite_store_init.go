@@ -4,14 +4,16 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	ctl "github.com/punk-one/edge-service-sdk/control"
+	"github.com/punk-one/edge-service-sdk/internal/sqliteutil"
 )
 
 func (s *sqliteStore) init() error {
 	stmts := []string{
 		`PRAGMA journal_mode = WAL;`,
-		`PRAGMA synchronous = NORMAL;`,
+		`PRAGMA synchronous = FULL;`,
 		`PRAGMA busy_timeout = 5000;`,
 		`CREATE TABLE IF NOT EXISTS control_jobs (
 			trace_id TEXT PRIMARY KEY,
@@ -52,6 +54,27 @@ func (s *sqliteStore) init() error {
 			created_at INTEGER NOT NULL,
 			updated_at INTEGER NOT NULL
 		);`,
+		`CREATE TABLE IF NOT EXISTS control_result_outbox (
+			trace_id TEXT PRIMARY KEY,
+			device_code TEXT NOT NULL,
+			product_code TEXT NOT NULL DEFAULT '',
+			kind TEXT NOT NULL,
+			payload_json TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			delivery_attempts INTEGER NOT NULL DEFAULT 0,
+			last_attempt_at INTEGER,
+			last_error TEXT
+		);`,
+		`CREATE TABLE IF NOT EXISTS control_result_dead_letter (
+			trace_id TEXT PRIMARY KEY,
+			payload_json TEXT NOT NULL,
+			reason TEXT NOT NULL,
+			quarantined_at INTEGER NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_control_results_trace_id_id ON control_results(trace_id, id DESC);`,
+		`CREATE INDEX IF NOT EXISTS idx_control_jobs_updated_at ON control_jobs(updated_at DESC, trace_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_control_jobs_device_kind ON control_jobs(device_code, kind, updated_at DESC);`,
+		`CREATE INDEX IF NOT EXISTS idx_control_result_outbox_kind_created ON control_result_outbox(kind, created_at);`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.Exec(stmt); err != nil {
@@ -70,8 +93,63 @@ func (s *sqliteStore) init() error {
 	if err := s.ensureColumn("control_pending_properties", "operation", "TEXT NOT NULL DEFAULT 'set'"); err != nil {
 		return err
 	}
-	_ = ctl.CodeSuccess
-	return nil
+	if err := s.recoverInterruptedJobs(); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(`PRAGMA user_version = 2;`)
+	return err
+}
+
+func (s *sqliteStore) recoverInterruptedJobs() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.Query(`SELECT trace_id, device_code, product_code, kind FROM control_jobs WHERE code = ?`, ctl.CodeProcessing)
+	if err != nil {
+		return err
+	}
+	var interrupted []JobState
+	for rows.Next() {
+		var job JobState
+		if err := rows.Scan(&job.TraceID, &job.DeviceCode, &job.ProductCode, &job.Kind); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		interrupted = append(interrupted, job)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	now := time.Now().UnixMilli()
+	for _, job := range interrupted {
+		traceID := job.TraceID
+		message := "execution outcome is ambiguous after process restart"
+		result := ctl.Result{TraceID: traceID, Code: ctl.CodeAmbiguous, Message: message, Data: map[string]interface{}{}, Time: now}
+		payload, err := jsonMarshal(result)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE control_jobs SET code = ?, message = ?, updated_at = ?, finished_at = ? WHERE trace_id = ? AND code = ?`, ctl.CodeAmbiguous, message, now, now, traceID, ctl.CodeProcessing); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO control_results(trace_id, code, message, result_json, is_final, reported_at) VALUES(?, ?, ?, ?, 1, ?)`, traceID, result.Code, result.Message, string(payload), result.Time); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO control_result_outbox(trace_id, device_code, product_code, kind, payload_json, created_at) VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(trace_id) DO NOTHING`, traceID, job.DeviceCode, job.ProductCode, job.Kind, string(payload), now); err != nil {
+			return err
+		}
+		// The outcome is deliberately final/ambiguous, so retaining the async
+		// request would only cause a futile replay attempt on every restart.
+		if _, err := tx.Exec(`DELETE FROM control_pending_commands WHERE trace_id = ?`, traceID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM control_pending_properties WHERE trace_id = ?`, traceID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *sqliteStore) ensureColumn(table string, column string, definition string) error {
@@ -107,9 +185,36 @@ func (s *sqliteStore) LoadJob(traceID string) (JobState, bool, error) {
 	return job, true, nil
 }
 
+func (s *sqliteStore) HealthCheck() error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("control sqlite store is not initialized")
+	}
+	var result string
+	if err := s.db.QueryRow(`PRAGMA quick_check(1);`).Scan(&result); err != nil {
+		return err
+	}
+	if result != "ok" {
+		return fmt.Errorf("control sqlite quick_check: %s", result)
+	}
+	return sqliteutil.CheckCapacity(s.db)
+}
+
+func (s *sqliteStore) ConfigureMaxBytes(maxBytes int64) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("control sqlite store is not initialized")
+	}
+	return sqliteutil.ConfigureMaxBytes(s.db, maxBytes)
+}
+
 func (s *sqliteStore) ListJobs(filter JobFilter) ([]JobState, error) {
 	if s == nil || s.db == nil {
 		return nil, fmt.Errorf("sqlite store is not initialized")
+	}
+	if filter.Limit <= 0 {
+		filter.Limit = 100
+	}
+	if filter.Limit > 1_000 {
+		filter.Limit = 1_000
 	}
 	whereSQL, args := buildJobFilterSQL(filter)
 	query := `SELECT trace_id, device_code, product_code, kind, identifier, code, message, created_at, updated_at, finished_at FROM control_jobs WHERE ` + whereSQL + ` ORDER BY updated_at DESC, created_at DESC`
@@ -139,6 +244,39 @@ func (s *sqliteStore) ListJobs(filter JobFilter) ([]JobState, error) {
 		items = append(items, item)
 	}
 	return items, rows.Err()
+}
+
+// PurgeFinishedBefore atomically removes final jobs and their result history.
+func (s *sqliteStore) PurgeFinishedBefore(cutoffMillis int64) (int64, error) {
+	if s == nil || s.db == nil || cutoffMillis <= 0 {
+		return 0, nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`DELETE FROM control_pending_commands WHERE trace_id IN (SELECT trace_id FROM control_jobs WHERE finished_at > 0 AND finished_at < ?)`, cutoffMillis); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(`DELETE FROM control_pending_properties WHERE trace_id IN (SELECT trace_id FROM control_jobs WHERE finished_at > 0 AND finished_at < ?)`, cutoffMillis); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(`DELETE FROM control_results WHERE trace_id IN (SELECT trace_id FROM control_jobs WHERE finished_at > 0 AND finished_at < ?)`, cutoffMillis); err != nil {
+		return 0, err
+	}
+	result, err := tx.Exec(`DELETE FROM control_jobs WHERE finished_at > 0 AND finished_at < ?`, cutoffMillis)
+	if err != nil {
+		return 0, err
+	}
+	removed, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return removed, nil
 }
 
 func (s *sqliteStore) JobDiagnostics(filter JobFilter) (JobDiagnostics, error) {
@@ -432,6 +570,44 @@ func (s *sqliteStore) UpsertJob(job JobState) (bool, error) {
 	return err == nil, err
 }
 
+func (s *sqliteStore) ClaimExecution(job JobState) (bool, error) {
+	if s == nil || s.db == nil {
+		return false, fmt.Errorf("sqlite store is not initialized")
+	}
+	if stringsTrimSpace(job.TraceID) == "" {
+		return false, fmt.Errorf("trace_id is required")
+	}
+	if job.UpdatedAt <= 0 {
+		job.UpdatedAt = time.Now().UnixMilli()
+	}
+	if job.CreatedAt <= 0 {
+		job.CreatedAt = job.UpdatedAt
+	}
+	result, err := s.db.Exec(`
+INSERT INTO control_jobs(
+	trace_id, device_code, product_code, kind, identifier, code, message,
+	created_at, updated_at, finished_at
+) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+ON CONFLICT(trace_id) DO UPDATE SET
+	device_code = excluded.device_code,
+	product_code = excluded.product_code,
+	kind = excluded.kind,
+	identifier = excluded.identifier,
+	code = excluded.code,
+	message = excluded.message,
+	updated_at = excluded.updated_at,
+	finished_at = 0
+WHERE control_jobs.code = ?`,
+		job.TraceID, job.DeviceCode, job.ProductCode, job.Kind, job.Identifier,
+		job.Code, job.Message, job.CreatedAt, job.UpdatedAt, ctl.CodeAccepted,
+	)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	return affected == 1, err
+}
+
 func (s *sqliteStore) SaveResult(traceID string, result ctl.Result, final bool) error {
 	finalVal := 0
 	if final {
@@ -443,15 +619,109 @@ func (s *sqliteStore) SaveResult(traceID string, result ctl.Result, final bool) 
 			return nil
 		}
 	}
-	_, err = s.db.Exec(`INSERT INTO control_results(trace_id, code, message, result_json, is_final, reported_at) VALUES(?, ?, ?, ?, ?, ?)`, traceID, result.Code, result.Message, string(mustMarshal(result)), finalVal, result.Time)
+	payload, marshalErr := jsonMarshal(result)
+	if marshalErr != nil {
+		return fmt.Errorf("marshal control result: %w", marshalErr)
+	}
+	_, err = s.db.Exec(`INSERT INTO control_results(trace_id, code, message, result_json, is_final, reported_at) VALUES(?, ?, ?, ?, ?, ?)`, traceID, result.Code, result.Message, string(payload), finalVal, result.Time)
 	return err
+}
+
+func (s *sqliteStore) RecordJobResult(job JobState, result ctl.Result, final bool) (bool, error) {
+	if s == nil || s.db == nil {
+		return false, fmt.Errorf("sqlite store is not initialized")
+	}
+	if stringsTrimSpace(job.TraceID) == "" {
+		return false, fmt.Errorf("trace_id is required")
+	}
+	if job.UpdatedAt <= 0 {
+		job.UpdatedAt = time.Now().UnixMilli()
+	}
+	if job.CreatedAt <= 0 {
+		job.CreatedAt = job.UpdatedAt
+	}
+	if final && job.FinishedAt <= 0 {
+		job.FinishedAt = job.UpdatedAt
+	}
+	if result.Time <= 0 {
+		result.Time = job.UpdatedAt
+	}
+	payload, err := jsonMarshal(result)
+	if err != nil {
+		return false, fmt.Errorf("marshal control result: %w", err)
+	}
+	finalValue := 0
+	if final {
+		finalValue = 1
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	upsert, err := tx.Exec(`
+INSERT INTO control_jobs(
+	trace_id, device_code, product_code, kind, identifier, code, message,
+	created_at, updated_at, finished_at
+) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(trace_id) DO UPDATE SET
+	device_code = excluded.device_code,
+	product_code = excluded.product_code,
+	kind = excluded.kind,
+	identifier = excluded.identifier,
+	code = excluded.code,
+	message = excluded.message,
+	updated_at = excluded.updated_at,
+	finished_at = excluded.finished_at
+WHERE control_jobs.code IN (?, ?)
+	AND (control_jobs.code <> excluded.code
+		OR control_jobs.message <> excluded.message
+		OR control_jobs.device_code <> excluded.device_code
+		OR control_jobs.product_code <> excluded.product_code
+		OR control_jobs.kind <> excluded.kind
+		OR control_jobs.identifier <> excluded.identifier)`,
+		job.TraceID, job.DeviceCode, job.ProductCode, job.Kind, job.Identifier,
+		job.Code, job.Message, job.CreatedAt, job.UpdatedAt, job.FinishedAt,
+		ctl.CodeProcessing, ctl.CodeAccepted,
+	)
+	if err != nil {
+		return false, err
+	}
+	affected, err := upsert.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if _, err := tx.Exec(`INSERT INTO control_results(trace_id, code, message, result_json, is_final, reported_at) VALUES(?, ?, ?, ?, ?, ?)`, job.TraceID, result.Code, result.Message, string(payload), finalValue, result.Time); err != nil {
+		return false, err
+	}
+	if final {
+		if _, err := tx.Exec(`
+INSERT INTO control_result_outbox(trace_id, device_code, product_code, kind, payload_json, created_at)
+VALUES(?, ?, ?, ?, ?, ?)
+ON CONFLICT(trace_id) DO NOTHING`, job.TraceID, job.DeviceCode, job.ProductCode, job.Kind, string(payload), job.UpdatedAt); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *sqliteStore) SavePendingCommand(job PendingCommand) (bool, error) {
 	if s == nil || s.db == nil {
 		return false, fmt.Errorf("sqlite store is not initialized")
 	}
-	payload := mustMarshal(job.Request)
+	payload, err := jsonMarshal(job.Request)
+	if err != nil {
+		return false, fmt.Errorf("marshal pending command: %w", err)
+	}
 	result, err := s.db.Exec(`INSERT OR IGNORE INTO control_pending_commands(trace_id, device_code, product_code, identifier, request_json, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)`,
 		job.TraceID, job.DeviceCode, job.ProductCode, job.Identifier, string(payload), job.CreatedAt, job.UpdatedAt)
 	if err != nil {
@@ -501,7 +771,10 @@ func (s *sqliteStore) SavePendingProperty(job PendingProperty) (bool, error) {
 	if s == nil || s.db == nil {
 		return false, fmt.Errorf("sqlite store is not initialized")
 	}
-	payload := mustMarshal(job.Request)
+	payload, err := jsonMarshal(job.Request)
+	if err != nil {
+		return false, fmt.Errorf("marshal pending property: %w", err)
+	}
 	result, err := s.db.Exec(`INSERT OR IGNORE INTO control_pending_properties(trace_id, device_code, product_code, operation, request_json, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)`,
 		job.TraceID, job.DeviceCode, job.ProductCode, normalizePendingPropertyOperation(job.Operation), string(payload), job.CreatedAt, job.UpdatedAt)
 	if err != nil {
@@ -548,6 +821,80 @@ func (s *sqliteStore) ListPendingProperties() ([]PendingProperty, error) {
 	return items, rows.Err()
 }
 
+func (s *sqliteStore) ListResultDeliveries(kindPrefix string, limit int) ([]ResultDelivery, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("sqlite store is not initialized")
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	if err := s.quarantineMalformedResultDeliveries(); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.Query(`
+SELECT trace_id, device_code, product_code, kind, payload_json, created_at, delivery_attempts
+FROM control_result_outbox
+WHERE kind = ? OR kind LIKE ?
+ORDER BY created_at, trace_id
+LIMIT ?`, kindPrefix, kindPrefix+":%", limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]ResultDelivery, 0, limit)
+	for rows.Next() {
+		var item ResultDelivery
+		var payload string
+		if err := rows.Scan(&item.TraceID, &item.DeviceCode, &item.ProductCode, &item.Kind, &payload, &item.CreatedAt, &item.Attempts); err != nil {
+			return nil, err
+		}
+		if err := jsonUnmarshal([]byte(payload), &item.Result); err != nil {
+			return nil, err
+		}
+		if item.Result.Data == nil {
+			item.Result.Data = map[string]interface{}{}
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func (s *sqliteStore) AckResultDelivery(traceID string) error {
+	result, err := s.db.Exec(`DELETE FROM control_result_outbox WHERE trace_id = ?`, traceID)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected > 1 {
+		return fmt.Errorf("ack result delivery affected %d rows", affected)
+	}
+	return nil
+}
+
+func (s *sqliteStore) MarkResultDeliveryFailed(traceID, message string) error {
+	_, err := s.db.Exec(`UPDATE control_result_outbox SET delivery_attempts = delivery_attempts + 1, last_attempt_at = ?, last_error = ? WHERE trace_id = ?`, time.Now().UnixMilli(), stringsTrimSpace(message), traceID)
+	return err
+}
+
+func (s *sqliteStore) quarantineMalformedResultDeliveries() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	now := time.Now().UnixMilli()
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO control_result_dead_letter(trace_id, payload_json, reason, quarantined_at) SELECT trace_id, payload_json, 'invalid payload_json', ? FROM control_result_outbox WHERE json_valid(payload_json) = 0`, now); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM control_result_outbox WHERE json_valid(payload_json) = 0`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func normalizePendingPropertyOperation(operation string) string {
 	switch stringsTrimSpace(operation) {
 	case "get":
@@ -562,12 +909,4 @@ func (s *sqliteStore) Close() error {
 		return nil
 	}
 	return s.db.Close()
-}
-
-func mustMarshal(v interface{}) []byte {
-	buf, err := jsonMarshal(v)
-	if err != nil {
-		return []byte(fmt.Sprintf(`{"marshal_error":%q}`, err.Error()))
-	}
-	return buf
 }

@@ -1,6 +1,7 @@
 package logger
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -55,16 +56,22 @@ func buildOutput(config Config) io.Writer {
 	}
 
 	if dir := filepath.Dir(path); dir != "." && dir != "" {
-		_ = os.MkdirAll(dir, 0o755)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to create log directory %s: %v; using stderr\n", dir, err)
+			return os.Stderr
+		}
 	}
 
-	return &lumberjack.Logger{
+	rotating := &lumberjack.Logger{
 		Filename:   path,
 		MaxSize:    maxOrDefault(config.MaxSize, 100),
 		MaxAge:     maxOrDefault(config.MaxFiles, 7),
 		MaxBackups: maxOrDefault(config.MaxBackups, 3),
 		Compress:   config.Compress,
 	}
+	// Keep an independent console copy so disk-full and log-rotation failures
+	// do not make the service completely unobservable.
+	return io.MultiWriter(os.Stdout, rotating)
 }
 
 func maxOrDefault(value int, fallback int) int {

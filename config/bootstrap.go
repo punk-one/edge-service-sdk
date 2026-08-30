@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	contracts "github.com/punk-one/edge-service-sdk/driver"
 	logger "github.com/punk-one/edge-service-sdk/logging"
@@ -14,6 +15,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+const DefaultRuntimeDatabaseMaxBytes int64 = 2 << 30
 
 // Config represents the application configuration.
 type Config struct {
@@ -52,13 +55,15 @@ type NATSBusConfig struct {
 
 // StorageConfig represents shared runtime storage.
 type StorageConfig struct {
-	SQLitePath string `yaml:"sqlitePath"`
+	SQLitePath       string `yaml:"sqlitePath"`
+	MaxDatabaseBytes int64  `yaml:"maxDatabaseBytes"`
 }
 
 // ControlStoreConfig controls local control job persistence.
 type ControlStoreConfig struct {
-	SQLitePath    string `yaml:"sqlitePath"`
-	RetentionDays int    `yaml:"retentionDays"`
+	SQLitePath       string `yaml:"sqlitePath"`
+	RetentionDays    int    `yaml:"retentionDays"`
+	MaxDatabaseBytes int64  `yaml:"maxDatabaseBytes"`
 }
 
 // AuthConfig represents auth-related runtime configuration.
@@ -131,7 +136,8 @@ func loadMainConfig(configPath string) (Config, error) {
 			Type:       "sensor",
 		},
 		Storage: StorageConfig{
-			SQLitePath: "./data/runtime.db",
+			SQLitePath:       "./data/runtime.db",
+			MaxDatabaseBytes: DefaultRuntimeDatabaseMaxBytes,
 		},
 		Auth: AuthConfig{
 			AccessTokenTTLMin: 10,
@@ -217,8 +223,9 @@ func loadMainConfig(configPath string) (Config, error) {
 			HeartbeatInterval: "30s",
 		},
 		ControlStore: ControlStoreConfig{
-			SQLitePath:    "./data/runtime.db",
-			RetentionDays: 7,
+			SQLitePath:       "./data/runtime.db",
+			RetentionDays:    7,
+			MaxDatabaseBytes: DefaultRuntimeDatabaseMaxBytes,
 		},
 		LogLevel: "INFO",
 	}
@@ -413,6 +420,9 @@ func NormalizeConfig(config Config) Config {
 	if strings.TrimSpace(config.Storage.SQLitePath) == "" {
 		config.Storage.SQLitePath = "./data/runtime.db"
 	}
+	if config.Storage.MaxDatabaseBytes == 0 {
+		config.Storage.MaxDatabaseBytes = DefaultRuntimeDatabaseMaxBytes
+	}
 	config.Storage.SQLitePath = filepath.FromSlash(config.Storage.SQLitePath)
 	config.TelemetryOutbox = reliable.NormalizeTelemetryOutboxConfig(config.TelemetryOutbox)
 	config.TelemetryOutbox.SQLitePath = filepath.FromSlash(config.TelemetryOutbox.SQLitePath)
@@ -421,6 +431,12 @@ func NormalizeConfig(config Config) Config {
 	}
 	if config.ControlStore.RetentionDays <= 0 {
 		config.ControlStore.RetentionDays = 7
+	}
+	if config.ControlStore.MaxDatabaseBytes == 0 {
+		config.ControlStore.MaxDatabaseBytes = config.Storage.MaxDatabaseBytes
+	}
+	if strings.EqualFold(filepath.Clean(config.Storage.SQLitePath), filepath.Clean(config.ControlStore.SQLitePath)) && config.ControlStore.MaxDatabaseBytes > config.Storage.MaxDatabaseBytes {
+		config.ControlStore.MaxDatabaseBytes = config.Storage.MaxDatabaseBytes
 	}
 	if config.Auth.AccessTokenTTLMin <= 0 {
 		config.Auth.AccessTokenTTLMin = 10
@@ -437,6 +453,84 @@ func ValidateConfig(config Config) error {
 	if err := reliable.ValidateTelemetryOutboxConfig(outbox); err != nil {
 		return err
 	}
+	if config.Storage.MaxDatabaseBytes < 64<<20 {
+		return fmt.Errorf("storage.maxDatabaseBytes must be >= 67108864")
+	}
+	if config.ControlStore.MaxDatabaseBytes < 64<<20 {
+		return fmt.Errorf("controlStore.maxDatabaseBytes must be >= 67108864")
+	}
+	if config.Service.Port < -1 || config.Service.Port > 65_535 {
+		return fmt.Errorf("service.port must be -1 or between 0 and 65535")
+	}
+	if config.Service.PortEnd < 0 || config.Service.PortEnd > 65_535 || (config.Service.PortEnd > 0 && config.Service.Port > 0 && config.Service.PortEnd < config.Service.Port) {
+		return fmt.Errorf("service.portEnd must be 0 or a valid port not lower than service.port")
+	}
+	if err := validateQoS("mqtt.qos", config.MQTT.QoS); err != nil {
+		return err
+	}
+	for name, topic := range map[string]mqtt.TopicConfig{
+		"telemetryReport": config.TelemetryReport, "propertySet": config.PropertySet,
+		"propertyGet": config.PropertyGet, "propertyResult": config.PropertyResult,
+		"propertyReport": config.PropertyReport, "commandCall": config.CommandCall,
+		"commandResult": config.CommandResult, "queryRequest": config.QueryRequest,
+		"queryResult": config.QueryResult, "statusReport": config.StatusReport,
+		"eventReport": config.EventReport,
+	} {
+		if err := validateQoS(name+".qos", topic.QoS); err != nil {
+			return err
+		}
+	}
+	if err := validatePositiveDuration("statusReport.heartbeatInterval", config.StatusReport.HeartbeatInterval, false); err != nil {
+		return err
+	}
+	groupNames := make(map[string]struct{}, len(config.MQTT.Groups))
+	for i, group := range config.MQTT.Groups {
+		name := strings.TrimSpace(group.Name)
+		if name == "" {
+			return fmt.Errorf("mqtt.groups[%d].name is required", i)
+		}
+		if _, exists := groupNames[name]; exists {
+			return fmt.Errorf("mqtt group name %q is duplicated", name)
+		}
+		groupNames[name] = struct{}{}
+		if err := validatePositiveDuration(fmt.Sprintf("mqtt.groups[%d].heartbeatInterval", i), group.HeartbeatInterval, true); err != nil {
+			return err
+		}
+		if group.QOS < 0 || group.QOS > 2 {
+			return fmt.Errorf("mqtt.groups[%d].qos must be between 0 and 2", i)
+		}
+	}
+	deviceNames := make(map[string]struct{}, len(config.Devices))
+	for i, rawDevice := range config.Devices {
+		device := NormalizeDeviceConfig(rawDevice)
+		if device.Name == "" {
+			return fmt.Errorf("deviceList[%d].name is required", i)
+		}
+		if _, exists := deviceNames[device.InternalName]; exists {
+			return fmt.Errorf("device internal name %q is duplicated", device.InternalName)
+		}
+		deviceNames[device.InternalName] = struct{}{}
+		if err := validatePositiveDuration("device "+device.InternalName+" telemetry.interval", device.Telemetry.Interval, true); err != nil {
+			return err
+		}
+		if err := validatePositiveDuration("device "+device.InternalName+" telemetry.heartbeatInterval", device.Telemetry.HeartbeatInterval, true); err != nil {
+			return err
+		}
+		for _, group := range device.Telemetry.Groups {
+			if err := validatePositiveDuration("device "+device.InternalName+" telemetry group "+group.Name+" interval", group.Interval, true); err != nil {
+				return err
+			}
+			if err := validatePositiveDuration("device "+device.InternalName+" telemetry group "+group.Name+" heartbeatInterval", group.HeartbeatInterval, true); err != nil {
+				return err
+			}
+		}
+		if err := validatePositiveDuration("device "+device.InternalName+" property.interval", device.Property.Interval, true); err != nil {
+			return err
+		}
+		if err := validatePositiveDuration("device "+device.InternalName+" property.heartbeatInterval", device.Property.HeartbeatInterval, true); err != nil {
+			return err
+		}
+	}
 	if strings.TrimSpace(config.TelemetryReport.Topic) == "" {
 		return nil
 	}
@@ -450,6 +544,25 @@ func ValidateConfig(config Config) error {
 	}
 	if strings.EqualFold(runtimePath, outboxPath) {
 		return fmt.Errorf("telemetryOutbox.sqlitePath must use a database file separate from storage.sqlitePath")
+	}
+	return nil
+}
+
+func validateQoS(name string, value int) error {
+	if value < 0 || value > 2 {
+		return fmt.Errorf("%s must be between 0 and 2", name)
+	}
+	return nil
+}
+
+func validatePositiveDuration(name, raw string, allowEmpty bool) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" && allowEmpty {
+		return nil
+	}
+	duration, err := time.ParseDuration(raw)
+	if err != nil || duration <= 0 {
+		return fmt.Errorf("%s must be a positive duration", name)
 	}
 	return nil
 }

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/punk-one/edge-service-sdk/internal/atomicfile"
 	"gopkg.in/yaml.v3"
 )
 
@@ -28,7 +29,7 @@ func writeYAMLFile(filePath string, data map[string]interface{}) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal YAML for %s: %w", filePath, err)
 	}
-	if err := os.WriteFile(filepath.Clean(filePath), out, 0o644); err != nil {
+	if err := atomicfile.WriteFile(filepath.Clean(filePath), out, 0o644); err != nil {
 		return fmt.Errorf("failed to write file %s: %w", filePath, err)
 	}
 	return nil

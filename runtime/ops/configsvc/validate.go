@@ -22,14 +22,14 @@ const (
 
 // FieldRule defines validation constraints for a configuration field.
 type FieldRule struct {
-	Type      FieldType      // expected type
-	Required  bool           // must be non-empty
-	Enum      []interface{}  // allowed values
-	Min       *float64       // minimum value (numeric)
-	Max       *float64       // maximum value (numeric)
-	Pattern   string         // regex pattern (string)
-	MinLength *int           // minimum string length
-	MaxLength *int           // maximum string length
+	Type      FieldType     // expected type
+	Required  bool          // must be non-empty
+	Enum      []interface{} // allowed values
+	Min       *float64      // minimum value (numeric)
+	Max       *float64      // maximum value (numeric)
+	Pattern   string        // regex pattern (string)
+	MinLength *int          // minimum string length
+	MaxLength *int          // maximum string length
 }
 
 // Validate validates a value against the given rule.
@@ -154,9 +154,12 @@ func (r *FieldRule) validateDuration(value interface{}) error {
 	if strings.TrimSpace(s) == "" && !r.Required {
 		return nil
 	}
-	_, err := time.ParseDuration(strings.TrimSpace(s))
+	duration, err := time.ParseDuration(strings.TrimSpace(s))
 	if err != nil {
 		return fmt.Errorf("invalid duration %q: %w", s, err)
+	}
+	if duration <= 0 {
+		return fmt.Errorf("duration %q must be positive", s)
 	}
 	return nil
 }
@@ -214,41 +217,41 @@ func resolveRule(rules map[string]FieldRule, scope, configPath string) (*FieldRu
 func DefaultValidationRules() map[string]FieldRule {
 	return map[string]FieldRule{
 		// config.yaml
-		"config::statusReport.heartbeatInterval":  {Type: TypeDuration},
-		"config::mqtt.url":                        {Type: TypeString, Pattern: `^(tcp|ssl|ws|wss)://.*:\d+$`},
-		"config::mqtt.qos":                        {Type: TypeInt, Enum: []interface{}{0, 1, 2}},
-		"config::mqtt.keepAliveSec":               {Type: TypeInt, Min: ptr(1), Max: ptr(3600)},
-		"config::mqtt.pingTimeoutSec":             {Type: TypeInt, Min: ptr(1), Max: ptr(60)},
-		"config::mqtt.connectTimeoutSec":          {Type: TypeInt, Min: ptr(1), Max: ptr(120)},
-		"config::mqtt.healthCheckIntervalSec":     {Type: TypeInt, Min: ptr(1), Max: ptr(300)},
-		"config::logging.level":                   {Type: TypeString, Enum: []interface{}{"debug", "info", "warn", "error"}},
-		"config::telemetryReport.dataFormat":      {Type: TypeString, Enum: []interface{}{"rule", "raw", "influx", "telemetry", "compact"}},
-		"config::telemetryReport.qos":             {Type: TypeInt, Enum: []interface{}{0, 1, 2}},
+		"config::statusReport.heartbeatInterval": {Type: TypeDuration},
+		"config::mqtt.url":                       {Type: TypeString, Pattern: `^(tcp|ssl|ws|wss)://.*:\d+$`},
+		"config::mqtt.qos":                       {Type: TypeInt, Enum: []interface{}{0, 1, 2}},
+		"config::mqtt.keepAliveSec":              {Type: TypeInt, Min: ptr(1), Max: ptr(3600)},
+		"config::mqtt.pingTimeoutSec":            {Type: TypeInt, Min: ptr(1), Max: ptr(60)},
+		"config::mqtt.connectTimeoutSec":         {Type: TypeInt, Min: ptr(1), Max: ptr(120)},
+		"config::mqtt.healthCheckIntervalSec":    {Type: TypeInt, Min: ptr(1), Max: ptr(300)},
+		"config::logging.level":                  {Type: TypeString, Enum: []interface{}{"debug", "info", "warn", "error"}},
+		"config::telemetryReport.dataFormat":     {Type: TypeString, Enum: []interface{}{"rule", "raw", "influx", "telemetry", "compact"}},
+		"config::telemetryReport.qos":            {Type: TypeInt, Enum: []interface{}{0, 1, 2}},
 
 		// device common
-		"device::protocols.s7.Host":         {Type: TypeString, Required: true},
-		"device::protocols.s7.Port":         {Type: TypeInt, Min: ptr(1), Max: ptr(65535)},
-		"device::protocols.s7.Rack":         {Type: TypeInt, Min: ptr(0), Max: ptr(15)},
-		"device::protocols.s7.Slot":         {Type: TypeInt, Min: ptr(0), Max: ptr(15)},
-		"device::protocols.s7.Timeout":      {Type: TypeInt, Min: ptr(1), Max: ptr(60)},
-		"device::protocols.s7.IdleTimeout":  {Type: TypeInt, Min: ptr(0), Max: ptr(300)},
-		"device::connectionStrategy":        {Type: TypeString, Enum: []interface{}{"persistent", "on_demand"}},
-		"device::profileName":               {Type: TypeString},
-		"device::productCode":               {Type: TypeString},
-		"device::description":               {Type: TypeString},
+		"device::protocols.s7.Host":        {Type: TypeString, Required: true},
+		"device::protocols.s7.Port":        {Type: TypeInt, Min: ptr(1), Max: ptr(65535)},
+		"device::protocols.s7.Rack":        {Type: TypeInt, Min: ptr(0), Max: ptr(15)},
+		"device::protocols.s7.Slot":        {Type: TypeInt, Min: ptr(0), Max: ptr(15)},
+		"device::protocols.s7.Timeout":     {Type: TypeInt, Min: ptr(1), Max: ptr(60)},
+		"device::protocols.s7.IdleTimeout": {Type: TypeInt, Min: ptr(0), Max: ptr(300)},
+		"device::connectionStrategy":       {Type: TypeString, Enum: []interface{}{"persistent", "on_demand"}},
+		"device::profileName":              {Type: TypeString},
+		"device::productCode":              {Type: TypeString},
+		"device::description":              {Type: TypeString},
 
 		// profile — telemetry
-		"profile::telemetry.interval":            {Type: TypeDuration},
-		"profile::telemetry.groups.*.interval":   {Type: TypeDuration},
+		"profile::telemetry.interval":                   {Type: TypeDuration},
+		"profile::telemetry.groups.*.interval":          {Type: TypeDuration},
 		"profile::telemetry.groups.*.heartbeatInterval": {Type: TypeDuration},
 		"profile::telemetry.groups.*.onChange":          {Type: TypeBool},
 
 		// profile — property
-		"profile::property.interval":              {Type: TypeDuration},
-		"profile::property.points.*.readWrite":    {Type: TypeString, Enum: []interface{}{"R", "RW", "W"}},
-		"profile::property.points.*.valueType":    {Type: TypeString},
-		"profile::property.points.*.maxLength":    {Type: TypeInt, Min: ptr(0)},
-		"profile::property.points.*.scale":        {Type: TypeString},
-		"profile::property.points.*.precision":    {Type: TypeInt, Min: ptr(0)},
+		"profile::property.interval":           {Type: TypeDuration},
+		"profile::property.points.*.readWrite": {Type: TypeString, Enum: []interface{}{"R", "RW", "W"}},
+		"profile::property.points.*.valueType": {Type: TypeString},
+		"profile::property.points.*.maxLength": {Type: TypeInt, Min: ptr(0)},
+		"profile::property.points.*.scale":     {Type: TypeString},
+		"profile::property.points.*.precision": {Type: TypeInt, Min: ptr(0)},
 	}
 }

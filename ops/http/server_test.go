@@ -20,6 +20,19 @@ import (
 	reliable "github.com/punk-one/edge-service-sdk/telemetry/reliable"
 )
 
+func TestReadBodyRejectsPayloadOverLimit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	context, _ := gin.CreateTestContext(httptest.NewRecorder())
+	context.Request = httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(make([]byte, maxRequestBodyBytes+1)))
+	_, err := readBody(context)
+	if err == nil {
+		t.Fatal("readBody() accepted oversized payload")
+	}
+	if status := errorStatus(err, http.StatusBadRequest); status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", status, http.StatusRequestEntityTooLarge)
+	}
+}
+
 func TestHandleHealthUsesAPIV1Shape(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
@@ -178,10 +191,15 @@ func TestHandleRuntimeStatusUsesSnakeCaseFields(t *testing.T) {
 		TelemetryOutboxEnabled: true,
 		TelemetryOutboxStats: func() (reliable.TelemetryOutboxStats, error) {
 			return reliable.TelemetryOutboxStats{
-				PendingCount:       3,
-				OldestPendingAgeMs: 1200,
-				SendRatePerSec:     5,
-				LastSendAt:         1710000000000,
+				PendingCount:        3,
+				OldestPendingAgeMs:  1200,
+				SendRatePerSec:      5,
+				LastSendAt:          1710000000000,
+				DeadLetterCount:     1,
+				MQTTPendingCount:    4,
+				MQTTOldestAgeMs:     900,
+				MQTTDeadLetterCount: 2,
+				MQTTPendingByGroup:  map[string]int64{"primary": 1, "mirror": 3},
 			}, nil
 		},
 		DeviceStates: func() []rtstatus.DeviceState {
@@ -224,6 +242,13 @@ func TestHandleRuntimeStatusUsesSnakeCaseFields(t *testing.T) {
 	}
 	if _, ok := runtimeBody["telemetry_outbox"]; !ok {
 		t.Fatalf("expected runtime.telemetry_outbox in payload: %#v", runtimeBody)
+	}
+	outboxBody := runtimeBody["telemetry_outbox"].(map[string]interface{})
+	if got := outboxBody["mqtt_pending_count"]; got != float64(4) {
+		t.Fatalf("mqtt_pending_count = %#v, want 4", got)
+	}
+	if groups, ok := outboxBody["mqtt_pending_by_group"].(map[string]interface{}); !ok || groups["mirror"] != float64(3) {
+		t.Fatalf("mqtt_pending_by_group = %#v, want mirror=3", outboxBody["mqtt_pending_by_group"])
 	}
 	if _, ok := runtimeBody["deviceCount"]; ok {
 		t.Fatalf("did not expect runtime.deviceCount in payload: %#v", runtimeBody)

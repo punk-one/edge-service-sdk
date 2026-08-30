@@ -64,9 +64,11 @@ func (s *mqttQueryService) RegisterMQTTHandlers(config rtconfig.Config) {
 	s.resultTopic = config.QueryResult
 	for _, productCode := range s.catalog.ProductCodes() {
 		topic := cfg.StringsReplaceProductCode(config.QueryRequest.Topic, productCode)
-		_ = s.transport.Subscribe(topic, byte(resolveQueryQoS(config.QueryRequest.QoS)), func(_ string, payload []byte) {
+		if err := s.transport.Subscribe(topic, byte(resolveQueryQoS(config.QueryRequest.QoS)), func(_ string, payload []byte) {
 			s.handleQuery(productCode, payload)
-		})
+		}); err != nil && s.logger != nil {
+			s.logger.Warnf("Query subscription is pending retry: topic=%s err=%v", topic, err)
+		}
 	}
 }
 

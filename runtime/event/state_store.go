@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	coreevent "github.com/punk-one/edge-service-sdk/event"
+	"github.com/punk-one/edge-service-sdk/internal/atomicfile"
 )
 
 // StateStore persists the event engine state independently from the event
@@ -53,25 +54,5 @@ func (s *fileStateStore) Save(state coreevent.PersistedState) error {
 	if err != nil {
 		return fmt.Errorf("encode event state: %w", err)
 	}
-	temporary, err := os.CreateTemp(filepath.Dir(s.path), ".event-state-*.tmp")
-	if err != nil {
-		return err
-	}
-	temporaryName := temporary.Name()
-	defer os.Remove(temporaryName)
-	if _, err := temporary.Write(data); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	if err := os.Remove(s.path); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return os.Rename(temporaryName, s.path)
+	return atomicfile.WriteFile(s.path, data, 0o644)
 }

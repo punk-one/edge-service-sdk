@@ -301,3 +301,15 @@ func TestExecuteReturnsUnsupportedForCommandNotBoundToDevice(t *testing.T) {
 		t.Fatalf("message = %q, want device unsupported message", result.Message)
 	}
 }
+
+func TestExecuteRejectsWhenCommandExecutionCapacityIsExhausted(t *testing.T) {
+	registry := newTestRegistry(stubCommand{desc: cmdapi.CommandDescriptor{Identifier: "start_machine", Mode: "sync"}})
+	service := NewService(&commandTestCatalog{device: testDevice("qhl0001", "qhl", "start_machine")}, &commandTestDriver{}, &commandTestPublisher{}, nil, nil, registry, nil)
+	service.commandSlots = make(chan struct{}, 1)
+	service.commandSlots <- struct{}{}
+
+	result, statusCode := service.Execute("start_machine", cmdapi.CommandRequest{TraceID: "trace-capacity", DeviceCode: "qhl0001", Data: map[string]interface{}{}}, "")
+	if statusCode != 503 || result.Code != ctl.CodeBusy {
+		t.Fatalf("unexpected result: status=%d body=%#v", statusCode, result)
+	}
+}

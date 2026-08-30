@@ -1,12 +1,15 @@
 package app
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -39,6 +42,12 @@ import (
 	mqtt "github.com/punk-one/edge-service-sdk/transport/mqtt"
 )
 
+// ErrRestartRequested is returned by Run when an authenticated operations
+// request asks the external service supervisor to restart the process.
+var ErrRestartRequested = errors.New("service restart requested")
+
+const restartExitCode = 75
+
 type DeviceSDK struct {
 	logger         logger.LoggingClient
 	telemetrySink  reliable.TelemetrySink
@@ -49,6 +58,8 @@ type DeviceSDK struct {
 	statusTracker  *rtstatus.Tracker
 	eventService   *eventruntime.Service
 	shuttingDown   atomic.Bool
+	driverFaultMu  sync.RWMutex
+	driverFault    func(deviceName, operation string, err error)
 
 	// Ops services
 	configService   *configsvc.ConfigService
@@ -234,6 +245,31 @@ func (s *DeviceSDK) DeviceWriteFailedAt(deviceName string, err error, observedAt
 	s.observeConnection(deviceName, false, "degraded", observedAt, 0, errorString(err))
 }
 
+// SetDriverFaultHandler installs the process-level recovery action for a
+// driver call that remains blocked after its deadline.
+func (s *DeviceSDK) SetDriverFaultHandler(handler func(deviceName, operation string, err error)) {
+	if s == nil {
+		return
+	}
+	s.driverFaultMu.Lock()
+	s.driverFault = handler
+	s.driverFaultMu.Unlock()
+}
+
+// ReportDriverFault requests recovery only for stuck calls. Ordinary protocol
+// errors remain device-local and continue using their normal retry policy.
+func (s *DeviceSDK) ReportDriverFault(deviceName, operation string, err error) {
+	if s == nil || !errors.Is(err, contracts.ErrOperationStuck) || s.isShuttingDown() {
+		return
+	}
+	s.driverFaultMu.RLock()
+	handler := s.driverFault
+	s.driverFaultMu.RUnlock()
+	if handler != nil {
+		handler(deviceName, operation, err)
+	}
+}
+
 func (s *DeviceSDK) SetEventService(service *eventruntime.Service) {
 	s.eventService = service
 }
@@ -329,6 +365,24 @@ func Bootstrap(serviceName, version string, driver contracts.ProtocolDriver, reg
 }
 
 func BootstrapWithOptions(serviceName, version string, driver contracts.ProtocolDriver, options BootstrapOptions) {
+	if err := RunWithOptions(serviceName, version, driver, options); err != nil {
+		fmt.Fprintf(os.Stderr, "%s stopped: %v\n", serviceName, err)
+		if errors.Is(err, ErrRestartRequested) {
+			os.Exit(restartExitCode)
+		}
+		os.Exit(1)
+	}
+}
+
+// Run executes the service lifecycle and propagates startup or runtime errors
+// to callers that own their process exit policy.
+func Run(serviceName, version string, driver contracts.ProtocolDriver, registry cmdapi.Registry) error {
+	return RunWithOptions(serviceName, version, driver, BootstrapOptions{CommandRegistry: registry})
+}
+
+// RunWithOptions executes the complete service lifecycle. Unlike the legacy
+// Bootstrap wrappers, it never terminates the process directly.
+func RunWithOptions(serviceName, version string, driver contracts.ProtocolDriver, options BootstrapOptions) error {
 	fmt.Printf("Starting %s version %s\n", serviceName, version)
 	registry := options.CommandRegistry
 	if registry == nil {
@@ -337,8 +391,7 @@ func BootstrapWithOptions(serviceName, version string, driver contracts.Protocol
 
 	config, err := rtconfig.LoadConfig("./configs/config.yaml")
 	if err != nil {
-		fmt.Printf("Failed to load configuration: %v\n", err)
-		return
+		return fmt.Errorf("load configuration: %w", err)
 	}
 	config = rtconfig.NormalizeConfig(config)
 
@@ -358,8 +411,7 @@ func BootstrapWithOptions(serviceName, version string, driver contracts.Protocol
 	logClient.Infof("Logging level set to: %s", logLevel)
 
 	if err := validateCommandBindings(config.Devices, registry); err != nil {
-		logClient.Errorf("Failed to validate command bindings: %v", err)
-		return
+		return fmt.Errorf("validate command bindings: %w", err)
 	}
 
 	busService, busErr := runtimebus.Start(serviceName, config.NATSBus, logClient)
@@ -374,7 +426,26 @@ func BootstrapWithOptions(serviceName, version string, driver contracts.Protocol
 		defer busService.Close()
 	}
 
-	publisher := mqtt.NewPublisher(config.MQTT, config.TelemetryReport, config.PropertyResult, config.PropertyReport, config.CommandResult, config.StatusReport, logClient, config.EventReport)
+	basePublisher := mqtt.NewPublisher(config.MQTT, config.TelemetryReport, config.PropertyResult, config.PropertyReport, config.CommandResult, config.StatusReport, logClient, config.EventReport)
+	publisher, err := mqtt.NewDurablePublisher(basePublisher, mqtt.DurablePublisherConfig{
+		SQLitePath:       config.TelemetryOutbox.SQLitePath,
+		MaxDatabaseBytes: config.TelemetryOutbox.MaxDatabaseBytes,
+		RetryInitial:     time.Duration(config.TelemetryOutbox.RetryInitialMs) * time.Millisecond,
+		RetryMax:         time.Duration(config.TelemetryOutbox.RetryMaxMs) * time.Millisecond,
+	}, logClient)
+	if err != nil {
+		_ = basePublisher.Close()
+		return fmt.Errorf("initialize durable MQTT publisher: %w", err)
+	}
+	var publisherCloseOnce sync.Once
+	closePublisher := func() {
+		publisherCloseOnce.Do(func() {
+			if err := publisher.Close(); err != nil {
+				logClient.Warnf("Failed to close MQTT publisher cleanly: %v", err)
+			}
+		})
+	}
+	defer closePublisher()
 	var mqttObserver *runtimebus.MQTTObserver
 	if busService != nil {
 		mqttObserver = runtimebus.NewMQTTObserver(busService, logClient)
@@ -389,42 +460,79 @@ func BootstrapWithOptions(serviceName, version string, driver contracts.Protocol
 	}
 	telemetryTransport, ok := publisher.(reliable.TelemetryTransport)
 	if !ok {
-		logClient.Errorf("MQTT publisher does not preserve telemetry outbox send_at")
-		return
+		return fmt.Errorf("MQTT publisher does not preserve telemetry outbox send_at")
 	}
 	telemetrySink, err := reliable.NewTelemetryDispatcher(config.TelemetryOutbox, telemetryTransport, logClient)
 	if err != nil {
-		logClient.Errorf("Failed to initialize telemetry outbox: %v", err)
-		return
+		return fmt.Errorf("initialize telemetry outbox: %w", err)
 	}
+	var telemetryCloseOnce sync.Once
+	closeTelemetry := func() {
+		telemetryCloseOnce.Do(func() {
+			if err := telemetrySink.Close(); err != nil {
+				logClient.Warnf("Failed to close telemetry outbox cleanly: %v", err)
+			}
+		})
+	}
+	defer closeTelemetry()
 
 	statusTracker := rtstatus.NewTracker()
 	authService, err := rtauth.NewService(rtauth.Config{
-		SQLitePath:     config.Storage.SQLitePath,
-		KeyFile:        config.Auth.KeyFile,
-		BootstrapToken: config.Auth.BootstrapToken,
-		AccessTokenTTL: time.Duration(config.Auth.AccessTokenTTLMin) * time.Minute,
+		SQLitePath:       config.Storage.SQLitePath,
+		MaxDatabaseBytes: config.Storage.MaxDatabaseBytes,
+		KeyFile:          config.Auth.KeyFile,
+		BootstrapToken:   config.Auth.BootstrapToken,
+		AccessTokenTTL:   time.Duration(config.Auth.AccessTokenTTLMin) * time.Minute,
 	})
 	if err != nil {
-		logClient.Errorf("Failed to initialize auth service: %v", err)
-		return
+		return fmt.Errorf("initialize auth service: %w", err)
 	}
+	defer func() {
+		if err := authService.Close(); err != nil {
+			logClient.Warnf("Failed to close auth service cleanly: %v", err)
+		}
+	}()
 
 	sdk := NewDeviceSDK(config, logClient, statusTracker)
 	sdk.telemetrySink = telemetrySink
 	eventService, err := eventruntime.NewService(config, publisher, logClient)
 	if err != nil {
-		logClient.Errorf("Failed to initialize EVENT service: %v", err)
-		return
+		return fmt.Errorf("initialize EVENT service: %w", err)
 	}
 	sdk.SetEventService(eventService)
 	if eventService != nil {
 		eventService.Start()
 	}
-	if err := driver.Initialize(sdk); err != nil {
-		logClient.Errorf("Failed to initialize driver: %v", err)
-		return
+	var eventCloseOnce sync.Once
+	closeEvent := func() {
+		eventCloseOnce.Do(func() {
+			if eventService != nil {
+				if err := eventService.Close(); err != nil {
+					logClient.Warnf("Failed to close EVENT service cleanly: %v", err)
+				}
+			}
+		})
 	}
+	defer closeEvent()
+	if err := driver.Initialize(sdk); err != nil {
+		return fmt.Errorf("initialize driver: %w", err)
+	}
+	var driverStopOnce sync.Once
+	stopDriver := func() {
+		driverStopOnce.Do(func() {
+			done := make(chan error, 1)
+			go func() { done <- driver.Stop(false) }()
+			select {
+			case err := <-done:
+				if err != nil {
+					logClient.Warnf("Failed to stop driver cleanly: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				logClient.Errorf("Driver Stop exceeded 5s; continuing process shutdown")
+			}
+		})
+	}
+	defer stopDriver()
 
 	// Initialize ops services
 	logDir := filepath.Dir(config.Logging.File)
@@ -433,9 +541,25 @@ func BootstrapWithOptions(serviceName, version string, driver contracts.Protocol
 	}
 	configService := configsvc.NewConfigService("./configs", config.Devices, nil)
 	logSearcher := logsvc.NewLogSearcher(logDir)
-	restarter := ops.NewRestarter(serviceName, func() error {
-		logClient.Infof("Soft restart triggered for %s", serviceName)
-		return nil
+	restartCh := make(chan ops.RestartMode, 1)
+	requestRestart := func(mode ops.RestartMode) func() error {
+		return func() error {
+			select {
+			case restartCh <- mode:
+				logClient.Infof("Graceful %s restart requested for %s", mode, serviceName)
+				return nil
+			default:
+				return fmt.Errorf("restart is already in progress")
+			}
+		}
+	}
+	restarter := ops.NewRestarterWithHooks(serviceName, requestRestart(ops.SoftRestart), requestRestart(ops.HardRestart))
+	sdk.SetDriverFaultHandler(func(deviceName, operation string, fault error) {
+		logClient.Errorf("Driver watchdog requesting hard restart: device=%s operation=%s err=%v", deviceName, operation, fault)
+		select {
+		case restartCh <- ops.HardRestart:
+		default:
+		}
 	})
 
 	// Wire config change callback for hot-reload
@@ -463,8 +587,7 @@ func BootstrapWithOptions(serviceName, version string, driver contracts.Protocol
 	dependencyManager.Register(dependency.NamedDependency("driver", func() error { return nil }))
 	dependencyManager.Register(dependency.NamedDependency("auth", authService.HealthCheck))
 	if err := dependencyManager.CheckAll(); err != nil {
-		logClient.Errorf("Dependency check failed: %v", err)
-		return
+		return fmt.Errorf("dependency check: %w", err)
 	}
 	if err := publisher.HealthCheck(); err != nil {
 		// MQTT is recoverable: continue collecting into telemetry_outbox and let
@@ -474,10 +597,9 @@ func BootstrapWithOptions(serviceName, version string, driver contracts.Protocol
 		logClient.Infof("Dependency ready: mqtt")
 	}
 
-	controlStore, err := rtcontrol.NewSQLiteStore(config.ControlStore.SQLitePath)
+	controlStore, err := rtcontrol.NewSQLiteStoreWithRetentionAndCapacity(config.ControlStore.SQLitePath, config.ControlStore.RetentionDays, config.ControlStore.MaxDatabaseBytes)
 	if err != nil {
-		logClient.Errorf("Failed to initialize control store: %v", err)
-		return
+		return fmt.Errorf("initialize control store: %w", err)
 	}
 	defer func() {
 		if closeErr := controlStore.Close(); closeErr != nil {
@@ -486,6 +608,9 @@ func BootstrapWithOptions(serviceName, version string, driver contracts.Protocol
 	}()
 	propertyService := rtproperty.NewService(sdk, driver, publisher, controlStore, logClient)
 	propertyService.RegisterMQTTHandlers(config)
+	if err := propertyService.ResumeResultDeliveries(); err != nil {
+		logClient.Warnf("Failed to resume pending property result deliveries: %v", err)
+	}
 	if err := propertyService.ResumePending(); err != nil {
 		logClient.Warnf("Failed to resume pending property tasks: %v", err)
 	}
@@ -493,6 +618,9 @@ func BootstrapWithOptions(serviceName, version string, driver contracts.Protocol
 	fileClient := file.NewClient()
 	commandService := rtcommand.NewService(sdk, driver, publisher, controlStore, logClient, registry, fileClient)
 	commandService.RegisterMQTTHandlers(config)
+	if err := commandService.ResumeResultDeliveries(); err != nil {
+		logClient.Warnf("Failed to resume pending command result deliveries: %v", err)
+	}
 	if err := commandService.ResumePending(); err != nil {
 		logClient.Warnf("Failed to resume pending commands: %v", err)
 	}
@@ -535,7 +663,7 @@ func BootstrapWithOptions(serviceName, version string, driver contracts.Protocol
 			deviceCopy.ConnectionStrategy,
 		)
 		super.Start(deviceCopy.InternalName, func() error {
-			return runMergedTelemetryWorker(driver, deviceCopy, sdk, logClient)
+			return runMergedTelemetryWorker(super.Context(), driver, deviceCopy, sdk, logClient)
 		})
 	}
 	if strings.TrimSpace(config.PropertyReport.Topic) != "" {
@@ -558,7 +686,7 @@ func BootstrapWithOptions(serviceName, version string, driver contracts.Protocol
 				len(reqs),
 			)
 			super.Start(deviceCopy.InternalName+"-property", func() error {
-				return runPropertyWorker(driver, deviceCopy, publisher, sdk, logClient)
+				return runPropertyWorker(super.Context(), driver, deviceCopy, publisher, sdk, logClient)
 			})
 		}
 	}
@@ -575,10 +703,28 @@ func BootstrapWithOptions(serviceName, version string, driver contracts.Protocol
 		DeviceCount:            len(config.Devices),
 		TelemetryWorkerCount:   workerCount,
 		TelemetryOutboxEnabled: strings.TrimSpace(config.TelemetryReport.Topic) != "",
-		Readiness:              buildRuntimeReadiness(authService, publisher),
-		TelemetryOutboxStats:   telemetrySink.Stats,
-		DeviceStates:           statusTracker.Snapshot,
-		AuthService:            authService,
+		Readiness:              buildRuntimeReadiness(authService, publisher, telemetrySink, controlStore, eventService),
+		TelemetryOutboxStats: func() (reliable.TelemetryOutboxStats, error) {
+			stats, statsErr := telemetrySink.Stats()
+			if statsErr != nil {
+				return stats, statsErr
+			}
+			if durable, ok := publisher.(interface {
+				DurableQueueStats() (mqtt.DurableQueueStats, error)
+			}); ok {
+				mqttStats, mqttErr := durable.DurableQueueStats()
+				if mqttErr != nil {
+					return stats, mqttErr
+				}
+				stats.MQTTPendingCount = mqttStats.PendingCount
+				stats.MQTTOldestAgeMs = mqttStats.OldestPendingAgeMs
+				stats.MQTTDeadLetterCount = mqttStats.DeadLetterCount
+				stats.MQTTPendingByGroup = mqttStats.PerDestination
+			}
+			return stats, nil
+		},
+		DeviceStates: statusTracker.Snapshot,
+		AuthService:  authService,
 		PropertyGet: func(req rtapi.PropertyRequest) (rtapi.PropertyResponse, int) {
 			return propertyService.ExecuteGet(req, "")
 		},
@@ -617,30 +763,56 @@ func BootstrapWithOptions(serviceName, version string, driver contracts.Protocol
 	shutdownCh := make(chan os.Signal, 1)
 	signal.Notify(shutdownCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(shutdownCh)
-	sig := <-shutdownCh
-	logClient.Infof("Shutdown signal received: %s", sig)
+	var restartMode ops.RestartMode
+	select {
+	case sig := <-shutdownCh:
+		logClient.Infof("Shutdown signal received: %s", sig)
+	case restartMode = <-restartCh:
+		logClient.Infof("Restart request accepted: mode=%s", restartMode)
+	}
 
-	// Stop device production first, then flush EVENT state/outbox before
-	// closing transports. The supervisor goroutines terminate with the
-	// process after Bootstrap returns.
+	// Stop accepting control requests first, then stop device production and
+	// flush durable queues before closing transports.
 	sdk.shuttingDown.Store(true)
-	if err := driver.Stop(false); err != nil {
-		logClient.Warnf("Failed to stop driver cleanly: %v", err)
+	super.Cancel()
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 15*time.Second)
+	if err := httpRuntime.Shutdown(shutdownCtx); err != nil {
+		logClient.Warnf("Failed to stop HTTP runtime cleanly: %v", err)
 	}
-	if eventService != nil {
-		if err := eventService.Close(); err != nil {
-			logClient.Warnf("Failed to close EVENT service cleanly: %v", err)
-		}
+	cancelShutdown()
+	if sdk.statusPublisher != nil {
+		sdk.statusPublisher.Close()
 	}
-	if err := telemetrySink.Close(); err != nil {
-		logClient.Warnf("Failed to close telemetry outbox cleanly: %v", err)
+	commandService.BeginShutdown()
+	propertyService.BeginShutdown()
+	stopDriver()
+	controlStopCtx, cancelControlStop := context.WithTimeout(context.Background(), 15*time.Second)
+	if err := commandService.Close(controlStopCtx); err != nil {
+		logClient.Warnf("Active command tasks did not stop before deadline: %v", err)
 	}
-	if err := publisher.Close(); err != nil {
-		logClient.Warnf("Failed to close MQTT publisher cleanly: %v", err)
+	if err := propertyService.Close(controlStopCtx); err != nil {
+		logClient.Warnf("Active property tasks did not stop before deadline: %v", err)
 	}
+	cancelControlStop()
+	workerStopCtx, cancelWorkerStop := context.WithTimeout(context.Background(), 15*time.Second)
+	workerStopErr := super.Stop(workerStopCtx)
+	cancelWorkerStop()
+	if workerStopErr != nil {
+		logClient.Warnf("Workers did not stop before deadline: %v", workerStopErr)
+	}
+	closeEvent()
+	closeTelemetry()
+	closePublisher()
+	if restartMode != "" {
+		return fmt.Errorf("%w: mode=%s", ErrRestartRequested, restartMode)
+	}
+	if workerStopErr != nil {
+		return fmt.Errorf("stop workers: %w", workerStopErr)
+	}
+	return nil
 }
 
-func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.DeviceConfig, sdk *DeviceSDK, logClient logger.LoggingClient) error {
+func runMergedTelemetryWorker(ctx context.Context, driver contracts.ProtocolDriver, device contracts.DeviceConfig, sdk *DeviceSDK, logClient logger.LoggingClient) error {
 	gcdInterval, err := computeGCD(device.Telemetry)
 	if err != nil {
 		return fmt.Errorf("invalid telemetry interval for device %s: %w", device.InternalName, err)
@@ -758,9 +930,12 @@ func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.
 
 		// Phase 2: 读
 		if len(dueReqs) > 0 {
-			values, err := driver.HandleReadCommands(device.InternalName, rtconfig.ProtocolPropertiesFromConfig(device), dueReqs)
+			operationCtx, cancelOperation := context.WithTimeout(ctx, contracts.DefaultOperationTimeout)
+			values, err := contracts.HandleReadCommandsWithContext(operationCtx, driver, device.InternalName, rtconfig.ProtocolPropertiesFromConfig(device), dueReqs)
+			cancelOperation()
 			if err != nil {
 				sdk.DeviceReadFailedAt(device.InternalName, err, now.UnixMilli())
+				sdk.ReportDriverFault(device.InternalName, "telemetry-read", err)
 				logClient.Errorf("Telemetry read failed for device %s: %v", device.InternalName, err)
 			} else {
 				sdk.DeviceReadSucceededAt(device.InternalName, now.UnixMilli())
@@ -854,7 +1029,11 @@ func runMergedTelemetryWorker(driver contracts.ProtocolDriver, device contracts.
 		}
 
 		isFirstTick = false
-		<-ticker.C
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -881,8 +1060,8 @@ func computeGCD(tc contracts.TelemetryConfig) (time.Duration, error) {
 	var gcd time.Duration
 	for _, raw := range intervals {
 		d, err := time.ParseDuration(raw)
-		if err != nil {
-			return 0, err
+		if err != nil || d <= 0 {
+			return 0, fmt.Errorf("interval %q must be a positive duration", raw)
 		}
 		if gcd == 0 {
 			gcd = d
@@ -1023,7 +1202,7 @@ func filterValuesByNames(values []*contracts.CommandValue, names map[string]bool
 	return filtered
 }
 
-func runPropertyWorker(driver contracts.ProtocolDriver, device contracts.DeviceConfig, publisher mqtt.Publisher, sdk *DeviceSDK, logClient logger.LoggingClient) error {
+func runPropertyWorker(ctx context.Context, driver contracts.ProtocolDriver, device contracts.DeviceConfig, publisher mqtt.Publisher, sdk *DeviceSDK, logClient logger.LoggingClient) error {
 	duration, err := parsePropertyInterval(device.Property.Interval)
 	if err != nil {
 		return fmt.Errorf("invalid property interval %s for device %s: %w", device.Property.Interval, device.InternalName, err)
@@ -1045,10 +1224,13 @@ func runPropertyWorker(driver contracts.ProtocolDriver, device contracts.DeviceC
 		lastEmittedAt: make(map[string]int64),
 	}
 	for {
-		values, err := driver.HandleReadCommands(device.InternalName, rtconfig.ProtocolPropertiesFromConfig(device), reqs)
+		operationCtx, cancelOperation := context.WithTimeout(ctx, contracts.DefaultOperationTimeout)
+		values, err := contracts.HandleReadCommandsWithContext(operationCtx, driver, device.InternalName, rtconfig.ProtocolPropertiesFromConfig(device), reqs)
+		cancelOperation()
 		if err != nil {
 			if sdk != nil {
 				sdk.DeviceReadFailedAt(device.InternalName, err, time.Now().UnixMilli())
+				sdk.ReportDriverFault(device.InternalName, "property-report-read", err)
 			}
 			logClient.Errorf("Property read failed for device %s: %v", device.InternalName, err)
 		} else {
@@ -1057,10 +1239,15 @@ func runPropertyWorker(driver contracts.ProtocolDriver, device contracts.DeviceC
 				sdk.DeviceReadSucceededAt(device.InternalName, now.UnixMilli())
 			}
 			if !shouldEmitProperty(device.Property, values, state, now) {
-				<-ticker.C
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-ticker.C:
+				}
 				continue
 			}
 			observedAt := now.UnixMilli()
+			traceID := outevent.NewTraceID(device.InternalName)
 			updateTelemetryState(state, values, observedAt)
 			propertyData := appconfig.BuildPropertyResponse(values, bindings)
 			if sdk != nil && sdk.eventService != nil {
@@ -1068,18 +1255,25 @@ func runPropertyWorker(driver contracts.ProtocolDriver, device contracts.DeviceC
 					logClient.Warnf("Failed to process EVENT property values for %s: %v", device.InternalName, eventErr)
 				}
 			}
-			_ = publisher.PublishPropertyReport(device, map[string]interface{}{
+			if err := publisher.PublishPropertyReport(device, map[string]interface{}{
+				"trace_id":    traceID,
 				"device_code": device.Name,
 				"time":        observedAt,
 				"data":        propertyData,
-			})
+			}); err != nil {
+				logClient.Warnf("Failed to publish property report for device %s: %v", device.InternalName, err)
+			}
 		}
 
-		<-ticker.C
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
 	}
 }
 
-func buildRuntimeReadiness(authService *rtauth.Service, publisher mqtt.Publisher) func() error {
+func buildRuntimeReadiness(authService *rtauth.Service, publisher mqtt.Publisher, dependencies ...interface{}) func() error {
 	return func() error {
 		if authService != nil {
 			if err := authService.HealthCheck(); err != nil {
@@ -1087,7 +1281,16 @@ func buildRuntimeReadiness(authService *rtauth.Service, publisher mqtt.Publisher
 			}
 		}
 		if publisher != nil {
-			return publisher.HealthCheck()
+			if err := publisher.HealthCheck(); err != nil {
+				return err
+			}
+		}
+		for _, dependency := range dependencies {
+			if checker, ok := dependency.(interface{ HealthCheck() error }); ok {
+				if err := checker.HealthCheck(); err != nil {
+					return err
+				}
+			}
 		}
 		return nil
 	}
@@ -1096,17 +1299,29 @@ func buildRuntimeReadiness(authService *rtauth.Service, publisher mqtt.Publisher
 func installStatusPublisher(tracker *rtstatus.Tracker, sdk *DeviceSDK, publisher mqtt.Publisher, topicConfig mqtt.TopicConfig, logClient logger.LoggingClient) *deviceStatusPublisher {
 	// Multi-group: snapshot via MultiPublisher, heartbeat per group
 	if mg, ok := publisher.(mqtt.MultiGroupPublisher); ok {
+		groups := mg.GroupPublishers()
+		if len(groups) == 0 {
+			// The durable wrapper also implements the optional interface so it can
+			// transparently forward real groups. An empty slice denotes a single
+			// MQTT destination and retains the original heartbeat behavior.
+			reporter := newDeviceStatusPublisher(tracker, sdk, publisher, topicConfig, logClient)
+			if reporter != nil {
+				reporter.Start()
+			}
+			return reporter
+		}
 		main := newDeviceStatusPublisher(tracker, sdk, publisher, topicConfig, logClient)
 		if main == nil {
 			return nil
 		}
-		main.Start()
+		main.StartChangeOnly()
 
-		for i, gp := range mg.GroupPublishers() {
+		for i, gp := range groups {
 			groupTopic := mg.GroupStatusTopic(i)
 			gsp := newDeviceStatusPublisher(tracker, sdk, gp, groupTopic, logClient)
 			if gsp != nil {
 				gsp.StartHeartbeatOnly()
+				main.children = append(main.children, gsp)
 			}
 		}
 		return main

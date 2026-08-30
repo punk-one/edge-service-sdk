@@ -2,6 +2,7 @@ package httpserver
 
 import (
 	"bytes"
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	rtauth "github.com/punk-one/edge-service-sdk/auth"
@@ -22,6 +24,11 @@ import (
 	reliable "github.com/punk-one/edge-service-sdk/telemetry/reliable"
 
 	"github.com/gin-gonic/gin"
+)
+
+const (
+	maxRequestBodyBytes  = int64(1 << 20)
+	maxControlQueryLimit = 1_000
 )
 
 // ReadinessFunc checks whether the runtime is ready to serve.
@@ -123,8 +130,11 @@ type Config struct {
 
 // Server exposes runtime HTTP APIs without blocking telemetry or MQTT workers.
 type Server struct {
-	cfg        Config
-	actualPort int
+	cfg          Config
+	actualPort   int
+	mu           sync.Mutex
+	server       *http.Server
+	requestSlots chan struct{}
 }
 
 // New creates a new HTTP runtime server.
@@ -132,7 +142,7 @@ func New(cfg Config) *Server {
 	if cfg.StartedAt.IsZero() {
 		cfg.StartedAt = time.Now()
 	}
-	return &Server{cfg: cfg}
+	return &Server{cfg: cfg, requestSlots: make(chan struct{}, 128)}
 }
 
 // Enabled reports whether the HTTP service should be started.
@@ -171,13 +181,42 @@ func (s *Server) Run() error {
 	server := &http.Server{
 		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    64 << 10,
 	}
+	s.mu.Lock()
+	s.server = server
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		if s.server == server {
+			s.server = nil
+		}
+		s.mu.Unlock()
+	}()
 
 	serveErr := server.Serve(listener)
 	if serveErr == nil || errors.Is(serveErr, http.ErrServerClosed) {
 		return nil
 	}
 	return serveErr
+}
+
+// Shutdown stops accepting new HTTP requests and waits for active handlers up
+// to the caller's deadline.
+func (s *Server) Shutdown(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	server := s.server
+	s.mu.Unlock()
+	if server == nil {
+		return nil
+	}
+	return server.Shutdown(ctx)
 }
 
 // listen creates a TCP listener, with optional port search when PortEnd > Port
@@ -219,6 +258,7 @@ func (s *Server) listenRange(start, end int) (net.Listener, error) {
 func (s *Server) router() *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
+	router.Use(s.limitConcurrency())
 	router.Use(gin.CustomRecovery(func(c *gin.Context, recovered interface{}) {
 		if s.cfg.Logger != nil {
 			s.cfg.Logger.Errorf("HTTP runtime panic recovered: path=%s err=%v", c.Request.URL.Path, recovered)
@@ -254,6 +294,18 @@ func (s *Server) router() *gin.Engine {
 	v1.GET("/device/control/jobs/:trace_id/result", s.handleControlJobResult)
 	v1.GET("/device/control/jobs/:trace_id/events", s.handleControlJobEvents)
 	return router
+}
+
+func (s *Server) limitConcurrency() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		select {
+		case s.requestSlots <- struct{}{}:
+			defer func() { <-s.requestSlots }()
+			c.Next()
+		default:
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "server is busy"})
+		}
+	}
 }
 
 func (s *Server) handleHealth(c *gin.Context) {
@@ -340,6 +392,11 @@ func (s *Server) handleRuntimeStatus(c *gin.Context) {
 		outboxBody["oldest_pending_age_ms"] = outboxStats.OldestPendingAgeMs
 		outboxBody["send_rate_per_sec"] = outboxStats.SendRatePerSec
 		outboxBody["last_send_at"] = millisToRFC3339(outboxStats.LastSendAt)
+		outboxBody["dead_letter_count"] = outboxStats.DeadLetterCount
+		outboxBody["mqtt_pending_count"] = outboxStats.MQTTPendingCount
+		outboxBody["mqtt_oldest_pending_age_ms"] = outboxStats.MQTTOldestAgeMs
+		outboxBody["mqtt_dead_letter_count"] = outboxStats.MQTTDeadLetterCount
+		outboxBody["mqtt_pending_by_group"] = outboxStats.MQTTPendingByGroup
 	}
 	response["runtime"].(gin.H)["telemetry_outbox"] = outboxBody
 
@@ -772,6 +829,12 @@ func parseControlJobListQuery(c *gin.Context) (ControlJobListQuery, error) {
 		}
 		query.Limit = int(value)
 	}
+	if query.Limit == 0 {
+		query.Limit = 100
+	}
+	if query.Limit > maxControlQueryLimit {
+		return ControlJobListQuery{}, fmt.Errorf("limit must be <= %d", maxControlQueryLimit)
+	}
 	if raw := strings.TrimSpace(c.Query("offset")); raw != "" {
 		value, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil || value < 0 {
@@ -1005,15 +1068,23 @@ func readBody(c *gin.Context) ([]byte, error) {
 	if c == nil || c.Request == nil || c.Request.Body == nil {
 		return []byte{}, nil
 	}
-	body, err := io.ReadAll(c.Request.Body)
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxRequestBodyBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read request body")
+	}
+	if int64(len(body)) > maxRequestBodyBytes {
+		return nil, requestBodyTooLargeError{}
 	}
 	if len(body) == 0 {
 		return []byte{}, nil
 	}
 	return body, nil
 }
+
+type requestBodyTooLargeError struct{}
+
+func (requestBodyTooLargeError) Error() string { return "request body exceeds 1 MiB limit" }
+func (requestBodyTooLargeError) Status() int   { return http.StatusRequestEntityTooLarge }
 
 func writeJSONError(c *gin.Context, statusCode int, message string) {
 	c.JSON(statusCode, gin.H{
@@ -1058,7 +1129,7 @@ func listenAddress(host string, port int) string {
 func normalizedHost(host string) string {
 	trimmed := strings.TrimSpace(host)
 	if trimmed == "" {
-		return "0.0.0.0"
+		return "127.0.0.1"
 	}
 	return trimmed
 }

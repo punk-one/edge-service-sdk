@@ -125,6 +125,7 @@ func (r *Runner) startDefinition(definition processapi.Definition, devices map[s
 	}
 
 	definitionCopy := definition
+	executionSlots := make(chan struct{}, definition.Concurrency)
 	return r.bus.StartConsumer(runtimebus.ConsumerConfig{
 		Durable:       "process-" + definition.Name,
 		FilterSubject: busapi.StreamSubject,
@@ -132,11 +133,11 @@ func (r *Runner) startDefinition(definition processapi.Definition, devices map[s
 		AckWait:       timeout + 5*time.Second,
 		MaxDeliver:    10,
 	}, func(parent context.Context, message busapi.Message) error {
-		return r.handle(parent, definitionCopy, devices, handler, timeout, message)
+		return r.handle(parent, definitionCopy, devices, handler, timeout, executionSlots, message)
 	})
 }
 
-func (r *Runner) handle(parent context.Context, definition processapi.Definition, devices map[string]struct{}, handler processapi.Handler, timeout time.Duration, message busapi.Message) (err error) {
+func (r *Runner) handle(parent context.Context, definition processapi.Definition, devices map[string]struct{}, handler processapi.Handler, timeout time.Duration, executionSlots chan struct{}, message busapi.Message) error {
 	if message.Origin == busapi.OriginProcess && strings.EqualFold(strings.TrimSpace(message.ProcessName), definition.Name) {
 		return nil
 	}
@@ -154,14 +155,35 @@ func (r *Runner) handle(parent context.Context, definition processapi.Definition
 
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("process %s panicked: %v", definition.Name, recovered)
-		}
+	select {
+	case executionSlots <- struct{}{}:
+	default:
+		return fmt.Errorf("process %s has %d timed or active executions", definition.Name, cap(executionSlots))
+	}
+	type handlerResult struct {
+		outputs []busapi.Message
+		err     error
+	}
+	done := make(chan handlerResult, 1)
+	go func() {
+		defer func() { <-executionSlots }()
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				done <- handlerResult{err: fmt.Errorf("process %s panicked: %v", definition.Name, recovered)}
+			}
+		}()
+		outputs, err := handler.Handle(ctx, message)
+		done <- handlerResult{outputs: outputs, err: err}
 	}()
-	outputs, err := handler.Handle(ctx, message)
-	if err != nil {
-		return err
+	var outputs []busapi.Message
+	select {
+	case result := <-done:
+		if result.err != nil {
+			return result.err
+		}
+		outputs = result.outputs
+	case <-ctx.Done():
+		return fmt.Errorf("process %s timed out after %s: %w", definition.Name, timeout, ctx.Err())
 	}
 	for _, output := range outputs {
 		if _, err := busapi.SubjectFor(output.Type, output.Identifier); err != nil {

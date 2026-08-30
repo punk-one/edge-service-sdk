@@ -8,12 +8,11 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/punk-one/edge-service-sdk/internal/sqliteutil"
 	outevent "github.com/punk-one/edge-service-sdk/telemetry"
 
 	_ "modernc.org/sqlite"
 )
-
-const telemetryOutboxSchemaVersion = 1
 
 type sqliteStore struct {
 	db *sql.DB
@@ -47,14 +46,15 @@ func newSQLiteStore(path string) (*sqliteStore, error) {
 func (s *sqliteStore) init() error {
 	for _, stmt := range []string{
 		"PRAGMA journal_mode = WAL;",
-		"PRAGMA synchronous = NORMAL;",
+		// FULL is intentional: a nil Append result is the SDK durability
+		// boundary and must survive an operating-system crash or power loss.
+		"PRAGMA synchronous = FULL;",
 		"PRAGMA busy_timeout = 5000;",
 	} {
 		if _, err := s.db.Exec(stmt); err != nil {
 			return err
 		}
 	}
-
 	if _, err := s.db.Exec(`
 CREATE TABLE IF NOT EXISTS telemetry_outbox (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,10 +74,18 @@ CREATE TABLE IF NOT EXISTS telemetry_outbox (
 CREATE INDEX IF NOT EXISTS idx_telemetry_outbox_order ON telemetry_outbox(time, id);
 CREATE INDEX IF NOT EXISTS idx_telemetry_outbox_retention ON telemetry_outbox(created_at);
 CREATE INDEX IF NOT EXISTS idx_telemetry_outbox_device ON telemetry_outbox(device_code, time, id);
+CREATE TABLE IF NOT EXISTS telemetry_outbox_dead_letter (
+	id INTEGER PRIMARY KEY,
+	trace_id TEXT,
+	device_code TEXT,
+	data_json TEXT NOT NULL,
+	reason TEXT NOT NULL,
+	quarantined_at INTEGER NOT NULL
+);
 `); err != nil {
 		return err
 	}
-	_, err := s.db.Exec(fmt.Sprintf("PRAGMA user_version = %d;", telemetryOutboxSchemaVersion))
+	_, err := s.db.Exec(`PRAGMA user_version = 1;`)
 	return err
 }
 
@@ -97,14 +105,8 @@ func (s *sqliteStore) Append(event outevent.TelemetryEvent, replayed bool, creat
 INSERT INTO telemetry_outbox(
 	trace_id, device_code, product_code, source_name, time, is_replayed, data_json, created_at
 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
-		event.TraceID,
-		event.DeviceName,
-		event.ProductCode,
-		sourceName,
-		event.CollectedAt,
-		boolInt(replayed),
-		string(dataJSON),
-		createdAt,
+		event.TraceID, event.DeviceName, event.ProductCode, sourceName,
+		event.CollectedAt, boolInt(replayed), string(dataJSON), createdAt,
 	)
 	if err != nil {
 		return 0, err
@@ -129,6 +131,9 @@ func (s *sqliteStore) MaxID() (int64, error) {
 }
 
 func (s *sqliteStore) FetchPending(limit int, cutoffID int64) ([]StoredTelemetry, error) {
+	if err := s.quarantineMalformed(); err != nil {
+		return nil, fmt.Errorf("quarantine malformed telemetry rows: %w", err)
+	}
 	if limit <= 0 {
 		limit = 100
 	}
@@ -203,6 +208,27 @@ LIMIT ?`
 	return result, rows.Err()
 }
 
+func (s *sqliteStore) quarantineMalformed() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`
+INSERT OR IGNORE INTO telemetry_outbox_dead_letter(
+	id, trace_id, device_code, data_json, reason, quarantined_at
+)
+SELECT id, trace_id, device_code, data_json, 'invalid data_json', ?
+FROM telemetry_outbox
+WHERE json_valid(data_json) = 0`, nowMillis()); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM telemetry_outbox WHERE json_valid(data_json) = 0`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *sqliteStore) MarkAttempt(id, sendAt int64, replayed bool) error {
 	result, err := s.db.Exec(`
 UPDATE telemetry_outbox
@@ -255,6 +281,32 @@ func (s *sqliteStore) Stats() (StoreStats, error) {
 		return StoreStats{}, err
 	}
 	return stats, nil
+}
+
+func (s *sqliteStore) ConfigureMaxBytes(maxBytes int64) error {
+	return sqliteutil.ConfigureMaxBytes(s.db, maxBytes)
+}
+
+func (s *sqliteStore) DeadLetterCount() (int64, error) {
+	var count int64
+	if err := s.db.QueryRow(`SELECT COUNT(1) FROM telemetry_outbox_dead_letter`).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (s *sqliteStore) HealthCheck() error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("telemetry sqlite store is not initialized")
+	}
+	var result string
+	if err := s.db.QueryRow(`PRAGMA quick_check(1);`).Scan(&result); err != nil {
+		return err
+	}
+	if result != "ok" {
+		return fmt.Errorf("telemetry sqlite quick_check: %s", result)
+	}
+	return sqliteutil.CheckCapacity(s.db)
 }
 
 func (s *sqliteStore) Close() error {

@@ -6,8 +6,13 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
+
+	"github.com/punk-one/edge-service-sdk/internal/atomicfile"
 )
+
+const defaultMaxDownloadBytes int64 = 1 << 30
 
 // Client provides HTTP-based file transfer capabilities using presigned URLs.
 // It is not aware of MinIO/S3/Azure Blob and does not handle authorization.
@@ -22,12 +27,23 @@ type Client interface {
 // NewClient creates a new Client with a 10-minute HTTP timeout.
 func NewClient() Client {
 	return &httpClient{
-		client: &http.Client{Timeout: 10 * time.Minute},
+		client:           &http.Client{Timeout: 10 * time.Minute},
+		maxDownloadBytes: defaultMaxDownloadBytes,
 	}
 }
 
+// NewClientWithMaxDownloadSize creates a client with an explicit download
+// limit. Non-positive values retain the 1 GiB safety default.
+func NewClientWithMaxDownloadSize(maxBytes int64) Client {
+	if maxBytes <= 0 {
+		maxBytes = defaultMaxDownloadBytes
+	}
+	return &httpClient{client: &http.Client{Timeout: 10 * time.Minute}, maxDownloadBytes: maxBytes}
+}
+
 type httpClient struct {
-	client *http.Client
+	client           *http.Client
+	maxDownloadBytes int64
 }
 
 func (c *httpClient) UploadByURL(ctx context.Context, url string, filePath string) error {
@@ -53,9 +69,8 @@ func (c *httpClient) UploadByURL(ctx context.Context, url string, filePath strin
 	if err != nil {
 		return fmt.Errorf("upload request: %w", err)
 	}
-	resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return fmt.Errorf("upload failed: HTTP %s", resp.Status)
 	}
 	return nil
@@ -73,18 +88,47 @@ func (c *httpClient) DownloadByURL(ctx context.Context, url string, targetPath s
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return fmt.Errorf("download failed: HTTP %s", resp.Status)
 	}
-
-	out, err := os.Create(targetPath)
-	if err != nil {
-		return fmt.Errorf("create target file: %w", err)
+	maxBytes := c.maxDownloadBytes
+	if maxBytes <= 0 {
+		maxBytes = defaultMaxDownloadBytes
 	}
-	defer out.Close()
-
-	if _, err := io.Copy(out, resp.Body); err != nil {
+	if resp.ContentLength > maxBytes {
+		return fmt.Errorf("download exceeds %d byte limit", maxBytes)
+	}
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		return fmt.Errorf("create target directory: %w", err)
+	}
+	out, err := os.CreateTemp(filepath.Dir(targetPath), ".download-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temporary target file: %w", err)
+	}
+	temporary := out.Name()
+	committed := false
+	defer func() {
+		_ = out.Close()
+		if !committed {
+			_ = os.Remove(temporary)
+		}
+	}()
+	written, err := io.Copy(out, io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
 		return fmt.Errorf("write target file: %w", err)
 	}
+	if written > maxBytes {
+		return fmt.Errorf("download exceeds %d byte limit", maxBytes)
+	}
+	if err := out.Sync(); err != nil {
+		return fmt.Errorf("flush target file: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("close target file: %w", err)
+	}
+	if err := atomicfile.Replace(temporary, targetPath); err != nil {
+		return fmt.Errorf("commit target file: %w", err)
+	}
+	committed = true
 	return nil
 }

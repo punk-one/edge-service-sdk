@@ -74,6 +74,17 @@ type PendingProperty struct {
 	UpdatedAt   int64
 }
 
+// ResultDelivery is one durable MQTT control-result publication.
+type ResultDelivery struct {
+	TraceID     string
+	DeviceCode  string
+	ProductCode string
+	Kind        string
+	Result      ctl.Result
+	CreatedAt   int64
+	Attempts    int64
+}
+
 // Store persists local control jobs, recorded results, and pending async work.
 type Store interface {
 	LoadJob(traceID string) (JobState, bool, error)
@@ -90,6 +101,30 @@ type Store interface {
 	DeletePendingProperty(traceID string) error
 	ListPendingProperties() ([]PendingProperty, error)
 	Close() error
+}
+
+// AtomicRecorder is implemented by stores that can update a job and append
+// its result in one transaction.
+type AtomicRecorder interface {
+	RecordJobResult(job JobState, result ctl.Result, final bool) (bool, error)
+}
+
+// ExecutionClaimer atomically moves a trace into processing without appending
+// a user-visible progress event.
+type ExecutionClaimer interface {
+	ClaimExecution(job JobState) (bool, error)
+}
+
+// ResultOutbox exposes durable final control-result deliveries.
+type ResultOutbox interface {
+	ListResultDeliveries(kindPrefix string, limit int) ([]ResultDelivery, error)
+	AckResultDelivery(traceID string) error
+	MarkResultDeliveryFailed(traceID, message string) error
+}
+
+// CapacityStore supports a hard SQLite file-size ceiling.
+type CapacityStore interface {
+	ConfigureMaxBytes(maxBytes int64) error
 }
 
 func IsFinalCode(code int) bool {

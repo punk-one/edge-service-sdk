@@ -32,6 +32,10 @@ type deviceStatusPublisher struct {
 	pingCache    map[string]bool
 	pingMu       sync.RWMutex
 	pingInterval time.Duration
+	stopCh       chan struct{}
+	stopOnce     sync.Once
+	wg           sync.WaitGroup
+	children     []*deviceStatusPublisher
 }
 
 type publishedDeviceStatus struct {
@@ -78,6 +82,7 @@ func newDeviceStatusPublisher(tracker *rtstatus.Tracker, sdk *DeviceSDK, publish
 		lastPublished:     make(map[string]publishedDeviceStatus),
 		pingCache:         make(map[string]bool),
 		pingInterval:      defaultPingInterval,
+		stopCh:            make(chan struct{}),
 	}
 }
 
@@ -91,17 +96,50 @@ func (p *deviceStatusPublisher) Start() {
 	})
 
 	p.publishSnapshot(p.tracker.Snapshot(), true, time.Now().UnixMilli())
-	go p.runHeartbeatLoop()
-	go p.startPingLoop()
+	p.startLoop(p.runHeartbeatLoop)
+	p.startLoop(p.startPingLoop)
+}
+
+// StartChangeOnly publishes state transitions and runs connectivity probes,
+// while child publishers own group-specific heartbeat schedules.
+func (p *deviceStatusPublisher) StartChangeOnly() {
+	if p == nil {
+		return
+	}
+	p.tracker.SetOnChange(func(states []rtstatus.DeviceState) {
+		p.publishSnapshot(states, false, time.Now().UnixMilli())
+	})
+	p.publishSnapshot(p.tracker.Snapshot(), true, time.Now().UnixMilli())
+	p.startLoop(p.startPingLoop)
 }
 
 // StartHeartbeatOnly starts only the heartbeat loop (no OnChange registration).
 // Used for per-group heartbeat in multi-group setups.
 func (p *deviceStatusPublisher) StartHeartbeatOnly() {
-	if p == nil || p.heartbeatInterval <= 0 {
+	if p == nil || p.currentHeartbeatInterval() <= 0 {
 		return
 	}
-	go p.runHeartbeatLoop()
+	p.startLoop(p.runHeartbeatLoop)
+}
+
+func (p *deviceStatusPublisher) startLoop(run func()) {
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		run()
+	}()
+}
+
+func (p *deviceStatusPublisher) Close() {
+	if p == nil {
+		return
+	}
+	p.stopOnce.Do(func() { close(p.stopCh) })
+	p.wg.Wait()
+	for _, child := range p.children {
+		child.Close()
+	}
+	p.tracker.SetOnChange(nil)
 }
 
 // UpdateHeartbeatInterval updates the heartbeat interval at runtime.
@@ -116,20 +154,35 @@ func (p *deviceStatusPublisher) UpdateHeartbeatInterval(interval time.Duration) 
 }
 
 func (p *deviceStatusPublisher) runHeartbeatLoop() {
-	if p == nil || p.heartbeatInterval <= 0 {
+	intervalValue := p.currentHeartbeatInterval()
+	if p == nil || intervalValue <= 0 {
 		return
 	}
 
 	interval := time.Second
-	if p.heartbeatInterval < interval {
-		interval = p.heartbeatInterval
+	if intervalValue < interval {
+		interval = intervalValue
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	for now := range ticker.C {
-		p.publishHeartbeat(p.tracker.Snapshot(), now.UnixMilli())
+	for {
+		select {
+		case <-p.stopCh:
+			return
+		case now := <-ticker.C:
+			p.publishHeartbeat(p.tracker.Snapshot(), now.UnixMilli())
+		}
 	}
+}
+
+func (p *deviceStatusPublisher) currentHeartbeatInterval() time.Duration {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.heartbeatInterval
 }
 
 func (p *deviceStatusPublisher) publishSnapshot(states []rtstatus.DeviceState, force bool, now int64) {
@@ -148,12 +201,13 @@ func (p *deviceStatusPublisher) publishSnapshot(states []rtstatus.DeviceState, f
 
 		p.mu.Lock()
 		record, exists := p.lastPublished[state.DeviceCode]
+		unchanged := exists && record.summary == summary
 		record.data = data
 		record.summary = summary
 		p.lastPublished[state.DeviceCode] = record
 		p.mu.Unlock()
 
-		if !force && exists && record.summary == summary {
+		if !force && unchanged {
 			continue
 		}
 
@@ -307,8 +361,13 @@ func (p *deviceStatusPublisher) startPingLoop() {
 
 	p.pingAllDevices()
 
-	for range ticker.C {
-		p.pingAllDevices()
+	for {
+		select {
+		case <-p.stopCh:
+			return
+		case <-ticker.C:
+			p.pingAllDevices()
+		}
 	}
 }
 
@@ -318,17 +377,35 @@ func (p *deviceStatusPublisher) pingAllDevices() {
 	}
 
 	devices := p.sdk.deviceConfigs
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, 16)
+deviceLoop:
 	for _, device := range devices {
 		addr := extractHostPort(device)
 		if addr == "" {
 			continue
 		}
-		reachable := pingTCP(addr, pingTimeout)
-
-		p.pingMu.Lock()
-		p.pingCache[device.Name] = reachable
-		p.pingMu.Unlock()
+		device := device
+		select {
+		case <-p.stopCh:
+			break deviceLoop
+		case semaphore <- struct{}{}:
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-semaphore }()
+			reachable := pingTCP(addr, pingTimeout)
+			deviceCode := device.InternalName
+			if deviceCode == "" {
+				deviceCode = device.Name
+			}
+			p.pingMu.Lock()
+			p.pingCache[deviceCode] = reachable
+			p.pingMu.Unlock()
+		}()
 	}
+	wg.Wait()
 }
 
 func (p *deviceStatusPublisher) isOnline(deviceCode string) bool {

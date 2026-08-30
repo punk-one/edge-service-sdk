@@ -19,6 +19,44 @@ It extracts the common runtime, control, and transport capabilities out of proto
 - control job persistence, result history, diagnostics, export, and MQTT query handling
 - dependency checks, worker supervision, and shared logging contracts
 
+## Reliability Hardening In v0.10.0
+
+- MQTT delivery now has a second SQLite acceptance boundary with one durable
+  row and ACK per named destination. Telemetry, EVENT, property reports, and
+  control results retry independently for every MQTT group; one unavailable
+  mirror cannot duplicate traffic to a healthy group.
+- Periodic property reports now carry a stable `trace_id` and survive broker
+  outages and process restarts. Runtime status exposes aggregate and per-group
+  MQTT queue depth, oldest age, and dead-letter count.
+- Pending rows bind to stable `mqtt.groups[].name` values. Removing or renaming
+  a group while it still has pending deliveries fails startup and requires the
+  operator to restore, drain, or explicitly migrate that destination.
+- A driver call that does not return after its deadline is classified as
+  stuck and requests a graceful hard restart. The external supervisor should
+  restart exit code `75`; `driver.Stop` is bounded to five seconds.
+
+- Startup and runtime failures now propagate through `app.Run` /
+  `app.RunWithOptions`; legacy `Bootstrap` wrappers exit non-zero on failure and
+  use exit code `75` after a graceful restart request.
+- Driver I/O has a 30-second default deadline. Implement
+  `driver.ContextProtocolDriver` to cancel transport I/O at its source. Legacy
+  drivers are serialized per device so a stuck call cannot create unbounded
+  goroutines; timed-out writes return the explicit ambiguous code `409`.
+- Control execution claims and final result/outbox writes are transactional.
+  Interrupted physical operations become final `ambiguous` results on startup
+  and are never blindly replayed.
+- MQTT reconnects retain a stable configured client ID, restore every
+  subscription before becoming healthy, and replace half-open connections after
+  publish or subscribe timeout.
+- SQLite acceptance paths use WAL + `synchronous=FULL`, quarantine malformed
+  outbox rows, enforce configurable database limits, and surface corruption or
+  95% capacity through readiness.
+- HTTP has body, header, request-concurrency, query-size, and read/write/idle
+  limits. Blank `service.host` now binds only to `127.0.0.1`.
+- Shutdown cancels workers and control operations, waits for in-flight work,
+  persists final state, then closes MQTT. Worker failures restart with bounded
+  exponential backoff.
+
 ## What's New In v0.9.9
 
 - **Single telemetry outbox path** — every telemetry report that passes the
@@ -46,7 +84,8 @@ It extracts the common runtime, control, and transport capabilities out of proto
 - **Service port auto-assign & range search** — `service.port: 0` now auto-assigns a free port (OS-picked). `service.portEnd` enables range search: try each port in `[port, portEnd]`, use the first available. Previously `port <= 0` disabled the server.
 - **Telemetry compact format** — now includes `trace_id`, `time`, and `send_at` alongside device-name-keyed data.
 - **bitMerge config** — `bitMerge` field on `TelemetryConfig` and `PropertyConfig` for bit-level data merging.
-- **ClientId randomization** — MQTT clientId always gets a random suffix: `sdk-{10-digit}` when unset, `{custom}-{6-digit}` when configured.
+- **ClientId lifecycle** — an omitted ID is generated once per process;
+  a configured ID remains stable and enables a persistent MQTT session.
 
 ## EVENT Configuration
 
@@ -87,11 +126,12 @@ so the SDK no longer exposes a process-memory telemetry channel.
 ```yaml
 telemetryOutbox:
   sqlitePath: "./data/telemetry-outbox.db"
-  retentionDays: 7
+  retentionDays: 0        # 0 = never silently discard pending telemetry
   sendBatchSize: 100
   maxSendRatePerSec: 100
   retryInitialMs: 1000
   retryMaxMs: 30000
+  maxDatabaseBytes: 2147483648
 
 telemetryReport:
   topic: "v1/gateway/{productCode}/telemetry/report"
@@ -110,6 +150,24 @@ The outbox is at-least-once: a crash after MQTT acceptance but before SQLite
 acknowledgement can produce a duplicate, so consumers should deduplicate by
 `trace_id`. QoS 1 is the default. The old `reliableQueue` key and
 `reliable_queue` table are neither read nor migrated.
+
+The shared and control SQLite files are also bounded. If both paths point to
+the same file, the lower configured limit applies:
+
+```yaml
+storage:
+  sqlitePath: "./data/runtime.db"
+  maxDatabaseBytes: 2147483648
+
+controlStore:
+  sqlitePath: "./data/runtime.db"
+  retentionDays: 7
+  maxDatabaseBytes: 2147483648
+```
+
+At the limit, SQLite rejects new durable writes instead of deleting unsent
+data. Operators should alert on `/api/v1/ready` and outbox depth/age before the
+95% readiness threshold is reached.
 
 ## What's New In v0.7.5
 
@@ -153,11 +211,17 @@ func main() {
     registry := cmdapi.NewRegistry()
     // registry.MustRegister(yourCommand)
 
-    app.Bootstrap("edge-service-yourproto", "v0.9.9", newDriver(), registry)
+    app.Bootstrap("edge-service-yourproto", "v0.10.0", newDriver(), registry)
 }
 ```
 
 The bootstrap flow loads config, initializes auth/MQTT/telemetry outbox/control store, wires property + command + query handlers, starts runtime HTTP APIs, and then supervises protocol workers.
+
+Applications that own their process policy can call `app.Run` instead. It
+returns startup/runtime errors and `app.ErrRestartRequested`; service managers
+should restart exit code `75`. For reliable cancellation, protocol drivers
+should additionally implement `driver.ContextProtocolDriver` while retaining
+the original `ProtocolDriver` methods for compatibility.
 
 ## Integration Checklist
 
@@ -321,4 +385,4 @@ MQTT runtime capabilities include telemetry/property/status publishing, property
 
 ## Version
 
-This repository version is `v0.9.9`.
+This repository version is `v0.10.0`.

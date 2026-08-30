@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	contracts "github.com/punk-one/edge-service-sdk/driver"
 )
 
@@ -117,5 +118,5 @@ func NewTraceID(deviceName string) string {
 	if deviceName == "" {
 		deviceName = "telemetry"
 	}
-	return fmt.Sprintf("%s-%d", deviceName, time.Now().UnixNano())
+	return fmt.Sprintf("%s-%s", deviceName, uuid.NewString())
 }

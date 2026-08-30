@@ -87,10 +87,11 @@ func NewService(config appconfig.Config, publisher interface{}, logClient logger
 		queueConfig := reliable.EventOutboxConfig{
 			Enabled:          true,
 			SQLitePath:       config.Storage.SQLitePath,
+			MaxDatabaseBytes: config.Storage.MaxDatabaseBytes,
 			BatchSize:        100,
 			ReplayIntervalMs: 3_000,
 			ReplayRatePerSec: 20,
-			RetentionDays:    7,
+			RetentionDays:    0,
 		}
 		dispatcher, err := reliable.NewEventDispatcher(queueConfig, eventPublisher, logClient)
 		if err != nil {
@@ -99,6 +100,14 @@ func NewService(config appconfig.Config, publisher interface{}, logClient logger
 		service.dispatcher = dispatcher
 	}
 	return service, nil
+}
+
+// HealthCheck verifies the EVENT durable delivery path when it is enabled.
+func (s *Service) HealthCheck() error {
+	if s == nil || s.dispatcher == nil {
+		return nil
+	}
+	return s.dispatcher.HealthCheck()
 }
 
 func (s *Service) Start() {
