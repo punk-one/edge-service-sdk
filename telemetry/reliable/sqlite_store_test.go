@@ -45,8 +45,9 @@ func TestTelemetrySQLiteStorePreservesDynamicDataAndTimeOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DataMap() error = %v", err)
 	}
-	if got := actualTelemetryValue(data["total_count"]); got != float64(139473) {
-		t.Fatalf("dynamic data was not preserved: %#v", data)
+	got, ok := actualTelemetryValue(data["total_count"]).(json.Number)
+	if !ok || got.String() != "139473" {
+		t.Fatalf("dynamic data was not preserved: %#v (%T)", got, got)
 	}
 }
 
@@ -84,6 +85,40 @@ func TestTelemetrySQLiteStorePersistsSendAttemptAndDoesNotReuseIDs(t *testing.T)
 	}
 	if secondID <= firstID {
 		t.Fatalf("AUTOINCREMENT id was reused after emptying table: first=%d second=%d", firstID, secondID)
+	}
+}
+
+func TestTelemetrySQLiteStorePreservesNumericJSONText(t *testing.T) {
+	store, err := newSQLiteStore(filepath.Join(t.TempDir(), "telemetry-outbox.db"))
+	if err != nil {
+		t.Fatalf("newSQLiteStore() error = %v", err)
+	}
+	defer store.Close()
+
+	event := outevent.TelemetryEvent{
+		TraceID:     "numeric-json",
+		DeviceName:  "D1",
+		CollectedAt: 1,
+		Values: map[string]outevent.TelemetryValue{
+			"temperature": {Type: "Float32", Value: json.RawMessage("12.30"), Origin: 1},
+			"counter":     {Type: "Uint64", Value: json.RawMessage("18446744073709551615"), Origin: 1},
+		},
+	}
+	if _, err := store.Append(event, false, 1); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	records, err := store.FetchPending(1, 0)
+	if err != nil {
+		t.Fatalf("FetchPending() error = %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("FetchPending() returned %d rows, want 1", len(records))
+	}
+	if got := string(records[0].Event.Values["temperature"].Value); got != "12.30" {
+		t.Fatalf("temperature JSON = %q, want 12.30", got)
+	}
+	if got := string(records[0].Event.Values["counter"].Value); got != "18446744073709551615" {
+		t.Fatalf("counter JSON = %q", got)
 	}
 }
 

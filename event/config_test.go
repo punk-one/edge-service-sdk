@@ -64,6 +64,52 @@ config:
 	}
 }
 
+func TestLoadProfilesPrefersJSON(t *testing.T) {
+	dir := t.TempDir()
+	yamlProfile := `name: yaml-events
+type: EVENT
+config:
+  categories:
+    alarm:
+      events:
+        - eventCode: YAML_EVENT
+          name: yaml event
+          eventType: pulse
+`
+	jsonProfile := `{"name":"json-events","type":"EVENT","config":{"categories":{"alarm":{"events":[{"eventCode":"JSON_EVENT","name":"json event","eventType":"pulse"}]}}}}`
+	if err := os.WriteFile(filepath.Join(dir, "sample.yaml"), []byte(yamlProfile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sample.json"), []byte(jsonProfile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	profiles, err := LoadProfiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := SelectProfile(profiles, "sample.json")
+	if !ok || profile.Name != "json-events" {
+		t.Fatalf("selected profile = %#v, %t", profile, ok)
+	}
+	if _, exists := profiles["yaml-events"]; exists {
+		t.Fatal("lower-priority YAML profile was loaded")
+	}
+}
+
+func TestLoadProfilesRejectsInvalidPreferredJSON(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "sample.yaml"), []byte("name: yaml-events\ntype: EVENT\nconfig:\n  categories: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sample.json"), []byte(`{"name":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadProfiles(dir); err == nil || !strings.Contains(err.Error(), "invalid JSON syntax") {
+		t.Fatalf("LoadProfiles() error = %v; want invalid JSON syntax", err)
+	}
+}
+
 func TestValidateForDeviceUsesGroupsAndStandalonePoints(t *testing.T) {
 	device := contracts.DeviceConfig{
 		Name: "D1",

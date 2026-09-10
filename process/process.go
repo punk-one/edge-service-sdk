@@ -92,7 +92,7 @@ func (r *registry) Names() []string {
 	return names
 }
 
-// Definition is loaded from configs/process/*.yaml. Every enabled Process
+// Definition is loaded from configs/process JSON/YAML files. Every enabled Process
 // receives all fixed SDK message types. Runtime controls are optional.
 type Definition struct {
 	Name        string `yaml:"name"`

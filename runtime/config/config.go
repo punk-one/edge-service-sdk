@@ -17,6 +17,18 @@ func LoadConfig(path string) (Config, error) {
 	return cfg.LoadConfig(path)
 }
 
+func LoadConfigWithSource(path string) (Config, string, error) {
+	return cfg.LoadConfigWithSource(path)
+}
+
+func ResolveConfigPath(path string) (string, bool, error) {
+	return cfg.ResolveConfigPath(path)
+}
+
+func ConfigPermissionsTooOpen(path string) (bool, error) {
+	return cfg.ConfigPermissionsTooOpen(path)
+}
+
 func NormalizeConfig(value Config) Config {
 	return cfg.NormalizeConfig(value)
 }

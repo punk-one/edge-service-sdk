@@ -5,13 +5,12 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
-	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	contracts "github.com/punk-one/edge-service-sdk/driver"
+	"github.com/punk-one/edge-service-sdk/internal/configfile"
 
 	"gopkg.in/yaml.v3"
 )
@@ -27,7 +26,7 @@ var forbiddenProfileKeys = map[string]struct{}{
 	"dependson": {},
 }
 
-// LoadProfiles loads all event YAML files from dir. An absent directory is a
+// LoadProfiles loads event JSON/YAML files from dir. An absent directory is a
 // valid disabled configuration and returns an empty map.
 func LoadProfiles(dir string) (map[string]EventProfileFile, error) {
 	profiles := make(map[string]EventProfileFile)
@@ -41,16 +40,10 @@ func LoadProfiles(dir string) (map[string]EventProfileFile, error) {
 		return nil, err
 	}
 
-	files, err := filepath.Glob(filepath.Join(dir, "*.yaml"))
+	files, err := configfile.ListPreferred(dir)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read event profile directory %s: %w", dir, err)
 	}
-	more, err := filepath.Glob(filepath.Join(dir, "*.yml"))
-	if err != nil {
-		return nil, err
-	}
-	files = append(files, more...)
-	sort.Strings(files)
 
 	for _, file := range files {
 		data, err := os.ReadFile(file)
@@ -62,7 +55,7 @@ func LoadProfiles(dir string) (map[string]EventProfileFile, error) {
 		}
 
 		var profile EventProfileFile
-		if err := yaml.Unmarshal(data, &profile); err != nil {
+		if err := configfile.Decode(file, data, &profile); err != nil {
 			return nil, fmt.Errorf("parse event profile %s: %w", file, err)
 		}
 		profile.Name = strings.TrimSpace(profile.Name)
@@ -81,7 +74,7 @@ func LoadProfiles(dir string) (map[string]EventProfileFile, error) {
 			return nil, fmt.Errorf("invalid event profile %s: %w", file, err)
 		}
 		profiles[profile.Name] = profile
-		fileName := strings.TrimSuffix(filepath.Base(file), filepath.Ext(file))
+		fileName := configfile.LogicalName(file)
 		if fileName != "" && fileName != profile.Name {
 			if existing, exists := profiles[fileName]; exists && existing.Name != profile.Name {
 				return nil, fmt.Errorf("event profile filename alias %q conflicts with profile %q", fileName, existing.Name)
@@ -105,7 +98,7 @@ func normalizeCategories(input map[string]CategoryConfig) map[string]CategoryCon
 }
 
 // SelectProfile resolves an explicit device.eventProfile reference. The
-// reference may be the YAML name or the filename without its extension.
+// reference may be the profile name or filename, with or without extension.
 func SelectProfile(profiles map[string]EventProfileFile, name string) (EventProfileFile, bool) {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -114,9 +107,9 @@ func SelectProfile(profiles map[string]EventProfileFile, name string) (EventProf
 	if profile, ok := profiles[name]; ok {
 		return profile, true
 	}
-	base := strings.TrimSuffix(strings.TrimSuffix(name, ".yaml"), ".yml")
+	base := configfile.LogicalName(name)
 	for key, profile := range profiles {
-		if strings.TrimSuffix(strings.TrimSuffix(key, ".yaml"), ".yml") == base {
+		if configfile.LogicalName(key) == base {
 			return profile, true
 		}
 	}
@@ -455,7 +448,7 @@ func collectStructFieldNames(items []contracts.PropertyStructField, fields map[s
 
 func validateForbiddenKeys(data []byte, file string) error {
 	var node yaml.Node
-	if err := yaml.Unmarshal(data, &node); err != nil {
+	if err := configfile.Decode(file, data, &node); err != nil {
 		return fmt.Errorf("parse event profile %s: %w", file, err)
 	}
 	if err := walkForbiddenKeys(&node); err != nil {

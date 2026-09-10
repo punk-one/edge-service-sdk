@@ -2,21 +2,23 @@ package configsvc
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 
 	appconfig "github.com/punk-one/edge-service-sdk/config"
 	contracts "github.com/punk-one/edge-service-sdk/driver"
+	coreevent "github.com/punk-one/edge-service-sdk/event"
+	"github.com/punk-one/edge-service-sdk/internal/configfile"
 	mqtt "github.com/punk-one/edge-service-sdk/transport/mqtt"
 )
 
 // ConfigService provides runtime configuration CRUD operations.
 // It supports both temporary (in-memory) and permanent (file-based) changes.
 type ConfigService struct {
-	mu sync.RWMutex
-
-	configsDir string
+	mu        sync.RWMutex
+	persistMu sync.Mutex
 
 	// name → filePath mappings
 	deviceFiles  map[string]string // "ZJJJG006" → "configs/devices/ZJJJG06.yaml"
@@ -37,8 +39,10 @@ type ConfigService struct {
 	// change callback
 	onChange ChangeCallback
 
-	// loaded config reference (for main config.yaml)
+	// loaded config reference (for the selected main JSON/YAML file)
 	mainConfigPath string
+	devicesDir     string
+	profilesDir    string
 }
 
 // NewConfigService creates a ConfigService from loaded configuration data.
@@ -46,22 +50,38 @@ type ConfigService struct {
 // deviceConfigs is the list of merged device configs from LoadConfig.
 // profiles is the map of loaded profiles.
 func NewConfigService(configsDir string, deviceConfigs []contracts.DeviceConfig, profiles map[string]contracts.DeviceProfile) *ConfigService {
+	mainConfigPath := filepath.Join(configsDir, "config.yaml")
+	if resolved, exists, err := configfile.ResolvePreferred(mainConfigPath); err == nil && exists {
+		mainConfigPath = resolved
+	}
+	return NewConfigServiceWithPaths(
+		mainConfigPath,
+		filepath.Join(configsDir, "devices"),
+		filepath.Join(configsDir, "profiles"),
+		deviceConfigs,
+		profiles,
+	)
+}
+
+// NewConfigServiceWithPaths creates a ConfigService using the exact paths that
+// were selected by the loader. Persistent updates therefore keep the source
+// format and cannot create a competing lower-priority configuration file.
+func NewConfigServiceWithPaths(mainConfigPath, devicesDir, profilesDir string, deviceConfigs []contracts.DeviceConfig, profiles map[string]contracts.DeviceProfile) *ConfigService {
 	svc := &ConfigService{
-		configsDir:     configsDir,
 		deviceFiles:    make(map[string]string),
 		profileFiles:   make(map[string]string),
 		profileDevices: make(map[string][]string),
 		deviceProfile:  make(map[string]string),
 		rules:          DefaultValidationRules(),
-		mainConfigPath: filepath.Join(configsDir, "config.yaml"),
+		mainConfigPath: filepath.Clean(mainConfigPath),
+		devicesDir:     filepath.Clean(devicesDir),
+		profilesDir:    filepath.Clean(profilesDir),
 	}
 
 	// Build device → file mapping by scanning devices directory
-	devicesDir := filepath.Join(configsDir, "devices")
 	svc.scanDeviceFiles(devicesDir, deviceConfigs)
 
 	// Build profile → file mapping by scanning profiles directory
-	profilesDir := filepath.Join(configsDir, "profiles")
 	svc.scanProfileFiles(profilesDir, profiles)
 
 	// Build profile → devices reverse index
@@ -99,23 +119,24 @@ func overrideKey(scope, name, configPath string) string {
 }
 
 // ---------------------------------------------------------------------------
-// Config scope (config.yaml)
+// Main config scope
 // ---------------------------------------------------------------------------
 
-// GetConfig reads a value from config.yaml.
+// GetConfig reads a value from the selected main configuration file.
 func (s *ConfigService) GetConfig(configPath string) (*ConfigResult, error) {
 	// Check temporary override first
 	ovKey := overrideKey("config", "", configPath)
 	if val, ok := s.overrides.Load(ovKey); ok {
 		return &ConfigResult{
 			ConfigPath: configPath,
-			Value:      val,
+			Value:      sanitizeConfigValue(configPath, val),
+			Configured: configuredFlag(configPath, val),
 			Source:     SourceOverride,
 		}, nil
 	}
 
 	// Read from file
-	data, err := readYAMLFile(s.mainConfigPath)
+	data, err := readConfigFile(s.mainConfigPath)
 	if err != nil {
 		return nil, err
 	}
@@ -125,13 +146,14 @@ func (s *ConfigService) GetConfig(configPath string) (*ConfigResult, error) {
 	}
 	return &ConfigResult{
 		ConfigPath: configPath,
-		Value:      val,
+		Value:      sanitizeConfigValue(configPath, val),
+		Configured: configuredFlag(configPath, val),
 		Source:     SourceFile,
 		SourceFile: s.mainConfigPath,
 	}, nil
 }
 
-// SetConfig sets a value in config.yaml.
+// SetConfig sets a value in the selected main configuration file.
 func (s *ConfigService) SetConfig(configPath string, value interface{}, persist bool) (*ConfigSetResult, error) {
 	// Validate
 	if rule, ok := resolveRule(s.rules, "config", configPath); ok {
@@ -150,15 +172,9 @@ func (s *ConfigService) SetConfig(configPath string, value interface{}, persist 
 	ovKey := overrideKey("config", "", configPath)
 
 	if persist {
-		// Write to YAML file
-		data, err := readYAMLFile(s.mainConfigPath)
-		if err != nil {
-			return nil, err
-		}
-		if err := setByPath(data, configPath, value); err != nil {
-			return nil, err
-		}
-		if err := writeYAMLFile(s.mainConfigPath, data); err != nil {
+		if err := s.updateConfigFile(s.mainConfigPath, func(data map[string]interface{}) error {
+			return setByPath(data, configPath, value)
+		}); err != nil {
 			return nil, err
 		}
 		// Also update in-memory override (so it takes effect immediately)
@@ -171,7 +187,7 @@ func (s *ConfigService) SetConfig(configPath string, value interface{}, persist 
 	result := &ConfigSetResult{
 		ConfigPath:    configPath,
 		PreviousValue: prevVal,
-		CurrentValue:  value,
+		CurrentValue:  sanitizeConfigValue(configPath, value),
 		TargetFile:    s.mainConfigPath,
 		Persist:       persist,
 		NeedRestart:   needsRestart("config", configPath),
@@ -182,7 +198,7 @@ func (s *ConfigService) SetConfig(configPath string, value interface{}, persist 
 		Name:       "",
 		ConfigPath: configPath,
 		OldValue:   prevVal,
-		NewValue:   value,
+		NewValue:   sanitizeConfigValue(configPath, value),
 		TargetFile: s.mainConfigPath,
 		Persist:    persist,
 	})
@@ -194,7 +210,7 @@ func (s *ConfigService) SetConfig(configPath string, value interface{}, persist 
 // Device scope
 // ---------------------------------------------------------------------------
 
-// resolveDeviceFile returns the device YAML file path for a device name.
+// resolveDeviceFile returns the selected device configuration file path.
 func (s *ConfigService) resolveDeviceFile(deviceName string) (string, error) {
 	if f, ok := s.deviceFiles[deviceName]; ok {
 		return f, nil
@@ -202,7 +218,7 @@ func (s *ConfigService) resolveDeviceFile(deviceName string) (string, error) {
 	return "", fmt.Errorf("device %q not found", deviceName)
 }
 
-// resolveDeviceProfileFile returns the profile YAML file path associated with a device.
+// resolveDeviceProfileFile returns the selected profile file associated with a device.
 func (s *ConfigService) resolveDeviceProfileFile(deviceName string) (string, error) {
 	profileName, ok := s.deviceProfile[deviceName]
 	if !ok {
@@ -222,7 +238,8 @@ func (s *ConfigService) GetDeviceConfig(deviceName, configPath string) (*ConfigR
 	if val, ok := s.overrides.Load(ovKey); ok {
 		return &ConfigResult{
 			ConfigPath: configPath,
-			Value:      val,
+			Value:      sanitizeConfigValue(configPath, val),
+			Configured: configuredFlag(configPath, val),
 			Source:     SourceOverride,
 		}, nil
 	}
@@ -232,7 +249,7 @@ func (s *ConfigService) GetDeviceConfig(deviceName, configPath string) (*ConfigR
 	if err != nil {
 		return nil, err
 	}
-	devData, err := readYAMLFile(devFile)
+	devData, err := readConfigFile(devFile)
 	if err != nil {
 		return nil, err
 	}
@@ -263,7 +280,8 @@ func (s *ConfigService) GetDeviceConfig(deviceName, configPath string) (*ConfigR
 		if err == nil {
 			return &ConfigResult{
 				ConfigPath: configPath,
-				Value:      val,
+				Value:      sanitizeConfigValue(configPath, val),
+				Configured: configuredFlag(configPath, val),
 				Source:     SourceDevice,
 				SourceFile: devFile,
 			}, nil
@@ -275,7 +293,7 @@ func (s *ConfigService) GetDeviceConfig(deviceName, configPath string) (*ConfigR
 	if err != nil {
 		return nil, fmt.Errorf("config_path %q not found in device %q and no profile: %w", configPath, deviceName, err)
 	}
-	profileData, err := readYAMLFile(profileFile)
+	profileData, err := readConfigFile(profileFile)
 	if err != nil {
 		return nil, err
 	}
@@ -285,7 +303,8 @@ func (s *ConfigService) GetDeviceConfig(deviceName, configPath string) (*ConfigR
 	}
 	return &ConfigResult{
 		ConfigPath: configPath,
-		Value:      val,
+		Value:      sanitizeConfigValue(configPath, val),
+		Configured: configuredFlag(configPath, val),
 		Source:     SourceProfile,
 		SourceFile: profileFile,
 	}, nil
@@ -337,8 +356,14 @@ func (s *ConfigService) SetDeviceConfig(deviceName, configPath string, value int
 		targetFile = f
 	} else {
 		// auto: check device file first
-		devFile, _ := s.resolveDeviceFile(deviceName)
-		devData, _ := readYAMLFile(devFile)
+		devFile, err := s.resolveDeviceFile(deviceName)
+		if err != nil {
+			return nil, err
+		}
+		devData, err := readConfigFile(devFile)
+		if err != nil {
+			return nil, err
+		}
 		devList, _ := devData["deviceList"].([]interface{})
 		var devEntry map[string]interface{}
 		for _, item := range devList {
@@ -362,33 +387,26 @@ func (s *ConfigService) SetDeviceConfig(deviceName, configPath string, value int
 	ovKey := overrideKey("device", deviceName, configPath)
 
 	if persist {
-		// Write to target YAML file
-		data, err := readYAMLFile(targetFile)
-		if err != nil {
-			return nil, err
-		}
-		// For device files, navigate into deviceList.{name}
-		writeData := data
-		if strings.Contains(targetFile, "devices") {
-			devList, ok := data["deviceList"].([]interface{})
-			if !ok {
-				return nil, fmt.Errorf("device file %s has no deviceList", targetFile)
-			}
-			for _, item := range devList {
-				m := item.(map[string]interface{})
-				if fmt.Sprint(m["name"]) == deviceName {
-					if err := setByPath(m, configPath, value); err != nil {
-						return nil, err
-					}
-					break
+		if err := s.updateConfigFile(targetFile, func(data map[string]interface{}) error {
+			// For device files, navigate into deviceList.{name}.
+			if s.isDeviceConfigFile(targetFile) {
+				devList, ok := data["deviceList"].([]interface{})
+				if !ok {
+					return fmt.Errorf("device file %s has no deviceList", targetFile)
 				}
+				for _, item := range devList {
+					m, ok := item.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					if fmt.Sprint(m["name"]) == deviceName {
+						return setByPath(m, configPath, value)
+					}
+				}
+				return fmt.Errorf("device %q not found in %s", deviceName, targetFile)
 			}
-		} else {
-			if err := setByPath(data, configPath, value); err != nil {
-				return nil, err
-			}
-		}
-		if err := writeYAMLFile(targetFile, writeData); err != nil {
+			return setByPath(data, configPath, value)
+		}); err != nil {
 			return nil, err
 		}
 		s.overrides.Store(ovKey, value)
@@ -399,7 +417,7 @@ func (s *ConfigService) SetDeviceConfig(deviceName, configPath string, value int
 	result := &ConfigSetResult{
 		ConfigPath:    configPath,
 		PreviousValue: prevVal,
-		CurrentValue:  value,
+		CurrentValue:  sanitizeConfigValue(configPath, value),
 		TargetFile:    targetFile,
 		Persist:       persist,
 		NeedRestart:   needsRestart("device", configPath),
@@ -410,7 +428,7 @@ func (s *ConfigService) SetDeviceConfig(deviceName, configPath string, value int
 		Name:       deviceName,
 		ConfigPath: configPath,
 		OldValue:   prevVal,
-		NewValue:   value,
+		NewValue:   sanitizeConfigValue(configPath, value),
 		TargetFile: targetFile,
 		Persist:    persist,
 	})
@@ -429,7 +447,8 @@ func (s *ConfigService) GetProfileConfig(profileName, configPath string) (*Confi
 	if val, ok := s.overrides.Load(ovKey); ok {
 		return &ConfigResult{
 			ConfigPath: configPath,
-			Value:      val,
+			Value:      sanitizeConfigValue(configPath, val),
+			Configured: configuredFlag(configPath, val),
 			Source:     SourceOverride,
 		}, nil
 	}
@@ -439,7 +458,7 @@ func (s *ConfigService) GetProfileConfig(profileName, configPath string) (*Confi
 		return nil, fmt.Errorf("profile %q not found", profileName)
 	}
 
-	data, err := readYAMLFile(profileFile)
+	data, err := readConfigFile(profileFile)
 	if err != nil {
 		return nil, err
 	}
@@ -449,7 +468,8 @@ func (s *ConfigService) GetProfileConfig(profileName, configPath string) (*Confi
 	}
 	return &ConfigResult{
 		ConfigPath: configPath,
-		Value:      val,
+		Value:      sanitizeConfigValue(configPath, val),
+		Configured: configuredFlag(configPath, val),
 		Source:     SourceFile,
 		SourceFile: profileFile,
 	}, nil
@@ -478,14 +498,9 @@ func (s *ConfigService) SetProfileConfig(profileName, configPath string, value i
 	ovKey := overrideKey("profile", profileName, configPath)
 
 	if persist {
-		data, err := readYAMLFile(profileFile)
-		if err != nil {
-			return nil, err
-		}
-		if err := setByPath(data, configPath, value); err != nil {
-			return nil, err
-		}
-		if err := writeYAMLFile(profileFile, data); err != nil {
+		if err := s.updateConfigFile(profileFile, func(data map[string]interface{}) error {
+			return setByPath(data, configPath, value)
+		}); err != nil {
 			return nil, err
 		}
 		s.overrides.Store(ovKey, value)
@@ -498,7 +513,7 @@ func (s *ConfigService) SetProfileConfig(profileName, configPath string, value i
 	result := &ConfigSetResult{
 		ConfigPath:    configPath,
 		PreviousValue: prevVal,
-		CurrentValue:  value,
+		CurrentValue:  sanitizeConfigValue(configPath, value),
 		TargetFile:    profileFile,
 		Persist:       persist,
 		NeedRestart:   needsRestart("profile", configPath),
@@ -509,7 +524,7 @@ func (s *ConfigService) SetProfileConfig(profileName, configPath string, value i
 		Name:       profileName,
 		ConfigPath: configPath,
 		OldValue:   prevVal,
-		NewValue:   value,
+		NewValue:   sanitizeConfigValue(configPath, value),
 		TargetFile: profileFile,
 		Persist:    persist,
 	})
@@ -550,7 +565,7 @@ func (s *ConfigService) ListDevices(deviceName, configPath string) ([]string, []
 		return nil, nil, err
 	}
 
-	data, err := readYAMLFile(devFile)
+	data, err := readConfigFile(devFile)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -561,7 +576,10 @@ func (s *ConfigService) ListDevices(deviceName, configPath string) ([]string, []
 	}
 	var devEntry map[string]interface{}
 	for _, item := range devList {
-		m := item.(map[string]interface{})
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
 		if fmt.Sprint(m["name"]) == deviceName {
 			devEntry = m
 			break
@@ -605,7 +623,7 @@ func (s *ConfigService) ListProfiles(profileName, configPath string) ([]string, 
 		return nil, nil, fmt.Errorf("profile %q not found", profileName)
 	}
 
-	data, err := readYAMLFile(profileFile)
+	data, err := readConfigFile(profileFile)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -639,7 +657,7 @@ func (s *ConfigService) GetOverrides() []OverrideRecord {
 				Scope:      parts[0],
 				Name:       parts[1],
 				ConfigPath: parts[2],
-				Value:      value,
+				Value:      sanitizeConfigValue(parts[2], value),
 			})
 		}
 		return true
@@ -726,12 +744,12 @@ func (s *ConfigService) GetEffectiveTopicConfig(topicKey string, base mqtt.Topic
 func (s *ConfigService) scanDeviceFiles(devicesDir string, deviceConfigs []contracts.DeviceConfig) {
 	// Build a map of device name → source file from the loaded configs
 	// We scan the directory to find which file contains each device
-	entries, err := filepath.Glob(filepath.Join(devicesDir, "*.yaml"))
+	entries, err := configfile.ListPreferred(devicesDir)
 	if err != nil {
 		return
 	}
 	for _, file := range entries {
-		data, err := readYAMLFile(file)
+		data, err := readConfigFile(file)
 		if err != nil {
 			continue
 		}
@@ -760,12 +778,12 @@ func (s *ConfigService) scanDeviceFiles(devicesDir string, deviceConfigs []contr
 }
 
 func (s *ConfigService) scanProfileFiles(profilesDir string, profiles map[string]contracts.DeviceProfile) {
-	entries, err := filepath.Glob(filepath.Join(profilesDir, "*.yaml"))
+	entries, err := configfile.ListPreferred(profilesDir)
 	if err != nil {
 		return
 	}
 	for _, file := range entries {
-		data, err := readYAMLFile(file)
+		data, err := readConfigFile(file)
 		if err != nil {
 			continue
 		}
@@ -775,8 +793,177 @@ func (s *ConfigService) scanProfileFiles(profilesDir string, profiles map[string
 	}
 }
 
+func (s *ConfigService) isDeviceConfigFile(path string) bool {
+	cleaned := filepath.Clean(path)
+	for _, candidate := range s.deviceFiles {
+		if filepath.Clean(candidate) == cleaned {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *ConfigService) updateConfigFile(path string, update func(map[string]interface{}) error) error {
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
+
+	data, err := readConfigFile(path)
+	if err != nil {
+		return err
+	}
+	if err := update(data); err != nil {
+		return err
+	}
+	if err := s.validateCandidateGraph(path, data); err != nil {
+		return fmt.Errorf("candidate configuration is invalid: %w", err)
+	}
+	return writeConfigFile(path, data)
+}
+
+func (s *ConfigService) validateCandidateGraph(candidatePath string, candidateData map[string]interface{}) error {
+	mainData, err := s.readCandidateMap(s.mainConfigPath, candidatePath, candidateData)
+	if err != nil {
+		return err
+	}
+	encodedMain, err := configfile.Marshal(s.mainConfigPath, mainData)
+	if err != nil {
+		return err
+	}
+	config, err := appconfig.DecodeMainConfig(s.mainConfigPath, encodedMain)
+	if err != nil {
+		return err
+	}
+
+	profiles, err := s.loadCandidateProfiles(candidatePath, candidateData)
+	if err != nil {
+		return err
+	}
+	devices, err := s.loadCandidateDevices(candidatePath, candidateData)
+	if err != nil {
+		return err
+	}
+	devices, err = appconfig.ApplyProfiles(devices, profiles)
+	if err != nil {
+		return err
+	}
+	config.Devices = devices
+	config = appconfig.NormalizeConfig(config)
+	if err := appconfig.ValidateConfig(config); err != nil {
+		return err
+	}
+	return validateCandidateEvents(config)
+}
+
+func (s *ConfigService) loadCandidateProfiles(candidatePath string, candidateData map[string]interface{}) (map[string]contracts.DeviceProfile, error) {
+	files, err := listConfigFiles(s.profilesDir)
+	if err != nil {
+		return nil, fmt.Errorf("read profile config directory %s: %w", s.profilesDir, err)
+	}
+	profiles := make(map[string]contracts.DeviceProfile, len(files))
+	for _, path := range files {
+		var profile contracts.DeviceProfile
+		if err := s.decodeCandidate(path, candidatePath, candidateData, &profile); err != nil {
+			return nil, err
+		}
+		profile = appconfig.NormalizeProfile(profile)
+		if strings.TrimSpace(profile.Name) == "" {
+			return nil, fmt.Errorf("profile file %s missing name", path)
+		}
+		if _, duplicate := profiles[profile.Name]; duplicate {
+			return nil, fmt.Errorf("duplicate device profile name %q", profile.Name)
+		}
+		profiles[profile.Name] = profile
+	}
+	return profiles, nil
+}
+
+func (s *ConfigService) loadCandidateDevices(candidatePath string, candidateData map[string]interface{}) ([]contracts.DeviceConfig, error) {
+	files, err := listConfigFiles(s.devicesDir)
+	if err != nil {
+		return nil, fmt.Errorf("read device config directory %s: %w", s.devicesDir, err)
+	}
+	var devices []contracts.DeviceConfig
+	for _, path := range files {
+		var file struct {
+			DeviceList []contracts.DeviceConfig `yaml:"deviceList"`
+		}
+		if err := s.decodeCandidate(path, candidatePath, candidateData, &file); err != nil {
+			return nil, err
+		}
+		for _, device := range file.DeviceList {
+			devices = append(devices, appconfig.NormalizeDeviceConfig(device))
+		}
+	}
+	return devices, nil
+}
+
+func (s *ConfigService) readCandidateMap(path, candidatePath string, candidateData map[string]interface{}) (map[string]interface{}, error) {
+	if sameConfigPath(path, candidatePath) {
+		return candidateData, nil
+	}
+	return readConfigFile(path)
+}
+
+func (s *ConfigService) decodeCandidate(path, candidatePath string, candidateData map[string]interface{}, target interface{}) error {
+	if !sameConfigPath(path, candidatePath) {
+		return configfile.Read(path, target)
+	}
+	data, err := configfile.Marshal(path, candidateData)
+	if err != nil {
+		return err
+	}
+	if err := configfile.Decode(path, data, target); err != nil {
+		return fmt.Errorf("parse configuration file %s: %w", path, err)
+	}
+	return nil
+}
+
+func listConfigFiles(dir string) ([]string, error) {
+	files, err := configfile.ListPreferred(dir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	return files, err
+}
+
+func sameConfigPath(left, right string) bool {
+	leftAbs, leftErr := filepath.Abs(filepath.Clean(left))
+	rightAbs, rightErr := filepath.Abs(filepath.Clean(right))
+	if leftErr == nil && rightErr == nil {
+		return leftAbs == rightAbs
+	}
+	return filepath.Clean(left) == filepath.Clean(right)
+}
+
+func validateCandidateEvents(config appconfig.Config) error {
+	eventDir := strings.TrimSpace(config.Device.EventDir)
+	if eventDir == "" {
+		return nil
+	}
+	profiles, err := coreevent.LoadProfiles(eventDir)
+	if err != nil {
+		return err
+	}
+	for _, device := range config.Devices {
+		if strings.TrimSpace(device.EventProfile) == "" {
+			continue
+		}
+		profile, ok := coreevent.SelectProfile(profiles, device.EventProfile)
+		if !ok {
+			return fmt.Errorf("device %s references unknown eventProfile %s", device.Name, device.EventProfile)
+		}
+		if err := coreevent.ValidateForDevice(profile, device); err != nil {
+			return fmt.Errorf("device %s eventProfile %s: %w", device.Name, device.EventProfile, err)
+		}
+	}
+	return nil
+}
+
 // needsRestart reports whether a config change requires a service restart.
 func needsRestart(scope, configPath string) bool {
+	if scope == "config" && strings.HasPrefix(configPath, "device.") && strings.HasSuffix(configPath, "Dir") {
+		return true
+	}
 	// MQTT connection parameters
 	if strings.HasPrefix(configPath, "mqtt.") {
 		return true
@@ -802,7 +989,7 @@ func needsRestart(scope, configPath string) bool {
 	return false
 }
 
-// GetMainConfigPath returns the path to config.yaml.
+// GetMainConfigPath returns the selected main configuration path.
 func (s *ConfigService) GetMainConfigPath() string {
 	return s.mainConfigPath
 }
@@ -842,5 +1029,82 @@ func NeedRestartKey(scope, configPath string) bool {
 	return needsRestart(scope, configPath)
 }
 
-// ensure appconfig is referenced for potential future use
-var _ = appconfig.LoadConfig
+const redactedConfigValue = "<redacted>"
+
+func sanitizeConfigValue(configPath string, value interface{}) interface{} {
+	if isSensitiveConfigPath(configPath) {
+		return redactScalar(value)
+	}
+	return redactSensitiveTree(value)
+}
+
+func configuredFlag(configPath string, value interface{}) *bool {
+	if !isSensitiveConfigPath(configPath) {
+		return nil
+	}
+	configured := true
+	switch typed := value.(type) {
+	case nil:
+		configured = false
+	case string:
+		configured = strings.TrimSpace(typed) != ""
+	case []interface{}:
+		configured = len(typed) > 0
+	case map[string]interface{}:
+		configured = len(typed) > 0
+	}
+	return &configured
+}
+
+func isSensitiveConfigPath(configPath string) bool {
+	parts := strings.FieldsFunc(configPath, func(r rune) bool {
+		return r == '.' || r == '[' || r == ']'
+	})
+	if len(parts) == 0 {
+		return false
+	}
+	return isSensitiveConfigKey(parts[len(parts)-1])
+}
+
+func isSensitiveConfigKey(key string) bool {
+	normalized := strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(strings.TrimSpace(key)))
+	switch normalized {
+	case "password", "clientkey", "bootstraptoken":
+		return true
+	default:
+		return false
+	}
+}
+
+func redactScalar(value interface{}) interface{} {
+	if value == nil {
+		return nil
+	}
+	if text, ok := value.(string); ok && text == "" {
+		return ""
+	}
+	return redactedConfigValue
+}
+
+func redactSensitiveTree(value interface{}) interface{} {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		result := make(map[string]interface{}, len(typed))
+		for key, item := range typed {
+			if isSensitiveConfigKey(key) {
+				result[key] = redactScalar(item)
+			} else {
+				result[key] = redactSensitiveTree(item)
+			}
+		}
+		return result
+	case []interface{}:
+		result := make([]interface{}, len(typed))
+		for index, item := range typed {
+			result[index] = redactSensitiveTree(item)
+		}
+		return result
+	default:
+		return value
+	}
+}

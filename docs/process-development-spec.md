@@ -8,20 +8,20 @@ as the edge service. It is not a sidecar, a Go plugin, or a replacement for the
 existing collection, MQTT, SQLite, property, or command paths.
 
 The optional bus is fail-open. If it cannot start, all Processes are disabled
-and the original service continues. A Process panic, timeout, invalid YAML, or
-missing handler must not stop the application.
+and the original service continues. A Process panic, timeout, invalid
+configuration, or missing handler must not stop the application.
 
 ## 2. Application layout
 
 ```text
 edge-service-*/
 ├── configs/
-│   ├── config.yaml
+│   ├── config.json
 │   ├── devices/
 │   ├── profiles/
 │   └── process/
-│       ├── telemetry-alarm.yaml
-│       └── external-query.yaml
+│       ├── telemetry-alarm.json
+│       └── external-query.json
 └── internal/
     └── processes/
         ├── registry.go
@@ -30,21 +30,24 @@ edge-service-*/
 ```
 
 `device.processDir` defaults to `./configs/process`. Go handlers are compiled
-into the application and require a rebuild. YAML is loaded at startup; hot
-reload and runtime Go-code loading are out of scope.
+into the application and require a rebuild. JSON is loaded at startup; YAML
+remains compatible. Hot reload and runtime Go-code loading are out of scope.
 
 ## 3. Enabling the runtime and binding devices
 
-The embedded bus is enabled in `configs/config.yaml`:
+The embedded bus is enabled in `configs/config.json`:
 
-```yaml
-natsBus:
-  enabled: true
-
-device:
-  profilesDir: "./configs/profiles"
-  devicesDir: "./configs/devices"
-  processDir: "./configs/process"
+```json
+{
+  "natsBus": {
+    "enabled": true
+  },
+  "device": {
+    "profilesDir": "./configs/profiles",
+    "devicesDir": "./configs/devices",
+    "processDir": "./configs/process"
+  }
+}
 ```
 
 `storeDir`, `maxAge`, and `maxBytes` are optional. Their defaults are
@@ -52,13 +55,17 @@ device:
 
 A Process is enabled by binding its name to one or more devices:
 
-```yaml
-deviceList:
-  - name: device-01
-    profileName: profile-01
-    productCode: product-01
-    processNames:
-      - external-query
+```json
+{
+  "deviceList": [
+    {
+      "name": "device-01",
+      "profileName": "profile-01",
+      "productCode": "product-01",
+      "processNames": ["external-query"]
+    }
+  ]
+}
 ```
 
 The SDK starts each distinct referenced Process once. Before invoking it, the
@@ -66,26 +73,30 @@ runtime requires the message device code to match one of its bound devices.
 Messages without a resolvable device code are skipped by device-bound
 Processes.
 
-## 4. Process YAML
+## 4. Process configuration
 
 Only `name` is required:
 
-```yaml
-name: external-query
-
-externalQuery:
-  baseURL: "https://example.invalid"
-  timeoutMs: 2000
+```json
+{
+  "name": "external-query",
+  "externalQuery": {
+    "baseURL": "https://example.invalid",
+    "timeoutMs": 2000
+  }
+}
 ```
 
 `handler` defaults to `name`. Runtime controls are optional:
 
-```yaml
-name: external-query
-handler: external-query
-concurrency: 1
-timeout: 30s
-maxHop: 4
+```json
+{
+  "name": "external-query",
+  "handler": "external-query",
+  "concurrency": 1,
+  "timeout": "30s",
+  "maxHop": 4
+}
 ```
 
 | Field | Default | Purpose |
@@ -94,9 +105,9 @@ maxHop: 4
 | `timeout` | `30s` | Maximum duration of one `Handle` call before redelivery. |
 | `maxHop` | `4` | Maximum Process-chain depth. Values above the SDK maximum of 16 are rejected. |
 
-Business-specific keys may coexist in the same YAML. The SDK reads the common
+Business-specific keys may coexist in the same file. The SDK reads the common
 definition fields; the application handler may load its own section. A Process
-does not receive a Profile object and must not use Process YAML to duplicate
+does not receive a Profile object and must not use Process configuration to duplicate
 PLC node addresses, Profile point names, polling intervals, or point lengths.
 Those are SDK collection/control concerns. If a Process needs a business field,
 it owns that field name in code and reads it from the MQTT-compatible payload.
@@ -113,7 +124,7 @@ type Handler interface {
 }
 ```
 
-Handlers register under the name referenced by YAML:
+Handlers register under the name referenced by configuration:
 
 ```go
 registry := process.NewRegistry()

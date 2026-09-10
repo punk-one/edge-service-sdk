@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -160,6 +161,36 @@ func TestConfiguredProcessCountDeduplicatesDeviceBindings(t *testing.T) {
 	}
 	if got := ConfiguredProcessCount(devices); got != 2 {
 		t.Fatalf("ConfiguredProcessCount() = %d, want 2", got)
+	}
+}
+
+func TestLoadDefinitionsPrefersJSON(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "worker.yaml"), []byte("name: yaml-worker\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "worker.json"), []byte(`{"name":"json-worker","timeout":"2s"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	definitions, err := loadDefinitions(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(definitions) != 1 || definitions["json-worker"].Name != "json-worker" {
+		t.Fatalf("definitions = %#v", definitions)
+	}
+}
+
+func TestLoadDefinitionsRejectsInvalidPreferredJSON(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "worker.yaml"), []byte("name: yaml-worker\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "worker.json"), []byte(`{"name":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadDefinitions(dir); err == nil || !strings.Contains(err.Error(), "invalid JSON syntax") {
+		t.Fatalf("loadDefinitions() error = %v; want invalid JSON syntax", err)
 	}
 }
 

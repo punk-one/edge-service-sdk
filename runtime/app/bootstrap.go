@@ -389,7 +389,7 @@ func RunWithOptions(serviceName, version string, driver contracts.ProtocolDriver
 		registry = cmdapi.NewRegistry()
 	}
 
-	config, err := rtconfig.LoadConfig("./configs/config.yaml")
+	config, mainConfigPath, err := rtconfig.LoadConfigWithSource("./configs/config.yaml")
 	if err != nil {
 		return fmt.Errorf("load configuration: %w", err)
 	}
@@ -409,6 +409,11 @@ func RunWithOptions(serviceName, version string, driver contracts.ProtocolDriver
 		logCfg.Compress,
 	)
 	logClient.Infof("Logging level set to: %s", logLevel)
+	if tooOpen, permissionErr := rtconfig.ConfigPermissionsTooOpen(mainConfigPath); permissionErr != nil {
+		logClient.Warnf("Main configuration file permissions could not be checked")
+	} else if tooOpen {
+		logClient.Warnf("Main configuration file permissions are broader than 0600; stored credentials may be readable by other users")
+	}
 
 	if err := validateCommandBindings(config.Devices, registry); err != nil {
 		return fmt.Errorf("validate command bindings: %w", err)
@@ -539,7 +544,13 @@ func RunWithOptions(serviceName, version string, driver contracts.ProtocolDriver
 	if logDir == "" || logDir == "." {
 		logDir = "."
 	}
-	configService := configsvc.NewConfigService("./configs", config.Devices, nil)
+	configService := configsvc.NewConfigServiceWithPaths(
+		mainConfigPath,
+		config.Device.DevicesDir,
+		config.Device.ProfilesDir,
+		config.Devices,
+		nil,
+	)
 	logSearcher := logsvc.NewLogSearcher(logDir)
 	restartCh := make(chan ops.RestartMode, 1)
 	requestRestart := func(mode ops.RestartMode) func() error {

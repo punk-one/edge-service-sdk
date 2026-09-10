@@ -2,40 +2,22 @@ package configsvc
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 
-	"github.com/punk-one/edge-service-sdk/internal/atomicfile"
-	"gopkg.in/yaml.v3"
+	"github.com/punk-one/edge-service-sdk/internal/configfile"
 )
 
-// readYAMLFile reads a YAML file and returns its contents as a generic map.
-func readYAMLFile(filePath string) (map[string]interface{}, error) {
-	data, err := os.ReadFile(filepath.Clean(filePath))
-	if err != nil {
-		return nil, fmt.Errorf("failed to read file %s: %w", filePath, err)
-	}
-	var result map[string]interface{}
-	if err := yaml.Unmarshal(data, &result); err != nil {
-		return nil, fmt.Errorf("failed to parse YAML file %s: %w", filePath, err)
-	}
-	return result, nil
+// readConfigFile reads JSON or YAML into a generic map.
+func readConfigFile(filePath string) (map[string]interface{}, error) {
+	return configfile.ReadMap(filePath)
 }
 
-// writeYAMLFile writes a generic map back to a YAML file.
-func writeYAMLFile(filePath string, data map[string]interface{}) error {
-	out, err := yaml.Marshal(data)
-	if err != nil {
-		return fmt.Errorf("failed to marshal YAML for %s: %w", filePath, err)
-	}
-	if err := atomicfile.WriteFile(filepath.Clean(filePath), out, 0o644); err != nil {
-		return fmt.Errorf("failed to write file %s: %w", filePath, err)
-	}
-	return nil
+// writeConfigFile writes a generic map back using the source file format.
+func writeConfigFile(filePath string, data map[string]interface{}) error {
+	return configfile.WriteMap(filePath, data)
 }
 
-// navigatePath traverses a YAML tree using a dot-separated path.
+// navigatePath traverses a configuration tree using a dot-separated path.
 // Named array elements are matched by their "name" field instead of requiring [index].
 func navigatePath(data interface{}, configPath string) (interface{}, error) {
 	parts := strings.Split(configPath, ".")
@@ -74,7 +56,7 @@ func navigatePath(data interface{}, configPath string) (interface{}, error) {
 	return current, nil
 }
 
-// setByPath sets a value at the given dot-separated path in the YAML tree.
+// setByPath sets a value at the given dot-separated path in the configuration tree.
 // Intermediate maps are created as needed. Named array elements are matched by name.
 func setByPath(data map[string]interface{}, configPath string, value interface{}) error {
 	parts := strings.Split(configPath, ".")

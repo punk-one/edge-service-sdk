@@ -8,7 +8,7 @@ type ConfigChange struct {
 	ConfigPath string      // dot-separated path within the config
 	OldValue   interface{} // previous value (nil if new)
 	NewValue   interface{} // new value
-	TargetFile string      // affected YAML file path
+	TargetFile string      // affected JSON or YAML file path
 	Persist    bool        // true if written to file, false if in-memory only
 }
 
@@ -54,6 +54,7 @@ const (
 type ConfigResult struct {
 	ConfigPath string       `json:"config_path"`
 	Value      interface{}  `json:"value"`
+	Configured *bool        `json:"configured,omitempty"`
 	Source     ConfigSource `json:"source"`
 	SourceFile string       `json:"source_file,omitempty"`
 }

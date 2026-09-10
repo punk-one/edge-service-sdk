@@ -339,13 +339,13 @@ func (d *TelemetryDispatcher) drain() bool {
 			}
 			if err := d.publish(record.Event, record.IsReplayed, sendAt); err != nil {
 				d.acceptanceMu.Lock()
-				d.setOnline(false)
 				if markErr := d.store.MarkFailed(record.ID, boundedError(err)); markErr != nil {
 					d.logErrorf("Failed to mark telemetry replay after publish failure: id=%d err=%v", record.ID, markErr)
 				}
 				if _, markErr := d.store.MarkAllReplayed(); markErr != nil {
 					d.logErrorf("Failed to mark pending telemetry as replayed after publish failure: %v", markErr)
 				}
+				d.setOnline(false)
 				d.acceptanceMu.Unlock()
 				d.logWarnf("Telemetry delivery paused: id=%d device=%s traceId=%s err=%v", record.ID, record.Event.DeviceName, record.Event.TraceID, err)
 				d.recordSendMetrics(sent, startedAt)

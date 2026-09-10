@@ -2,6 +2,7 @@ package mqtt
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	outevent "github.com/punk-one/edge-service-sdk/telemetry"
@@ -86,5 +87,42 @@ func TestCompactFormatIncludesReplayMetadata(t *testing.T) {
 	}
 	if got := int64(payload["send_at"].(float64)); got != sendAt {
 		t.Fatalf("send_at = %d, want %d", got, sendAt)
+	}
+}
+
+func TestTelemetryFormatsPreserveNumericJSONText(t *testing.T) {
+	event := outevent.TelemetryEvent{
+		TraceID:     "trace-numeric",
+		DeviceName:  "device-01",
+		CollectedAt: 1710000000000,
+		Values: map[string]outevent.TelemetryValue{
+			"temperature": {
+				Type: "Float32", Value: json.RawMessage("12.30"), Origin: 1710000000000,
+			},
+			"counter": {
+				Type: "Uint64", Value: json.RawMessage("18446744073709551615"), Origin: 1710000000000,
+			},
+		},
+	}
+	data, err := event.DataMap()
+	if err != nil {
+		t.Fatalf("DataMap() error = %v", err)
+	}
+
+	for _, format := range []string{"rule", "raw", "compact", "telemetry", "influx"} {
+		t.Run(format, func(t *testing.T) {
+			publisher := &MQTTPublisher{telemetry: TopicConfig{DataFormat: format}}
+			body, err := publisher.formatTelemetryAt(event, data, true, 1710000001234)
+			if err != nil {
+				t.Fatalf("formatTelemetryAt() error = %v", err)
+			}
+			payload := string(body)
+			if !strings.Contains(payload, "12.30") {
+				t.Fatalf("payload lost configured decimal text: %s", payload)
+			}
+			if !strings.Contains(payload, "18446744073709551615") {
+				t.Fatalf("payload lost uint64 precision: %s", payload)
+			}
+		})
 	}
 }

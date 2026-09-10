@@ -19,6 +19,22 @@ It extracts the common runtime, control, and transport capabilities out of proto
 - control job persistence, result history, diagnostics, export, and MQTT query handling
 - dependency checks, worker supervision, and shared logging contracts
 
+## JSON Configuration And Numeric Fidelity In v0.11.0
+
+- External JSON is the production configuration format. For the same logical
+  file, selection order is JSON, YAML, then YML. An invalid preferred JSON file
+  fails startup instead of falling back to stale YAML.
+- Main config, devices, profiles, EVENT profiles, and Process definitions share
+  the same selection behavior. Persistent configuration changes use atomic
+  replacement and retain the selected source format.
+- No configuration manifest is required, so an external daemon can replace JSON
+  files without coupling application startup to manifest generation.
+- Float32 and Float64 telemetry with configured positive `precision` is
+  canonicalized before the SQLite durability boundary. SQLite replay and every
+  MQTT telemetry format preserve that JSON number text.
+- JSON numbers are no longer generically restored as `float64`; declared
+  numeric types and Int64/Uint64 values are preserved across durable replay.
+
 ## Reliability Hardening In v0.10.0
 
 - MQTT delivery now has a second SQLite acceptance boundary with one durable
@@ -211,7 +227,7 @@ func main() {
     registry := cmdapi.NewRegistry()
     // registry.MustRegister(yourCommand)
 
-    app.Bootstrap("edge-service-yourproto", "v0.10.0", newDriver(), registry)
+    app.Bootstrap("edge-service-yourproto", "v0.11.0", newDriver(), registry)
 }
 ```
 
@@ -226,10 +242,24 @@ the original `ProtocolDriver` methods for compatibility.
 ## Integration Checklist
 
 1. Keep protocol-specific address parsing, connections, and driver calls in your service repository.
-2. Put shared runtime config into `configs/config.yaml`, `devices/*.yaml`, and `profiles/*.yaml`.
+2. Put shared runtime config into external JSON files: `configs/config.json`, `devices/*.json`, and `profiles/*.json`.
 3. Register command implementations through `command.Registry` when the service exposes callable commands.
 4. Route telemetry/property/status/command topics through the SDK MQTT publisher instead of re-implementing transport logic.
 5. Reuse the SDK HTTP endpoints and control store so HTTP, MQTT, async execution, and result queries stay aligned.
+
+## Configuration file formats
+
+The production format is external JSON. YAML remains backward compatible. For
+the same logical filename the SDK loads exactly one file using this precedence:
+`.json`, `.yaml`, then `.yml`. A selected but invalid JSON file fails startup;
+the SDK never silently falls back to stale YAML. Device profiles, device lists,
+EVENT profiles, and Process definitions use the same rule. Runtime persistent
+updates are written atomically back to the selected file in its original
+format.
+
+MQTT credentials come only from the selected main configuration; no alternate
+password source is consulted. Operations API results redact password, client
+key, and bootstrap token values.
 
 ## Optional embedded JetStream bus
 
@@ -264,31 +294,37 @@ not forced to `rule`. The SDK adds routing metadata only as NATS headers:
 
 Minimal optional configuration:
 
-```yaml
-natsBus:
-  enabled: true
-
-device:
-  profilesDir: "./configs/profiles"
-  devicesDir: "./configs/devices"
-  # Optional; defaults to ./configs/process.
-  processDir: "./configs/process"
+```json
+{
+  "natsBus": {
+    "enabled": true
+  },
+  "device": {
+    "profilesDir": "./configs/profiles",
+    "devicesDir": "./configs/devices",
+    "processDir": "./configs/process"
+  }
+}
 ```
 
 The default JetStream store is `./data/natsbus`. `maxAge`
 defaults to `72h` and `maxBytes` defaults to 1 GiB. The optional values can be
 overridden under `natsBus`.
 
-Processes are enabled per device in `configs/devices/*.yaml`:
+Processes are enabled per device in `configs/devices/*.json` (YAML is still
+accepted for compatibility):
 
-```yaml
-deviceList:
-  - name: device-01
-    profileName: profile-01
-    productCode: product-01
-    processNames:
-      - telemetry-alarm
-      - external-query
+```json
+{
+  "deviceList": [
+    {
+      "name": "device-01",
+      "profileName": "profile-01",
+      "productCode": "product-01",
+      "processNames": ["telemetry-alarm", "external-query"]
+    }
+  ]
+}
 ```
 
 Each distinct referenced Process is started once and receives all fixed SDK
@@ -316,14 +352,14 @@ application process API and lifecycle contract.
 - `ops/status`
   Device status tracking and runtime snapshots.
 - `event`
-  Protocol-independent event model, YAML validation, expression evaluation, connection/OEE/alarm state machines, payload selection, and summary windows.
+  Protocol-independent event model, JSON/YAML validation, expression evaluation, connection/OEE/alarm state machines, payload selection, and summary windows.
 - `runtime/event`
   EVENT runtime lifecycle, state-file persistence, event dispatch, and integration with the MQTT event publisher.
 - `bus` / `runtime/bus`
   Fixed message contracts plus the optional embedded JetStream server, mirror,
   durable consumers, and random-port lifecycle.
 - `process` / `runtime/process`
-  Application handler registry, YAML definitions, independent durable
+  Application handler registry, JSON/YAML definitions, independent durable
   consumers, self-loop prevention, timeout handling, and output publication.
 - `runtime/app`
   SDK bootstrap facade, runtime assembly, status publishing, and MQTT query wiring.
@@ -385,4 +421,4 @@ MQTT runtime capabilities include telemetry/property/status publishing, property
 
 ## Version
 
-This repository version is `v0.10.0`.
+This repository version is `v0.11.0`.

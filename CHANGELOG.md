@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.11.0 - 2026-09-10
+
+### Configuration
+
+- Added external JSON support for the main configuration, devices, profiles,
+  EVENT profiles, and Process definitions.
+- Defined deterministic sibling precedence: `.json`, then `.yaml`, then
+  `.yml`.
+- A selected but malformed higher-priority file now fails loading; the loader
+  does not silently fall back to a lower-priority file.
+- Persistent configuration operations retain the selected source format and use
+  atomic file replacement.
+- Removed any need for a configuration manifest. Configuration daemons can
+  replace individual JSON files independently.
+- MQTT credentials are read only from the selected main configuration.
+  Operations responses redact passwords, client keys, and bootstrap tokens.
+
+### Telemetry numeric fidelity
+
+- Configured positive point `precision` is enforced by the SDK before telemetry
+  is committed to the SQLite outbox.
+- Float32 and Float64 values are stored as canonical JSON numbers with the
+  configured decimal places, including trailing zeroes in the emitted payload.
+- SQLite `data_json` remains TEXT; no database schema migration is required.
+- Durable replay preserves JSON number text with `json.Number` instead of
+  converting every number to Float64.
+- Reconstructed command values restore the declared numeric Go type, preventing
+  Int64 and Uint64 corruption above the exact Float64 integer range.
+- Precision is accepted from 0 through 18. For compatibility, 0 means precision
+  formatting is disabled; positive values specify decimal places.
+
+### Upgrade notes
+
+1. Update the consuming service dependency to
+   `github.com/punk-one/edge-service-sdk v0.11.0`.
+2. JSON conversion is optional. Existing YAML/YML remains supported, but a JSON
+   sibling takes precedence when both exist.
+3. Do not generate or deploy `configs/config-manifest.json`; v0.11.0 does not
+   use it.
+4. Keep `configs/config.json` external to the executable and restrict file
+   permissions because it contains the MQTT password.
+5. No SQLite migration is needed. Existing pending outbox rows remain readable;
+   new rows use number-preserving serialization.
+
 ## v0.10.0 - 2026-08-30
 
 - Added a SQLite-first MQTT destination outbox. Telemetry, EVENT, property

@@ -3,8 +3,10 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	contracts "github.com/punk-one/edge-service-sdk/driver"
 	reliable "github.com/punk-one/edge-service-sdk/telemetry/reliable"
 	mqtt "github.com/punk-one/edge-service-sdk/transport/mqtt"
 )
@@ -168,6 +170,112 @@ func TestLoadConfigRejectsReliableQueue(t *testing.T) {
 	}
 }
 
+func TestLoadMainConfigPrefersJSON(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("service:\n  host: yaml-host\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "config.json"), []byte(`{"service":{"host":"json-host"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	config, err := loadMainConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Service.Host != "json-host" {
+		t.Fatalf("service.host = %q, want JSON value", config.Service.Host)
+	}
+}
+
+func TestLoadConfigWithSourceReturnsSelectedJSONPath(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.yaml")
+	jsonPath := filepath.Join(root, "config.json")
+	if err := os.WriteFile(configPath, []byte("service:\n  host: yaml-host\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(jsonPath, []byte(`{"service":{"host":"json-host"},"device":{"devicesDir":"`+filepath.ToSlash(filepath.Join(root, "missing-devices"))+`","profilesDir":"`+filepath.ToSlash(filepath.Join(root, "missing-profiles"))+`"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	config, source, err := LoadConfigWithSource(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source != jsonPath || config.Service.Host != "json-host" {
+		t.Fatalf("LoadConfigWithSource() source=%q host=%q", source, config.Service.Host)
+	}
+}
+
+func TestLoadMainConfigRejectsInvalidPreferredJSON(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("service:\n  host: yaml-host\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "config.json"), []byte(`{"service":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := loadMainConfig(configPath); err == nil || !strings.Contains(err.Error(), "invalid JSON syntax") {
+		t.Fatalf("loadMainConfig() error = %v; want invalid JSON syntax", err)
+	}
+}
+
+func TestDeviceAndProfileLoadersPreferJSON(t *testing.T) {
+	root := t.TempDir()
+	devicesDir := filepath.Join(root, "devices")
+	profilesDir := filepath.Join(root, "profiles")
+	if err := os.MkdirAll(devicesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(profilesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(devicesDir, "line.yaml"), []byte("deviceList:\n  - name: yaml-device\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(devicesDir, "line.json"), []byte(`{"deviceList":[{"name":"json-device","internalName":"json-device"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profilesDir, "base.yaml"), []byte("name: yaml-profile\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profilesDir, "base.json"), []byte(`{"name":"json-profile"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	devices, err := loadDeviceConfigs(devicesDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(devices) != 1 || devices[0].Name != "json-device" {
+		t.Fatalf("devices = %#v", devices)
+	}
+	profiles, err := loadDeviceProfiles(profilesDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(profiles) != 1 || profiles["json-profile"].Name != "json-profile" {
+		t.Fatalf("profiles = %#v", profiles)
+	}
+}
+
+func TestDeviceProfileLoaderRejectsDuplicateNames(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "first.json"), []byte(`{"name":"duplicate"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "second.yml"), []byte("name: duplicate\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadDeviceProfiles(dir); err == nil || !strings.Contains(err.Error(), "duplicate device profile") {
+		t.Fatalf("loadDeviceProfiles() error = %v; want duplicate error", err)
+	}
+}
+
 func TestValidateConfigRequiresIndependentTelemetryDatabase(t *testing.T) {
 	config := NormalizeConfig(Config{
 		Storage:         StorageConfig{SQLitePath: "./data/runtime.db"},
@@ -177,5 +285,33 @@ func TestValidateConfigRequiresIndependentTelemetryDatabase(t *testing.T) {
 	config.TelemetryOutbox.SQLitePath = config.Storage.SQLitePath
 	if err := ValidateConfig(config); err == nil {
 		t.Fatal("ValidateConfig() accepted shared runtime and telemetry database")
+	}
+}
+
+func TestValidateConfigRejectsDuplicateDeviceNames(t *testing.T) {
+	config := defaultConfig()
+	config.Devices = []contracts.DeviceConfig{
+		{Name: "duplicate", InternalName: "internal-1"},
+		{Name: "duplicate", InternalName: "internal-2"},
+	}
+	config = NormalizeConfig(config)
+	if err := ValidateConfig(config); err == nil || !strings.Contains(err.Error(), "device name") {
+		t.Fatalf("ValidateConfig() error = %v; want duplicate device name", err)
+	}
+}
+
+func TestValidateConfigRejectsExcessivePointPrecision(t *testing.T) {
+	config := defaultConfig()
+	config.Devices = []contracts.DeviceConfig{{
+		Name: "device-01",
+		Telemetry: contracts.TelemetryConfig{
+			Groups: []contracts.TelemetryGroup{{
+				Name:   "analog",
+				Points: []contracts.PointConfig{{Name: "temperature", Precision: 19}},
+			}},
+		},
+	}}
+	if err := ValidateConfig(config); err == nil || !strings.Contains(err.Error(), "precision") {
+		t.Fatalf("ValidateConfig() error = %v; want precision error", err)
 	}
 }

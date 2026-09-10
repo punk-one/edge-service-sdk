@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	outevent "github.com/punk-one/edge-service-sdk/telemetry"
 )
 
 // FieldType describes the expected type of a config field.
@@ -191,32 +193,50 @@ func ptr(f float64) *float64 { return &f }
 // resolveRule finds the best-matching validation rule for a scope+path combination.
 // Supports wildcards (*) in rule keys for dynamic names (groups, points, etc.).
 func resolveRule(rules map[string]FieldRule, scope, configPath string) (*FieldRule, bool) {
-	// Try exact match first
 	key := scope + "::" + configPath
 	if rule, ok := rules[key]; ok {
 		return &rule, true
 	}
 
-	// Try wildcard matches
 	parts := strings.Split(configPath, ".")
-	for i := range parts {
-		// Replace one segment at a time with * and try
-		pattern := make([]string, len(parts))
-		copy(pattern, parts)
-		pattern[i] = "*"
-		wildKey := scope + "::" + strings.Join(pattern, ".")
-		if rule, ok := rules[wildKey]; ok {
-			return &rule, true
+	prefix := scope + "::"
+	bestSpecificity := -1
+	bestKey := ""
+	var bestRule FieldRule
+	for candidate, rule := range rules {
+		if !strings.HasPrefix(candidate, prefix) {
+			continue
+		}
+		pattern := strings.Split(strings.TrimPrefix(candidate, prefix), ".")
+		if len(pattern) != len(parts) {
+			continue
+		}
+		specificity := 0
+		matches := true
+		for i := range parts {
+			if pattern[i] == "*" {
+				continue
+			}
+			if pattern[i] != parts[i] {
+				matches = false
+				break
+			}
+			specificity++
+		}
+		if matches && (specificity > bestSpecificity ||
+			(specificity == bestSpecificity && (bestKey == "" || candidate < bestKey))) {
+			bestSpecificity = specificity
+			bestKey = candidate
+			bestRule = rule
 		}
 	}
-
-	return nil, false
+	return &bestRule, bestSpecificity >= 0
 }
 
 // DefaultValidationRules returns the built-in validation rules for SDK services.
 func DefaultValidationRules() map[string]FieldRule {
 	return map[string]FieldRule{
-		// config.yaml
+		// main configuration
 		"config::statusReport.heartbeatInterval": {Type: TypeDuration},
 		"config::mqtt.url":                       {Type: TypeString, Pattern: `^(tcp|ssl|ws|wss)://.*:\d+$`},
 		"config::mqtt.qos":                       {Type: TypeInt, Enum: []interface{}{0, 1, 2}},
@@ -239,12 +259,24 @@ func DefaultValidationRules() map[string]FieldRule {
 		"device::profileName":              {Type: TypeString},
 		"device::productCode":              {Type: TypeString},
 		"device::description":              {Type: TypeString},
+		"device::telemetry.points.*.precision": {
+			Type: TypeInt, Min: ptr(0), Max: ptr(float64(outevent.MaxDecimalPrecision)),
+		},
+		"device::telemetry.groups.*.points.*.precision": {
+			Type: TypeInt, Min: ptr(0), Max: ptr(float64(outevent.MaxDecimalPrecision)),
+		},
 
 		// profile — telemetry
 		"profile::telemetry.interval":                   {Type: TypeDuration},
 		"profile::telemetry.groups.*.interval":          {Type: TypeDuration},
 		"profile::telemetry.groups.*.heartbeatInterval": {Type: TypeDuration},
 		"profile::telemetry.groups.*.onChange":          {Type: TypeBool},
+		"profile::telemetry.points.*.precision": {
+			Type: TypeInt, Min: ptr(0), Max: ptr(float64(outevent.MaxDecimalPrecision)),
+		},
+		"profile::telemetry.groups.*.points.*.precision": {
+			Type: TypeInt, Min: ptr(0), Max: ptr(float64(outevent.MaxDecimalPrecision)),
+		},
 
 		// profile — property
 		"profile::property.interval":           {Type: TypeDuration},
@@ -252,6 +284,8 @@ func DefaultValidationRules() map[string]FieldRule {
 		"profile::property.points.*.valueType": {Type: TypeString},
 		"profile::property.points.*.maxLength": {Type: TypeInt, Min: ptr(0)},
 		"profile::property.points.*.scale":     {Type: TypeString},
-		"profile::property.points.*.precision": {Type: TypeInt, Min: ptr(0)},
+		"profile::property.points.*.precision": {
+			Type: TypeInt, Min: ptr(0), Max: ptr(float64(outevent.MaxDecimalPrecision)),
+		},
 	}
 }

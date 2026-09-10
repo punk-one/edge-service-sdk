@@ -5,19 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	busapi "github.com/punk-one/edge-service-sdk/bus"
 	contracts "github.com/punk-one/edge-service-sdk/driver"
+	"github.com/punk-one/edge-service-sdk/internal/configfile"
 	logger "github.com/punk-one/edge-service-sdk/logging"
 	processapi "github.com/punk-one/edge-service-sdk/process"
 	runtimebus "github.com/punk-one/edge-service-sdk/runtime/bus"
-
-	"gopkg.in/yaml.v3"
 )
 
 const defaultConfigDir = "./configs/process"
@@ -77,7 +74,7 @@ func (r *Runner) Start() (int, error) {
 	for _, name := range names {
 		definition, ok := definitions[name]
 		if !ok {
-			startErrors = append(startErrors, fmt.Errorf("device-bound process %q has no YAML definition in %s", name, dir))
+			startErrors = append(startErrors, fmt.Errorf("device-bound process %q has no configuration definition in %s", name, dir))
 			continue
 		}
 		handlerName := strings.TrimSpace(definition.Handler)
@@ -262,30 +259,15 @@ func messageDeviceCode(message busapi.Message) string {
 }
 
 func loadDefinitions(dir string) (map[string]processapi.Definition, error) {
-	entries, err := os.ReadDir(dir)
+	paths, err := configfile.ListPreferred(dir)
 	if err != nil {
 		return nil, fmt.Errorf("read process config directory %s: %w", dir, err)
 	}
 	definitions := make(map[string]processapi.Definition)
-	paths := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		ext := strings.ToLower(filepath.Ext(entry.Name()))
-		if ext == ".yaml" || ext == ".yml" {
-			paths = append(paths, filepath.Join(dir, entry.Name()))
-		}
-	}
-	sort.Strings(paths)
 	for _, path := range paths {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil, err
-		}
 		var definition processapi.Definition
-		if err := yaml.Unmarshal(data, &definition); err != nil {
-			return nil, fmt.Errorf("parse process definition %s: %w", path, err)
+		if err := configfile.Read(path, &definition); err != nil {
+			return nil, err
 		}
 		definition.Name = strings.TrimSpace(definition.Name)
 		if definition.Name == "" {

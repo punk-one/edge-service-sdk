@@ -4,16 +4,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
 	contracts "github.com/punk-one/edge-service-sdk/driver"
+	"github.com/punk-one/edge-service-sdk/internal/configfile"
 	logger "github.com/punk-one/edge-service-sdk/logging"
+	outevent "github.com/punk-one/edge-service-sdk/telemetry"
 	reliable "github.com/punk-one/edge-service-sdk/telemetry/reliable"
 	mqtt "github.com/punk-one/edge-service-sdk/transport/mqtt"
-
-	"gopkg.in/yaml.v3"
 )
 
 const DefaultRuntimeDatabaseMaxBytes int64 = 2 << 30
@@ -90,11 +89,35 @@ type DeviceConfig struct {
 	EventDir    string `yaml:"eventDir"`
 }
 
-// LoadConfig loads configuration from YAML file.
+// ResolveConfigPath resolves a logical main configuration path using the SDK
+// precedence rule: JSON, then YAML, then YML.
+func ResolveConfigPath(configPath string) (string, bool, error) {
+	return configfile.ResolvePreferred(configPath)
+}
+
+// ConfigPermissionsTooOpen reports unsafe Unix group/other permissions.
+// Windows ACLs are not represented by os.FileMode and return false here.
+func ConfigPermissionsTooOpen(configPath string) (bool, error) {
+	return configfile.PermissionsTooOpen(configPath)
+}
+
+// LoadConfig loads the main, device, and profile configuration files.
 func LoadConfig(configPath string) (Config, error) {
-	config, err := loadMainConfig(configPath)
+	config, _, err := LoadConfigWithSource(configPath)
+	return config, err
+}
+
+// LoadConfigWithSource loads configuration and returns the exact selected main
+// configuration path. Selection and loading are kept in one operation so
+// callers cannot retain a stale lower-priority path.
+func LoadConfigWithSource(configPath string) (Config, string, error) {
+	resolvedPath, exists, err := configfile.ResolvePreferred(configPath)
 	if err != nil {
-		return config, err
+		return Config{}, "", err
+	}
+	config, err := loadMainConfigResolved(resolvedPath, exists)
+	if err != nil {
+		return config, resolvedPath, err
 	}
 
 	devicesDir := config.Device.DevicesDir
@@ -108,23 +131,31 @@ func LoadConfig(configPath string) (Config, error) {
 
 	profiles, err := loadDeviceProfiles(profilesDir)
 	if err != nil {
-		return config, err
+		return config, resolvedPath, err
 	}
 
 	devices, err := loadDeviceConfigs(devicesDir)
 	if err != nil {
-		return config, err
+		return config, resolvedPath, err
 	}
 	devices, err = applyProfiles(devices, profiles)
 	if err != nil {
-		return config, err
+		return config, resolvedPath, err
 	}
 	config.Devices = devices
-	return config, nil
+	return config, resolvedPath, nil
 }
 
 func loadMainConfig(configPath string) (Config, error) {
-	config := Config{
+	resolvedPath, exists, err := configfile.ResolvePreferred(configPath)
+	if err != nil {
+		return Config{}, err
+	}
+	return loadMainConfigResolved(resolvedPath, exists)
+}
+
+func defaultConfig() Config {
+	return Config{
 		Logging: logger.Config{
 			Level:  "info",
 			Format: "json",
@@ -229,24 +260,38 @@ func loadMainConfig(configPath string) (Config, error) {
 		},
 		LogLevel: "INFO",
 	}
+}
 
-	if _, err := os.Stat(configPath); err == nil {
-		data, err := os.ReadFile(configPath)
-		if err != nil {
-			return config, fmt.Errorf("failed to read config file: %v", err)
+func loadMainConfigResolved(configPath string, exists bool) (Config, error) {
+	if !exists {
+		config := NormalizeConfig(defaultConfig())
+		if err := ValidateConfig(config); err != nil {
+			return config, err
 		}
-		var raw map[string]interface{}
-		if err := yaml.Unmarshal(data, &raw); err != nil {
-			return config, fmt.Errorf("failed to parse config file: %v", err)
-		}
-		if _, exists := raw["reliableQueue"]; exists {
-			return config, fmt.Errorf("unsupported configuration %q; use %q", "reliableQueue", "telemetryOutbox")
-		}
-		if err := yaml.Unmarshal(data, &config); err != nil {
-			return config, fmt.Errorf("failed to parse config file: %v", err)
-		}
+		return config, nil
 	}
 
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return Config{}, fmt.Errorf("read configuration file %s: %w", configPath, err)
+	}
+	return DecodeMainConfig(configPath, data)
+}
+
+// DecodeMainConfig decodes and validates main configuration data using the
+// same defaults and removed-field checks as startup loading.
+func DecodeMainConfig(configPath string, data []byte) (Config, error) {
+	config := defaultConfig()
+	var raw map[string]interface{}
+	if err := configfile.Decode(configPath, data, &raw); err != nil {
+		return config, fmt.Errorf("parse configuration file %s: %w", configPath, err)
+	}
+	if _, exists := raw["reliableQueue"]; exists {
+		return config, fmt.Errorf("unsupported configuration %q; use %q", "reliableQueue", "telemetryOutbox")
+	}
+	if err := configfile.Decode(configPath, data, &config); err != nil {
+		return config, fmt.Errorf("parse configuration file %s: %w", configPath, err)
+	}
 	config = NormalizeConfig(config)
 	if err := ValidateConfig(config); err != nil {
 		return config, err
@@ -257,27 +302,20 @@ func loadMainConfig(configPath string) (Config, error) {
 func loadDeviceConfigs(devicesDir string) ([]contracts.DeviceConfig, error) {
 	var devices []contracts.DeviceConfig
 
-	if _, err := os.Stat(devicesDir); os.IsNotExist(err) {
+	files, err := configfile.ListPreferred(devicesDir)
+	if os.IsNotExist(err) {
 		return devices, nil
 	}
-
-	files, err := filepath.Glob(filepath.Join(devicesDir, "*.yaml"))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read device config directory %s: %w", devicesDir, err)
 	}
-	sort.Strings(files)
 
 	for _, file := range files {
-		data, err := os.ReadFile(file)
-		if err != nil {
-			return nil, err
-		}
-
 		var deviceFile struct {
 			DeviceList []contracts.DeviceConfig `yaml:"deviceList"`
 		}
-		if err := yaml.Unmarshal(data, &deviceFile); err != nil {
-			return nil, fmt.Errorf("failed to parse device file %s: %w", file, err)
+		if err := configfile.Read(file, &deviceFile); err != nil {
+			return nil, err
 		}
 
 		for _, device := range deviceFile.DeviceList {
@@ -291,28 +329,24 @@ func loadDeviceConfigs(devicesDir string) ([]contracts.DeviceConfig, error) {
 func loadDeviceProfiles(profilesDir string) (map[string]contracts.DeviceProfile, error) {
 	profiles := make(map[string]contracts.DeviceProfile)
 
-	if _, err := os.Stat(profilesDir); os.IsNotExist(err) {
+	files, err := configfile.ListPreferred(profilesDir)
+	if os.IsNotExist(err) {
 		return profiles, nil
 	}
-
-	files, err := filepath.Glob(filepath.Join(profilesDir, "*.yaml"))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read profile config directory %s: %w", profilesDir, err)
 	}
-	sort.Strings(files)
 
 	for _, file := range files {
-		data, err := os.ReadFile(file)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read profile file %s: %w", file, err)
-		}
-
 		var profile contracts.DeviceProfile
-		if err := yaml.Unmarshal(data, &profile); err != nil {
-			return nil, fmt.Errorf("failed to parse profile file %s: %w", file, err)
+		if err := configfile.Read(file, &profile); err != nil {
+			return nil, err
 		}
 		if strings.TrimSpace(profile.Name) == "" {
 			return nil, fmt.Errorf("profile file %s missing name", file)
+		}
+		if _, duplicate := profiles[profile.Name]; duplicate {
+			return nil, fmt.Errorf("duplicate device profile name %q", profile.Name)
 		}
 
 		profiles[profile.Name] = NormalizeProfile(profile)
@@ -501,19 +535,27 @@ func ValidateConfig(config Config) error {
 		}
 	}
 	deviceNames := make(map[string]struct{}, len(config.Devices))
+	deviceInternalNames := make(map[string]struct{}, len(config.Devices))
 	for i, rawDevice := range config.Devices {
 		device := NormalizeDeviceConfig(rawDevice)
 		if device.Name == "" {
 			return fmt.Errorf("deviceList[%d].name is required", i)
 		}
-		if _, exists := deviceNames[device.InternalName]; exists {
+		if _, exists := deviceNames[device.Name]; exists {
+			return fmt.Errorf("device name %q is duplicated", device.Name)
+		}
+		deviceNames[device.Name] = struct{}{}
+		if _, exists := deviceInternalNames[device.InternalName]; exists {
 			return fmt.Errorf("device internal name %q is duplicated", device.InternalName)
 		}
-		deviceNames[device.InternalName] = struct{}{}
+		deviceInternalNames[device.InternalName] = struct{}{}
 		if err := validatePositiveDuration("device "+device.InternalName+" telemetry.interval", device.Telemetry.Interval, true); err != nil {
 			return err
 		}
 		if err := validatePositiveDuration("device "+device.InternalName+" telemetry.heartbeatInterval", device.Telemetry.HeartbeatInterval, true); err != nil {
+			return err
+		}
+		if err := validatePointPrecisions("device "+device.InternalName+" telemetry", device.Telemetry.Points); err != nil {
 			return err
 		}
 		for _, group := range device.Telemetry.Groups {
@@ -523,11 +565,17 @@ func ValidateConfig(config Config) error {
 			if err := validatePositiveDuration("device "+device.InternalName+" telemetry group "+group.Name+" heartbeatInterval", group.HeartbeatInterval, true); err != nil {
 				return err
 			}
+			if err := validatePointPrecisions("device "+device.InternalName+" telemetry group "+group.Name, group.Points); err != nil {
+				return err
+			}
 		}
 		if err := validatePositiveDuration("device "+device.InternalName+" property.interval", device.Property.Interval, true); err != nil {
 			return err
 		}
 		if err := validatePositiveDuration("device "+device.InternalName+" property.heartbeatInterval", device.Property.HeartbeatInterval, true); err != nil {
+			return err
+		}
+		if err := validatePointPrecisions("device "+device.InternalName+" property", device.Property.Points); err != nil {
 			return err
 		}
 	}
@@ -544,6 +592,18 @@ func ValidateConfig(config Config) error {
 	}
 	if strings.EqualFold(runtimePath, outboxPath) {
 		return fmt.Errorf("telemetryOutbox.sqlitePath must use a database file separate from storage.sqlitePath")
+	}
+	return nil
+}
+
+func validatePointPrecisions(scope string, points []contracts.PointConfig) error {
+	for _, point := range points {
+		if point.Precision < 0 || point.Precision > outevent.MaxDecimalPrecision {
+			return fmt.Errorf(
+				"%s point %s precision must be between 0 and %d",
+				scope, point.Name, outevent.MaxDecimalPrecision,
+			)
+		}
 	}
 	return nil
 }
