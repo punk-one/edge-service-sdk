@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.12.0 - 2026-09-18
+
+### Telemetry outbox throughput
+
+- Added `telemetryOutbox.maxInFlight` (default `32`, maximum `256`) and
+  concurrent QoS acknowledgement windows while preserving MQTT submission
+  order.
+- Changed `sendBatchSize` to remain the SQLite read-page size; it no longer
+  implies serial per-row MQTT waits. Successful IDs are acknowledged in one
+  SQLite transaction per window.
+- Replaced the fixed per-message rate sleep with a token bucket, so database
+  work and broker round-trip time count toward `maxSendRatePerSec` instead of
+  reducing throughput below the configured cap.
+- Removed full-table malformed-JSON scans and startup/failure replay updates
+  from the hot path. Recovery state is now represented by an ID cutoff.
+- In single-broker mode, telemetry uses `telemetry_outbox` as its only new
+  persistence queue and is deleted only after the corresponding MQTT PUBACK.
+  Existing telemetry already present in `mqtt_destination_outbox` is drained
+  first and is never discarded during the transition. Multi-group MQTT keeps
+  per-destination durable rows.
+- Made telemetry append idempotent by `trace_id`, preserving safe retries at
+  the SQLite acceptance boundary.
+
+### Upgrade notes
+
+1. Stop the service cleanly before replacing the binary.
+2. Never delete, rename, recreate, or migrate an existing
+   `telemetry-outbox.db`. When copying a stopped deployment, keep its `-wal`
+   and `-shm` sidecars with the database if they exist.
+3. For no time-based deletion, set `retentionDays: 0`; this does not disable
+   `maxDatabaseBytes`, and a full database rejects new writes instead of
+   deleting unsent telemetry.
+4. Start with `sendBatchSize: 200`, `maxInFlight: 32`, and
+   `maxSendRatePerSec: 200`. Raise `maxInFlight` gradually only after checking
+   broker limits, CPU, memory, network RTT, and duplicate tolerance.
+5. Delivery remains at-least-once. Consumers must deduplicate by `trace_id`
+   because a crash after broker acceptance but before SQLite ACK can replay a
+   message.
+
 ## v0.11.0 - 2026-09-10
 
 ### Configuration

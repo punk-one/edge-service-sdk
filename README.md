@@ -143,8 +143,9 @@ so the SDK no longer exposes a process-memory telemetry channel.
 telemetryOutbox:
   sqlitePath: "./data/telemetry-outbox.db"
   retentionDays: 0        # 0 = never silently discard pending telemetry
-  sendBatchSize: 100
-  maxSendRatePerSec: 100
+  sendBatchSize: 200      # SQLite read page size
+  maxInFlight: 32         # concurrent MQTT QoS acknowledgements, max 256
+  maxSendRatePerSec: 200  # 0 = unlimited
   retryInitialMs: 1000
   retryMaxMs: 30000
   maxDatabaseBytes: 2147483648
@@ -154,7 +155,9 @@ telemetryReport:
   qos: 1
 ```
 
-The outbox database must be different from `storage.sqlitePath`. Dynamic
+The outbox database must be different from `storage.sqlitePath`. Never delete
+or replace an existing outbox during an upgrade; pending rows are upgraded in
+place. Dynamic
 telemetry points are stored in a JSON column, so each report may have a
 different `data` shape. Pending rows are selected by `time, id`; after startup
 or network recovery, an ID cutoff keeps the recovery backlog ahead of records

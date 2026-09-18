@@ -11,6 +11,7 @@ import (
 	events "github.com/punk-one/edge-service-sdk/event"
 	logger "github.com/punk-one/edge-service-sdk/logging"
 	outevent "github.com/punk-one/edge-service-sdk/telemetry"
+	reliable "github.com/punk-one/edge-service-sdk/telemetry/reliable"
 )
 
 // NewMQTTPublisher creates a new MQTT publisher.
@@ -63,17 +64,25 @@ func (p *MQTTPublisher) PublishTelemetryEvent(event outevent.TelemetryEvent, rep
 // PublishTelemetryEventAt publishes telemetry with an outbox-selected send_at
 // so the persisted attempt metadata and public MQTT envelope match exactly.
 func (p *MQTTPublisher) PublishTelemetryEventAt(event outevent.TelemetryEvent, replayed bool, sendAt int64) error {
-	data, err := event.DataMap()
+	message, err := p.telemetryMessageAt(event, replayed, sendAt)
 	if err != nil {
 		return err
+	}
+	return p.publishRaw(message)
+}
+
+func (p *MQTTPublisher) telemetryMessageAt(event outevent.TelemetryEvent, replayed bool, sendAt int64) (mqttMessage, error) {
+	data, err := event.DataMap()
+	if err != nil {
+		return mqttMessage{}, err
 	}
 
 	body, err := p.formatTelemetryAt(event, data, replayed, sendAt)
 	if err != nil {
-		return err
+		return mqttMessage{}, err
 	}
 
-	return p.publishRaw(mqttMessage{
+	return mqttMessage{
 		Type:        busapi.TelemetryReport,
 		Topic:       resolveTopic(p.telemetry.Topic, event.ProductCode),
 		QoS:         byte(resolveQoS(p.telemetry.QoS, p.client.config.QoS)),
@@ -83,7 +92,41 @@ func (p *MQTTPublisher) PublishTelemetryEventAt(event outevent.TelemetryEvent, r
 		ProductCode: event.ProductCode,
 		TraceID:     event.TraceID,
 		DataFormat:  p.telemetry.DataFormat,
-	})
+	}, nil
+}
+
+// PublishTelemetryBatchAt submits the whole window before waiting for QoS
+// acknowledgements. Results preserve the input order and are only nil after
+// the corresponding MQTT token has completed successfully.
+func (p *MQTTPublisher) PublishTelemetryBatchAt(items []reliable.TelemetryPublishRequest) []error {
+	results := make([]error, len(items))
+	messages := make([]mqttMessage, 0, len(items))
+	indexes := make([]int, 0, len(items))
+	for i, item := range items {
+		message, err := p.telemetryMessageAt(item.Event, item.Replayed, item.SendAt)
+		if err != nil {
+			results[i] = err
+			continue
+		}
+		messages = append(messages, message)
+		indexes = append(indexes, i)
+	}
+	publishResults := p.client.publishMessages(messages)
+	for i, message := range messages {
+		resultIndex := indexes[i]
+		if i < len(publishResults) {
+			results[resultIndex] = publishResults[i]
+		} else {
+			results[resultIndex] = fmt.Errorf("mqtt batch result missing")
+		}
+		p.observe(Observation{
+			Direction: DirectionOutbound, Type: message.Type, Topic: message.Topic,
+			QoS: message.QoS, Retain: message.Retain, Payload: append([]byte(nil), message.Payload...),
+			DataFormat: message.DataFormat, DeviceName: message.DeviceName,
+			ProductCode: message.ProductCode, TraceID: message.TraceID, Identifier: message.Identifier,
+		})
+	}
+	return results
 }
 
 func (p *MQTTPublisher) PublishCommandValues(device contracts.DeviceConfig, values []*contracts.CommandValue) error {

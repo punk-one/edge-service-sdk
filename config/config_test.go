@@ -68,6 +68,7 @@ telemetryOutbox:
   sqlitePath: "./data/telemetry-outbox.db"
   retentionDays: 7
   sendBatchSize: 100
+  maxInFlight: 32
   maxSendRatePerSec: 100
   retryInitialMs: 1000
   retryMaxMs: 30000

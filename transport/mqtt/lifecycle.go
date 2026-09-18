@@ -348,33 +348,82 @@ func (c *mqttClient) subscribeWithClient(client paho.Client, topic string, qos b
 }
 
 func (c *mqttClient) publishMessage(message mqttMessage) error {
-	if message.Topic == "" {
+	results := c.publishMessages([]mqttMessage{message})
+	if len(results) == 0 {
 		return nil
+	}
+	return results[0]
+}
+
+// publishMessages submits every message before waiting for its QoS token.
+// This keeps MQTT submission order while allowing the client to have several
+// QoS 1 packets in flight instead of paying one network round trip per row.
+func (c *mqttClient) publishMessages(messages []mqttMessage) []error {
+	results := make([]error, len(messages))
+	if len(messages) == 0 {
+		return results
 	}
 
 	client := c.currentClient()
 	if !mqttClientReady(client) {
 		err := fmt.Errorf("mqtt client not connected")
+		for i, message := range messages {
+			if message.Topic != "" {
+				results[i] = err
+			}
+		}
 		c.markUnhealthy(err.Error())
 		c.resetClient(client)
 		c.startReconnect("publish_not_ready", err)
-		return err
+		return results
 	}
 
-	token := client.Publish(message.Topic, message.QoS, message.Retain, message.Payload)
-	if err := waitToken(token, c.config.publishTimeout(), "publish"); err != nil {
-		c.markUnhealthy("publish failed")
-		c.logger.Warnf("Failed to publish MQTT topic %s: %v", message.Topic, err)
-		// Token timeout on a half-open socket must force a new TCP/MQTT session;
-		// IsConnected alone is not a sufficient health signal.
-		c.resetClient(client)
-		client.Disconnect(0)
-		c.startReconnect("publish_failure", err)
-		return err
+	type pendingPublish struct {
+		index int
+		token paho.Token
+	}
+	pending := make([]pendingPublish, 0, len(messages))
+	for i, message := range messages {
+		if message.Topic == "" {
+			continue
+		}
+		pending = append(pending, pendingPublish{
+			index: i,
+			token: client.Publish(message.Topic, message.QoS, message.Retain, message.Payload),
+		})
 	}
 
-	c.markHealthy("publish path ready")
-	return nil
+	deadline := time.Now().Add(c.config.publishTimeout())
+	var firstFailure error
+	for _, item := range pending {
+		remaining := time.Until(deadline)
+		var err error
+		if remaining <= 0 || !item.token.WaitTimeout(remaining) {
+			err = fmt.Errorf("mqtt publish timeout after %s", c.config.publishTimeout())
+		} else if tokenErr := item.token.Error(); tokenErr != nil {
+			err = fmt.Errorf("mqtt publish: %w", tokenErr)
+		}
+		results[item.index] = err
+		if err != nil {
+			if firstFailure == nil {
+				firstFailure = err
+			}
+			c.logger.Warnf("Failed to publish MQTT topic %s: %v", messages[item.index].Topic, err)
+		}
+	}
+
+	if firstFailure == nil {
+		c.markHealthy("publish path ready")
+		return results
+	}
+
+	c.markUnhealthy("publish failed")
+	// A timeout on a half-open socket must force a new TCP/MQTT session;
+	// IsConnected alone is not a sufficient health signal.
+	c.resetClient(client)
+	client.Disconnect(0)
+	c.startReconnect("publish_failure", firstFailure)
+	return results
 }
 
 // Publish sends raw bytes to the specified MQTT topic.

@@ -1,20 +1,24 @@
 package mqtt
 
 import (
+	"encoding/json"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
 
 	contracts "github.com/punk-one/edge-service-sdk/driver"
 	outevent "github.com/punk-one/edge-service-sdk/telemetry"
+	reliable "github.com/punk-one/edge-service-sdk/telemetry/reliable"
 )
 
 type durableTargetStub struct {
 	mu                  sync.Mutex
 	failPropertyReports bool
 	propertyReports     int
+	telemetry           []string
 }
 
 func (s *durableTargetStub) PublishTelemetry(contracts.DeviceConfig, map[string]interface{}) error {
@@ -23,11 +27,21 @@ func (s *durableTargetStub) PublishTelemetry(contracts.DeviceConfig, map[string]
 func (s *durableTargetStub) PublishCommandValues(contracts.DeviceConfig, []*contracts.CommandValue) error {
 	return nil
 }
-func (s *durableTargetStub) PublishTelemetryEvent(outevent.TelemetryEvent, bool) error {
+func (s *durableTargetStub) PublishTelemetryEvent(event outevent.TelemetryEvent, replayed bool) error {
+	return s.PublishTelemetryEventAt(event, replayed, time.Now().UnixMilli())
+}
+func (s *durableTargetStub) PublishTelemetryEventAt(event outevent.TelemetryEvent, _ bool, _ int64) error {
+	s.mu.Lock()
+	s.telemetry = append(s.telemetry, event.TraceID)
+	s.mu.Unlock()
 	return nil
 }
-func (s *durableTargetStub) PublishTelemetryEventAt(outevent.TelemetryEvent, bool, int64) error {
-	return nil
+func (s *durableTargetStub) PublishTelemetryBatchAt(items []reliable.TelemetryPublishRequest) []error {
+	results := make([]error, len(items))
+	for i, item := range items {
+		results[i] = s.PublishTelemetryEventAt(item.Event, item.Replayed, item.SendAt)
+	}
+	return results
 }
 func (s *durableTargetStub) PublishPropertyResult(contracts.DeviceConfig, map[string]interface{}) error {
 	return nil
@@ -60,6 +74,11 @@ func (s *durableTargetStub) setFailure(value bool) {
 	s.mu.Lock()
 	s.failPropertyReports = value
 	s.mu.Unlock()
+}
+func (s *durableTargetStub) telemetrySnapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.telemetry...)
 }
 
 type durableMultiStub struct {
@@ -187,6 +206,57 @@ func TestDurableSinglePublisherDoesNotAdvertiseMultiGroup(t *testing.T) {
 	}
 }
 
+func TestDurableSinglePublisherDrainsLegacyTelemetryBeforeDirectBatch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "outbox.db")
+	store, err := newDurablePublisherStore(path, 64<<20)
+	if err != nil {
+		t.Fatalf("newDurablePublisherStore() error = %v", err)
+	}
+	legacy := testDurableTelemetryEvent("legacy")
+	payload, err := json.Marshal(durableEnvelope{Telemetry: &legacy})
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if err := store.append([]string{durableDefaultDestination}, durableKindTelemetryEvent, durableKey(durableKindTelemetryEvent, legacy.TraceID, payload), payload, true); err != nil {
+		t.Fatalf("append legacy telemetry error = %v", err)
+	}
+	if err := store.close(); err != nil {
+		t.Fatalf("store.close() error = %v", err)
+	}
+
+	target := &durableTargetStub{}
+	publisher, err := NewDurablePublisher(target, DurablePublisherConfig{
+		SQLitePath:       path,
+		MaxDatabaseBytes: 64 << 20,
+		RetryInitial:     10 * time.Millisecond,
+		RetryMax:         20 * time.Millisecond,
+	}, nil)
+	if err != nil {
+		t.Fatalf("NewDurablePublisher() error = %v", err)
+	}
+	defer publisher.Close()
+
+	batch, ok := publisher.(reliable.BatchTelemetryTransport)
+	if !ok {
+		t.Fatal("durable publisher does not expose batch telemetry transport")
+	}
+	items := []reliable.TelemetryPublishRequest{
+		{Event: testDurableTelemetryEvent("new-1"), SendAt: time.Now().UnixMilli()},
+		{Event: testDurableTelemetryEvent("new-2"), SendAt: time.Now().UnixMilli()},
+	}
+	for i, result := range batch.PublishTelemetryBatchAt(items) {
+		if result != nil {
+			t.Fatalf("batch result %d = %v", i, result)
+		}
+	}
+	if got := target.telemetrySnapshot(); !reflect.DeepEqual(got, []string{"legacy", "new-1", "new-2"}) {
+		t.Fatalf("telemetry delivery order = %#v", got)
+	}
+	if count := pendingDurableRows(t, unwrapDurablePublisher(t, publisher)); count != 0 {
+		t.Fatalf("pending durable telemetry rows = %d, want 0", count)
+	}
+}
+
 func TestDurablePublisherRejectsRemovedPendingDestination(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "outbox.db")
 	failing := &durableTargetStub{failPropertyReports: true}
@@ -258,4 +328,11 @@ func waitForDurable(t *testing.T, ready func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("timed out waiting for durable MQTT delivery")
+}
+
+func testDurableTelemetryEvent(traceID string) outevent.TelemetryEvent {
+	return outevent.TelemetryEvent{
+		TraceID: traceID, DeviceName: "D1", ProductCode: "P1", SourceName: "telemetry", CollectedAt: 1,
+		Values: map[string]outevent.TelemetryValue{},
+	}
 }

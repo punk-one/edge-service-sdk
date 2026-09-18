@@ -2,7 +2,9 @@ package reliable
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -18,13 +20,31 @@ type telemetryDelivery struct {
 }
 
 type telemetryTransportStub struct {
-	mu       sync.Mutex
-	healthy  bool
-	failing  bool
-	received []telemetryDelivery
-	hooks    []func()
-	started  chan struct{}
-	block    chan struct{}
+	mu         sync.Mutex
+	healthy    bool
+	failing    bool
+	received   []telemetryDelivery
+	batchSizes []int
+	hooks      []func()
+	started    chan struct{}
+	block      chan struct{}
+}
+
+func (s *telemetryTransportStub) PublishTelemetryBatchAt(items []TelemetryPublishRequest) []error {
+	s.mu.Lock()
+	s.batchSizes = append(s.batchSizes, len(items))
+	s.mu.Unlock()
+	results := make([]error, len(items))
+	for i, item := range items {
+		results[i] = s.PublishTelemetryEventAt(item.Event, item.Replayed, item.SendAt)
+	}
+	return results
+}
+
+func (s *telemetryTransportStub) batchSnapshot() []int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]int(nil), s.batchSizes...)
 }
 
 func (s *telemetryTransportStub) PublishTelemetryEvent(event outevent.TelemetryEvent, replayed bool) error {
@@ -144,6 +164,9 @@ func TestValidateTelemetryOutboxConfigRejectsNegativeValues(t *testing.T) {
 	}{
 		{name: "retention", mutate: func(cfg *TelemetryOutboxConfig) { cfg.RetentionDays = -1 }},
 		{name: "batch", mutate: func(cfg *TelemetryOutboxConfig) { cfg.SendBatchSize = -1 }},
+		{name: "in flight", mutate: func(cfg *TelemetryOutboxConfig) { cfg.MaxInFlight = -1 }},
+		{name: "in flight over batch", mutate: func(cfg *TelemetryOutboxConfig) { cfg.MaxInFlight = cfg.SendBatchSize + 1 }},
+		{name: "in flight over limit", mutate: func(cfg *TelemetryOutboxConfig) { cfg.MaxInFlight = 257; cfg.SendBatchSize = 257 }},
 		{name: "rate", mutate: func(cfg *TelemetryOutboxConfig) { cfg.MaxSendRatePerSec = -1 }},
 		{name: "retry initial", mutate: func(cfg *TelemetryOutboxConfig) { cfg.RetryInitialMs = -1 }},
 		{name: "retry max", mutate: func(cfg *TelemetryOutboxConfig) { cfg.RetryMaxMs = cfg.RetryInitialMs - 1 }},
@@ -186,6 +209,37 @@ func TestTelemetryDispatcherDrainsOfflineDataInTimeOrder(t *testing.T) {
 		if !delivery.replayed || delivery.sendAt <= delivery.event.CollectedAt {
 			t.Fatalf("offline replay fields are invalid: %#v", delivery)
 		}
+	}
+}
+
+func TestTelemetryDispatcherHonorsConfiguredMaxInFlight(t *testing.T) {
+	transport := &telemetryTransportStub{}
+	dispatcher, err := NewTelemetryDispatcher(TelemetryOutboxConfig{
+		SQLitePath:        filepath.Join(t.TempDir(), "telemetry-outbox.db"),
+		SendBatchSize:     5,
+		MaxInFlight:       2,
+		MaxSendRatePerSec: 0,
+		RetryInitialMs:    10,
+		RetryMaxMs:        20,
+		MaxDatabaseBytes:  64 << 20,
+	}, transport, nil)
+	if err != nil {
+		t.Fatalf("NewTelemetryDispatcher() error = %v", err)
+	}
+	defer dispatcher.Close()
+
+	for i := 0; i < 5; i++ {
+		if err := dispatcher.PublishAsyncValues(testDevice(), testAsync(fmt.Sprintf("trace-%d", i), int64(1_000+i), i)); err != nil {
+			t.Fatalf("PublishAsyncValues(%d) error = %v", i, err)
+		}
+	}
+	transport.setOnline(true)
+	waitUntil(t, 2*time.Second, func() bool {
+		stats, statsErr := dispatcher.Stats()
+		return statsErr == nil && stats.PendingCount == 0
+	})
+	if got := transport.batchSnapshot(); !reflect.DeepEqual(got, []int{2, 2, 1}) {
+		t.Fatalf("batch windows = %#v, want [2 2 1]", got)
 	}
 }
 
@@ -235,7 +289,7 @@ func TestTelemetryDispatcherMarksStartupRowsReplayedAndKeepsNewRowsRealtime(t *t
 	}
 }
 
-func TestTelemetryDispatcherMarksEntirePendingSetReplayedOnPublishFailure(t *testing.T) {
+func TestTelemetryDispatcherReplaysEntirePendingSetAfterPublishFailure(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "telemetry-outbox.db")
 	transport := &telemetryTransportStub{
 		healthy: true,
@@ -267,12 +321,12 @@ func TestTelemetryDispatcherMarksEntirePendingSetReplayedOnPublishFailure(t *tes
 	close(transport.block)
 	waitUntil(t, time.Second, func() bool { return !dispatcher.isOnline() })
 
-	records, err := dispatcher.store.FetchPending(10, 0)
-	if err != nil {
-		t.Fatalf("FetchPending() error = %v", err)
-	}
-	if len(records) != 2 || !records[0].IsReplayed || !records[1].IsReplayed {
-		t.Fatalf("publish failure did not mark the pending set replayed: %#v", records)
+	transport.setOnline(true)
+	waitUntil(t, 2*time.Second, func() bool { return len(transport.snapshot()) == 2 })
+	for _, delivery := range transport.snapshot() {
+		if !delivery.replayed {
+			t.Fatalf("publish failure did not replay the entire pending set: %#v", transport.snapshot())
+		}
 	}
 }
 

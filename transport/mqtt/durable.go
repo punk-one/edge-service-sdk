@@ -17,6 +17,7 @@ import (
 	"github.com/punk-one/edge-service-sdk/internal/sqliteutil"
 	logger "github.com/punk-one/edge-service-sdk/logging"
 	outevent "github.com/punk-one/edge-service-sdk/telemetry"
+	reliable "github.com/punk-one/edge-service-sdk/telemetry/reliable"
 
 	_ "modernc.org/sqlite"
 )
@@ -79,13 +80,16 @@ type durablePublisherStore struct {
 // acceptance boundary in front of network I/O. This also makes property
 // reports durable in single-broker deployments.
 type durablePublisher struct {
-	base         Publisher
-	logger       logger.LoggingClient
-	store        *durablePublisherStore
-	targets      map[string]Publisher
-	destinations []string
-	retryInitial time.Duration
-	retryMax     time.Duration
+	base                Publisher
+	logger              logger.LoggingClient
+	store               *durablePublisherStore
+	targets             map[string]Publisher
+	destinations        []string
+	retryInitial        time.Duration
+	retryMax            time.Duration
+	directTelemetry     bool
+	legacyTelemetryDone chan struct{}
+	legacyTelemetryOnce sync.Once
 
 	stopCh    chan struct{}
 	wake      map[string]chan struct{}
@@ -139,16 +143,28 @@ func NewDurablePublisher(base Publisher, cfg DurablePublisherConfig, logClient l
 		_ = store.close()
 		return nil, err
 	}
+	_, isMulti := base.(MultiGroupPublisher)
+	directTelemetry := !isMulti
+	legacyTelemetryPending, err := store.telemetryPendingCount()
+	if err != nil {
+		_ = store.close()
+		return nil, fmt.Errorf("count legacy durable telemetry: %w", err)
+	}
 	d := &durablePublisher{
-		base:         base,
-		logger:       logClient,
-		store:        store,
-		targets:      targets,
-		destinations: destinations,
-		retryInitial: cfg.RetryInitial,
-		retryMax:     cfg.RetryMax,
-		stopCh:       make(chan struct{}),
-		wake:         make(map[string]chan struct{}, len(destinations)),
+		base:                base,
+		logger:              logClient,
+		store:               store,
+		targets:             targets,
+		destinations:        destinations,
+		retryInitial:        cfg.RetryInitial,
+		retryMax:            cfg.RetryMax,
+		directTelemetry:     directTelemetry,
+		legacyTelemetryDone: make(chan struct{}),
+		stopCh:              make(chan struct{}),
+		wake:                make(map[string]chan struct{}, len(destinations)),
+	}
+	if !directTelemetry || legacyTelemetryPending == 0 {
+		d.legacyTelemetryOnce.Do(func() { close(d.legacyTelemetryDone) })
 	}
 	for _, destination := range destinations {
 		d.wake[destination] = make(chan struct{}, 1)
@@ -295,6 +311,13 @@ func (s *durablePublisherStore) validateDestinations(configured []string) error 
 		}
 	}
 	return rows.Err()
+}
+
+func (s *durablePublisherStore) telemetryPendingCount() (int64, error) {
+	var count int64
+	err := s.db.QueryRow(`SELECT COUNT(1) FROM mqtt_destination_outbox
+		WHERE kind IN (?, ?)`, durableKindTelemetry, durableKindTelemetryEvent).Scan(&count)
+	return count, err
 }
 
 func (s *durablePublisherStore) next(destination string) (durableRecord, bool, error) {
@@ -455,6 +478,7 @@ func (d *durablePublisher) runDestination(destination string) {
 			continue
 		}
 		if !found {
+			d.refreshLegacyTelemetryGate()
 			delay = d.retryInitial
 			if !d.wait(destination, 0) {
 				return
@@ -487,7 +511,36 @@ func (d *durablePublisher) runDestination(destination string) {
 			delay = nextDurableDelay(delay, d.retryMax)
 			continue
 		}
+		if record.Kind == durableKindTelemetry || record.Kind == durableKindTelemetryEvent {
+			d.refreshLegacyTelemetryGate()
+		}
 		delay = d.retryInitial
+	}
+}
+
+func (d *durablePublisher) refreshLegacyTelemetryGate() {
+	if !d.directTelemetry {
+		return
+	}
+	count, err := d.store.telemetryPendingCount()
+	if err != nil {
+		d.logError("count legacy telemetry", durableDefaultDestination, 0, err)
+		return
+	}
+	if count == 0 {
+		d.legacyTelemetryOnce.Do(func() { close(d.legacyTelemetryDone) })
+	}
+}
+
+func (d *durablePublisher) waitForLegacyTelemetry() error {
+	if !d.directTelemetry {
+		return nil
+	}
+	select {
+	case <-d.legacyTelemetryDone:
+		return nil
+	case <-d.stopCh:
+		return fmt.Errorf("durable mqtt publisher is closed")
 	}
 }
 
@@ -580,6 +633,12 @@ func nextDurableDelay(current, maximum time.Duration) time.Duration {
 }
 
 func (d *durablePublisher) PublishTelemetry(device contracts.DeviceConfig, payload map[string]interface{}) error {
+	if d.directTelemetry {
+		if err := d.waitForLegacyTelemetry(); err != nil {
+			return err
+		}
+		return d.base.PublishTelemetry(device, payload)
+	}
 	return d.enqueue(durableKindTelemetry, "", durableEnvelope{Device: device, Payload: payload}, false)
 }
 
@@ -591,8 +650,46 @@ func (d *durablePublisher) PublishTelemetryEvent(event outevent.TelemetryEvent, 
 	return d.PublishTelemetryEventAt(event, replayed, time.Now().UnixMilli())
 }
 
-func (d *durablePublisher) PublishTelemetryEventAt(event outevent.TelemetryEvent, replayed bool, _ int64) error {
+func (d *durablePublisher) PublishTelemetryEventAt(event outevent.TelemetryEvent, replayed bool, sendAt int64) error {
+	if d.directTelemetry {
+		if err := d.waitForLegacyTelemetry(); err != nil {
+			return err
+		}
+		transport, ok := d.base.(interface {
+			PublishTelemetryEventAt(outevent.TelemetryEvent, bool, int64) error
+		})
+		if !ok {
+			return fmt.Errorf("MQTT publisher does not support persisted telemetry send_at")
+		}
+		return transport.PublishTelemetryEventAt(event, replayed, sendAt)
+	}
 	return d.enqueue(durableKindTelemetryEvent, event.TraceID, durableEnvelope{Telemetry: &event}, replayed)
+}
+
+// PublishTelemetryBatchAt keeps the destination-aware queue for multi-broker
+// deployments. A single broker can use the telemetry outbox as the only
+// durability boundary and acknowledge a whole in-flight MQTT window directly.
+func (d *durablePublisher) PublishTelemetryBatchAt(items []reliable.TelemetryPublishRequest) []error {
+	results := make([]error, len(items))
+	if d.directTelemetry {
+		if err := d.waitForLegacyTelemetry(); err != nil {
+			for i := range results {
+				results[i] = err
+			}
+			return results
+		}
+		if transport, ok := d.base.(reliable.BatchTelemetryTransport); ok {
+			return transport.PublishTelemetryBatchAt(items)
+		}
+		for i, item := range items {
+			results[i] = d.PublishTelemetryEventAt(item.Event, item.Replayed, item.SendAt)
+		}
+		return results
+	}
+	for i, item := range items {
+		results[i] = d.PublishTelemetryEventAt(item.Event, item.Replayed, item.SendAt)
+	}
+	return results
 }
 
 func (d *durablePublisher) PublishPropertyResult(device contracts.DeviceConfig, payload map[string]interface{}) error {
@@ -732,4 +829,5 @@ var (
 	_ interface {
 		PublishTelemetryEventAt(outevent.TelemetryEvent, bool, int64) error
 	} = (*durablePublisher)(nil)
+	_ reliable.BatchTelemetryTransport = (*durablePublisher)(nil)
 )

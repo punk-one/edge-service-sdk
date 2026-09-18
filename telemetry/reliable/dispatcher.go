@@ -20,6 +20,7 @@ func DefaultTelemetryOutboxConfig() TelemetryOutboxConfig {
 		SQLitePath:        "./data/telemetry-outbox.db",
 		RetentionDays:     0,
 		SendBatchSize:     100,
+		MaxInFlight:       32,
 		MaxSendRatePerSec: 100,
 		RetryInitialMs:    1_000,
 		RetryMaxMs:        30_000,
@@ -36,6 +37,12 @@ func NormalizeTelemetryOutboxConfig(cfg TelemetryOutboxConfig) TelemetryOutboxCo
 	}
 	if cfg.SendBatchSize == 0 {
 		cfg.SendBatchSize = defaults.SendBatchSize
+	}
+	if cfg.MaxInFlight == 0 {
+		cfg.MaxInFlight = defaults.MaxInFlight
+		if cfg.MaxInFlight > cfg.SendBatchSize {
+			cfg.MaxInFlight = cfg.SendBatchSize
+		}
 	}
 	if cfg.RetryInitialMs == 0 {
 		cfg.RetryInitialMs = defaults.RetryInitialMs
@@ -57,6 +64,15 @@ func ValidateTelemetryOutboxConfig(cfg TelemetryOutboxConfig) error {
 	}
 	if cfg.SendBatchSize <= 0 {
 		return fmt.Errorf("telemetryOutbox.sendBatchSize must be > 0")
+	}
+	if cfg.MaxInFlight <= 0 {
+		return fmt.Errorf("telemetryOutbox.maxInFlight must be > 0")
+	}
+	if cfg.MaxInFlight > 256 {
+		return fmt.Errorf("telemetryOutbox.maxInFlight must be <= 256")
+	}
+	if cfg.MaxInFlight > cfg.SendBatchSize {
+		return fmt.Errorf("telemetryOutbox.maxInFlight must be <= telemetryOutbox.sendBatchSize")
 	}
 	if cfg.MaxSendRatePerSec < 0 {
 		return fmt.Errorf("telemetryOutbox.maxSendRatePerSec must be >= 0")
@@ -104,21 +120,22 @@ func NewTelemetryDispatcher(cfg TelemetryOutboxConfig, transport TelemetryTransp
 	}
 	dispatcher.purgeExpired()
 
-	// Any row surviving process startup is recovery delivery, regardless of
-	// whether the previous process attempted it before exiting.
-	marked, err := store.MarkAllReplayed()
-	if err != nil {
-		_ = store.Close()
-		return nil, fmt.Errorf("mark startup telemetry as replayed: %w", err)
-	}
+	// Any row surviving process startup is recovery delivery. Keep a cutoff
+	// instead of rewriting the entire outbox, which is prohibitively expensive
+	// when a gateway starts with hundreds of thousands of pending rows.
 	cutoff, err := store.MaxID()
 	if err != nil {
 		_ = store.Close()
 		return nil, fmt.Errorf("read startup telemetry cutoff: %w", err)
 	}
 	dispatcher.recoveryCutoff = cutoff
-	if marked > 0 && logClient != nil {
-		logClient.Infof("Telemetry outbox startup recovery: pending=%d cutoffId=%d", marked, cutoff)
+	if cutoff > 0 && logClient != nil {
+		stats, statsErr := store.Stats()
+		if statsErr == nil {
+			logClient.Infof("Telemetry outbox startup recovery: pending=%d cutoffId=%d", stats.PendingCount, cutoff)
+		} else {
+			logClient.Infof("Telemetry outbox startup recovery: cutoffId=%d", cutoff)
+		}
 	}
 
 	if registrar, ok := transport.(connectRegistrar); ok {
@@ -326,45 +343,76 @@ func (d *TelemetryDispatcher) drain() bool {
 				d.clearRecoveryCutoff(cutoff)
 				continue
 			}
+			stats, statsErr := d.store.Stats()
+			if statsErr == nil && stats.PendingCount > 0 {
+				// FetchPending may have quarantined a complete malformed page.
+				// Continue immediately so valid rows behind it are not stranded.
+				continue
+			}
 			d.recordSendMetrics(sent, startedAt)
 			return false
 		}
 
-		for _, record := range records {
-			sendAt := nowMillis()
-			if err := d.store.MarkAttempt(record.ID, sendAt, record.IsReplayed); err != nil {
-				d.logErrorf("Failed to persist telemetry send attempt: id=%d err=%v", record.ID, err)
-				d.recordSendMetrics(sent, startedAt)
-				return true
+		if cutoff > 0 {
+			for i := range records {
+				records[i].IsReplayed = true
 			}
-			if err := d.publish(record.Event, record.IsReplayed, sendAt); err != nil {
-				d.acceptanceMu.Lock()
-				if markErr := d.store.MarkFailed(record.ID, boundedError(err)); markErr != nil {
-					d.logErrorf("Failed to mark telemetry replay after publish failure: id=%d err=%v", record.ID, markErr)
-				}
-				if _, markErr := d.store.MarkAllReplayed(); markErr != nil {
-					d.logErrorf("Failed to mark pending telemetry as replayed after publish failure: %v", markErr)
-				}
-				d.setOnline(false)
-				d.acceptanceMu.Unlock()
-				d.logWarnf("Telemetry delivery paused: id=%d device=%s traceId=%s err=%v", record.ID, record.Event.DeviceName, record.Event.TraceID, err)
-				d.recordSendMetrics(sent, startedAt)
-				return true
-			}
-			if err := d.store.Ack(record.ID); err != nil {
-				if markErr := d.store.MarkFailed(record.ID, boundedError(err)); markErr != nil {
-					d.logErrorf("Failed to preserve telemetry after ack failure: id=%d err=%v", record.ID, markErr)
-				}
-				d.logErrorf("MQTT accepted telemetry but SQLite ack failed: id=%d traceId=%s err=%v", record.ID, record.Event.TraceID, err)
-				d.recordSendMetrics(sent, startedAt)
-				return true
-			}
-			d.setOnline(true)
-			sent++
-			if !d.waitSendRate() {
+		}
+		sendAt := nowMillis()
+		if err := d.store.MarkAttempts(records, sendAt); err != nil {
+			d.logErrorf("Failed to persist telemetry send attempts: count=%d err=%v", len(records), err)
+			d.recordSendMetrics(sent, startedAt)
+			return true
+		}
+
+		for start := 0; start < len(records); {
+			window, ok := d.waitRateAllowance(minInt(d.cfg.MaxInFlight, len(records)-start))
+			if !ok {
 				d.recordSendMetrics(sent, startedAt)
 				return false
 			}
+			end := start + window
+			results := d.publishBatch(records[start:end], sendAt)
+			acked := make([]int64, 0, window)
+			var firstFailure error
+			var failedRecord StoredTelemetry
+			for i, record := range records[start:end] {
+				if i < len(results) && results[i] == nil {
+					acked = append(acked, record.ID)
+					continue
+				}
+				failure := fmt.Errorf("telemetry batch result missing")
+				if i < len(results) && results[i] != nil {
+					failure = results[i]
+				}
+				if markErr := d.store.MarkFailed(record.ID, boundedError(failure)); markErr != nil {
+					d.logErrorf("Failed to mark telemetry replay after publish failure: id=%d err=%v", record.ID, markErr)
+				}
+				if firstFailure == nil {
+					firstFailure = failure
+					failedRecord = record
+				}
+			}
+			if len(acked) > 0 {
+				if err := d.store.AckBatch(acked); err != nil {
+					d.logErrorf("MQTT accepted telemetry but SQLite batch ack failed: count=%d err=%v", len(acked), err)
+					d.recordSendMetrics(sent, startedAt)
+					return true
+				}
+				sent += len(acked)
+				d.setOnline(true)
+				d.recordSendMetrics(sent, startedAt)
+			}
+			if firstFailure != nil {
+				d.acceptanceMu.Lock()
+				d.refreshRecoveryCutoff()
+				d.setOnline(false)
+				d.acceptanceMu.Unlock()
+				d.logWarnf("Telemetry delivery paused: id=%d device=%s traceId=%s err=%v", failedRecord.ID, failedRecord.Event.DeviceName, failedRecord.Event.TraceID, firstFailure)
+				d.recordSendMetrics(sent, startedAt)
+				return true
+			}
+			start = end
 		}
 	}
 }
@@ -373,22 +421,73 @@ func (d *TelemetryDispatcher) publish(event outevent.TelemetryEvent, replayed bo
 	return d.transport.PublishTelemetryEventAt(event, replayed, sendAt)
 }
 
-func (d *TelemetryDispatcher) waitSendRate() bool {
+func (d *TelemetryDispatcher) publishBatch(records []StoredTelemetry, sendAt int64) []error {
+	requests := make([]TelemetryPublishRequest, len(records))
+	for i, record := range records {
+		requests[i] = TelemetryPublishRequest{Event: record.Event, Replayed: record.IsReplayed, SendAt: sendAt}
+	}
+	if transport, ok := d.transport.(BatchTelemetryTransport); ok {
+		return transport.PublishTelemetryBatchAt(requests)
+	}
+	results := make([]error, len(records))
+	for i := range results {
+		results[i] = fmt.Errorf("telemetry publish not attempted after an earlier failure")
+	}
+	for i, record := range records {
+		results[i] = d.publish(record.Event, record.IsReplayed, sendAt)
+		if results[i] != nil {
+			break
+		}
+	}
+	return results
+}
+
+// waitRateAllowance implements a token bucket. Database and PUBACK latency
+// refill the bucket, so the configured value is an average cap rather than an
+// extra fixed sleep added to every message.
+func (d *TelemetryDispatcher) waitRateAllowance(maximum int) (int, bool) {
+	if maximum <= 0 {
+		return 0, true
+	}
 	if d.cfg.MaxSendRatePerSec <= 0 {
-		return true
+		return maximum, true
 	}
-	delay := time.Second / time.Duration(d.cfg.MaxSendRatePerSec)
-	if delay <= 0 {
-		return true
+	capacity := float64(d.cfg.MaxInFlight)
+	for {
+		now := nowMillis()
+		if d.rateLastRefill == 0 {
+			d.rateLastRefill = now
+			d.rateTokens = capacity
+		} else if now > d.rateLastRefill {
+			d.rateTokens += float64(now-d.rateLastRefill) * float64(d.cfg.MaxSendRatePerSec) / 1000
+			if d.rateTokens > capacity {
+				d.rateTokens = capacity
+			}
+			d.rateLastRefill = now
+		}
+		if allowed := minInt(maximum, int(d.rateTokens)); allowed > 0 {
+			d.rateTokens -= float64(allowed)
+			return allowed, true
+		}
+		wait := time.Duration(math.Ceil((1-d.rateTokens)*1000/float64(d.cfg.MaxSendRatePerSec))) * time.Millisecond
+		if wait < time.Millisecond {
+			wait = time.Millisecond
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-d.stopCh:
+			timer.Stop()
+			return 0, false
+		case <-timer.C:
+		}
 	}
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-d.stopCh:
-		return false
-	case <-timer.C:
-		return true
+}
+
+func minInt(left, right int) int {
+	if left < right {
+		return left
 	}
+	return right
 }
 
 func (d *TelemetryDispatcher) purgeExpired() {

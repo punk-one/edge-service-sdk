@@ -14,10 +14,24 @@ type TelemetryOutboxConfig struct {
 	SQLitePath        string `yaml:"sqlitePath"`
 	RetentionDays     int    `yaml:"retentionDays"`
 	SendBatchSize     int    `yaml:"sendBatchSize"`
+	MaxInFlight       int    `yaml:"maxInFlight"`
 	MaxSendRatePerSec int    `yaml:"maxSendRatePerSec"`
 	RetryInitialMs    int    `yaml:"retryInitialMs"`
 	RetryMaxMs        int    `yaml:"retryMaxMs"`
 	MaxDatabaseBytes  int64  `yaml:"maxDatabaseBytes"`
+}
+
+// TelemetryPublishRequest is one already-persisted telemetry delivery attempt.
+type TelemetryPublishRequest struct {
+	Event    outevent.TelemetryEvent
+	Replayed bool
+	SendAt   int64
+}
+
+// BatchTelemetryTransport optionally publishes a window of persisted telemetry
+// concurrently while returning one acknowledgement result per input item.
+type BatchTelemetryTransport interface {
+	PublishTelemetryBatchAt(items []TelemetryPublishRequest) []error
 }
 
 // EventOutboxConfig is intentionally separate from telemetry configuration.
@@ -59,8 +73,10 @@ type telemetryStore interface {
 	MaxID() (int64, error)
 	FetchPending(limit int, cutoffID int64) ([]StoredTelemetry, error)
 	MarkAttempt(id, sendAt int64, replayed bool) error
+	MarkAttempts(records []StoredTelemetry, sendAt int64) error
 	MarkFailed(id int64, message string) error
 	Ack(id int64) error
+	AckBatch(ids []int64) error
 	PurgeExpired(cutoffMillis int64) (int64, error)
 	Stats() (StoreStats, error)
 	Close() error
@@ -122,4 +138,7 @@ type TelemetryDispatcher struct {
 	metricsMu    sync.RWMutex
 	lastSendRate int
 	lastSendAt   int64
+
+	rateTokens     float64
+	rateLastRefill int64
 }

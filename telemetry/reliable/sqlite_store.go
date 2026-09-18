@@ -104,14 +104,26 @@ func (s *sqliteStore) Append(event outevent.TelemetryEvent, replayed bool, creat
 	result, err := s.db.Exec(`
 INSERT INTO telemetry_outbox(
 	trace_id, device_code, product_code, source_name, time, is_replayed, data_json, created_at
-) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(trace_id) DO NOTHING`,
 		event.TraceID, event.DeviceName, event.ProductCode, sourceName,
 		event.CollectedAt, boolInt(replayed), string(dataJSON), createdAt,
 	)
 	if err != nil {
 		return 0, err
 	}
-	return result.LastInsertId()
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if affected == 1 {
+		return result.LastInsertId()
+	}
+	var id int64
+	if err := s.db.QueryRow(`SELECT id FROM telemetry_outbox WHERE trace_id = ?`, event.TraceID).Scan(&id); err != nil {
+		return 0, fmt.Errorf("resolve idempotent telemetry append: %w", err)
+	}
+	return id, nil
 }
 
 func (s *sqliteStore) MarkAllReplayed() (int64, error) {
@@ -131,9 +143,6 @@ func (s *sqliteStore) MaxID() (int64, error) {
 }
 
 func (s *sqliteStore) FetchPending(limit int, cutoffID int64) ([]StoredTelemetry, error) {
-	if err := s.quarantineMalformed(); err != nil {
-		return nil, fmt.Errorf("quarantine malformed telemetry rows: %w", err)
-	}
 	if limit <= 0 {
 		limit = 100
 	}
@@ -159,9 +168,8 @@ LIMIT ?`
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
 	result := make([]StoredTelemetry, 0, limit)
+	invalidIDs := make([]int64, 0)
 	for rows.Next() {
 		var (
 			item       StoredTelemetry
@@ -190,7 +198,8 @@ LIMIT ?`
 		}
 		values := make(map[string]outevent.TelemetryValue)
 		if err := json.Unmarshal([]byte(dataJSON), &values); err != nil {
-			return nil, fmt.Errorf("decode telemetry outbox row %d: %w", item.ID, err)
+			invalidIDs = append(invalidIDs, item.ID)
+			continue
 		}
 		item.SendAt = sendAt.Int64
 		item.HasSendAt = sendAt.Valid
@@ -205,26 +214,42 @@ LIMIT ?`
 		}
 		result = append(result, item)
 	}
-	return result, rows.Err()
+	rowErr := rows.Err()
+	if err := rows.Close(); rowErr == nil {
+		rowErr = err
+	}
+	if rowErr != nil {
+		return nil, rowErr
+	}
+	if len(invalidIDs) > 0 {
+		if err := s.quarantineRows(invalidIDs, "invalid data_json"); err != nil {
+			return nil, fmt.Errorf("quarantine malformed telemetry rows: %w", err)
+		}
+	}
+	return result, nil
 }
 
-func (s *sqliteStore) quarantineMalformed() error {
+func (s *sqliteStore) quarantineRows(ids []int64, reason string) error {
+	if len(ids) == 0 {
+		return nil
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.Exec(`
-INSERT OR IGNORE INTO telemetry_outbox_dead_letter(
-	id, trace_id, device_code, data_json, reason, quarantined_at
-)
-SELECT id, trace_id, device_code, data_json, 'invalid data_json', ?
-FROM telemetry_outbox
-WHERE json_valid(data_json) = 0`, nowMillis()); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM telemetry_outbox WHERE json_valid(data_json) = 0`); err != nil {
-		return err
+	for _, id := range ids {
+		if _, err := tx.Exec(`
+	INSERT OR IGNORE INTO telemetry_outbox_dead_letter(
+		id, trace_id, device_code, data_json, reason, quarantined_at
+	)
+	SELECT id, trace_id, device_code, data_json, ?, ?
+	FROM telemetry_outbox WHERE id = ?`, reason, nowMillis(), id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM telemetry_outbox WHERE id = ?`, id); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -244,6 +269,36 @@ WHERE id = ?`, sendAt, sendAt, boolInt(replayed), id)
 	return requireOneRow(result, "mark telemetry send attempt")
 }
 
+func (s *sqliteStore) MarkAttempts(records []StoredTelemetry, sendAt int64) error {
+	if len(records) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	statement, err := tx.Prepare(`
+	UPDATE telemetry_outbox
+	SET send_at = ?, last_attempt_at = ?, delivery_attempts = delivery_attempts + 1,
+		is_replayed = ?, last_error = NULL
+	WHERE id = ?`)
+	if err != nil {
+		return err
+	}
+	defer statement.Close()
+	for _, record := range records {
+		result, execErr := statement.Exec(sendAt, sendAt, boolInt(record.IsReplayed), record.ID)
+		if execErr != nil {
+			return execErr
+		}
+		if err := requireOneRow(result, "mark telemetry send attempt"); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *sqliteStore) MarkFailed(id int64, message string) error {
 	result, err := s.db.Exec(`
 UPDATE telemetry_outbox
@@ -261,6 +316,42 @@ func (s *sqliteStore) Ack(id int64) error {
 		return err
 	}
 	return requireOneRow(result, "ack telemetry delivery")
+}
+
+func (s *sqliteStore) AckBatch(ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	const chunkSize = 500
+	for start := 0; start < len(ids); start += chunkSize {
+		end := start + chunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[start:end]
+		args := make([]interface{}, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+		}
+		query := `DELETE FROM telemetry_outbox WHERE id IN (` + strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",") + `)`
+		result, execErr := tx.Exec(query, args...)
+		if execErr != nil {
+			return execErr
+		}
+		affected, affectedErr := result.RowsAffected()
+		if affectedErr != nil {
+			return affectedErr
+		}
+		if affected != int64(len(chunk)) {
+			return fmt.Errorf("ack telemetry delivery affected %d rows, want %d", affected, len(chunk))
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *sqliteStore) PurgeExpired(cutoffMillis int64) (int64, error) {
