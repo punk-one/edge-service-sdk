@@ -33,4 +33,10 @@ func TestConfigureMaxBytesEnforcesLimitAndCapacityWarning(t *testing.T) {
 	if err := CheckCapacity(db); err == nil {
 		t.Fatal("CheckCapacity() error = nil, want capacity warning")
 	}
+	if _, err := db.Exec(`DELETE FROM payloads;`); err != nil {
+		t.Fatalf("delete payloads error = %v", err)
+	}
+	if err := CheckCapacity(db); err != nil {
+		t.Fatalf("CheckCapacity() after freeing pages error = %v", err)
+	}
 }

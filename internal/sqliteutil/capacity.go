@@ -68,8 +68,16 @@ func CheckCapacity(db *sql.DB) error {
 	if err := db.QueryRow(`PRAGMA max_page_count;`).Scan(&maxPages); err != nil {
 		return fmt.Errorf("read sqlite max_page_count: %w", err)
 	}
-	if maxPages > 0 && pageCount*100 >= maxPages*CapacityWarningPercent {
-		return fmt.Errorf("sqlite capacity is at least %d%%: used=%d bytes max=%d bytes", CapacityWarningPercent, pageCount*pageSize, maxPages*pageSize)
+	var freePages int64
+	if err := db.QueryRow(`PRAGMA freelist_count;`).Scan(&freePages); err != nil {
+		return fmt.Errorf("read sqlite freelist_count: %w", err)
+	}
+	usedPages := pageCount - freePages
+	if usedPages < 0 {
+		usedPages = 0
+	}
+	if maxPages > 0 && usedPages*100 >= maxPages*CapacityWarningPercent {
+		return fmt.Errorf("sqlite capacity is at least %d%%: live=%d bytes allocated=%d bytes max=%d bytes", CapacityWarningPercent, usedPages*pageSize, pageCount*pageSize, maxPages*pageSize)
 	}
 	return nil
 }

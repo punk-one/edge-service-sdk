@@ -18,7 +18,7 @@ const telemetryCleanupInterval = time.Hour
 func DefaultTelemetryOutboxConfig() TelemetryOutboxConfig {
 	return TelemetryOutboxConfig{
 		SQLitePath:        "./data/telemetry-outbox.db",
-		RetentionDays:     0,
+		RetentionDays:     7,
 		SendBatchSize:     100,
 		MaxInFlight:       32,
 		MaxSendRatePerSec: 100,
@@ -28,12 +28,16 @@ func DefaultTelemetryOutboxConfig() TelemetryOutboxConfig {
 	}
 }
 
-// NormalizeTelemetryOutboxConfig applies operational defaults. RetentionDays
-// and MaxSendRatePerSec deliberately preserve zero (no expiry / no limit).
+// NormalizeTelemetryOutboxConfig applies operational defaults. Zero retention
+// is only unlimited when the operator explicitly opts in; otherwise it falls
+// back to seven days. MaxSendRatePerSec deliberately preserves zero (no limit).
 func NormalizeTelemetryOutboxConfig(cfg TelemetryOutboxConfig) TelemetryOutboxConfig {
 	defaults := DefaultTelemetryOutboxConfig()
 	if strings.TrimSpace(cfg.SQLitePath) == "" {
 		cfg.SQLitePath = defaults.SQLitePath
+	}
+	if cfg.RetentionDays == 0 && !cfg.AllowUnlimitedRetention {
+		cfg.RetentionDays = defaults.RetentionDays
 	}
 	if cfg.SendBatchSize == 0 {
 		cfg.SendBatchSize = defaults.SendBatchSize
@@ -186,6 +190,9 @@ func (d *TelemetryDispatcher) Close() error {
 		d.closed = true
 		close(d.stopCh)
 		d.lifecycleMu.Unlock()
+		if canceler, ok := d.transport.(interface{ CancelTelemetryWait() }); ok {
+			canceler.CancelTelemetryWait()
+		}
 		<-d.doneCh
 		d.closeErr = d.store.Close()
 	})

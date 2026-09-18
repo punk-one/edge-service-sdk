@@ -257,6 +257,66 @@ func TestDurableSinglePublisherDrainsLegacyTelemetryBeforeDirectBatch(t *testing
 	}
 }
 
+func TestDurableSinglePublisherLegacyTelemetryBypassesFailedPropertyHead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "outbox.db")
+	store, err := newDurablePublisherStore(path, 64<<20)
+	if err != nil {
+		t.Fatalf("newDurablePublisherStore() error = %v", err)
+	}
+	propertyPayload, err := json.Marshal(durableEnvelope{
+		Device:  contracts.DeviceConfig{Name: "D1", ProductCode: "P1"},
+		Payload: map[string]interface{}{"value": 1},
+	})
+	if err != nil {
+		t.Fatalf("marshal property envelope: %v", err)
+	}
+	if err := store.append([]string{durableDefaultDestination}, durableKindPropertyReport, "property:blocked", propertyPayload, true); err != nil {
+		t.Fatalf("append property error = %v", err)
+	}
+	legacy := testDurableTelemetryEvent("legacy-behind-property")
+	telemetryPayload, err := json.Marshal(durableEnvelope{Telemetry: &legacy})
+	if err != nil {
+		t.Fatalf("marshal telemetry envelope: %v", err)
+	}
+	if err := store.append([]string{durableDefaultDestination}, durableKindTelemetryEvent, durableKey(durableKindTelemetryEvent, legacy.TraceID, telemetryPayload), telemetryPayload, true); err != nil {
+		t.Fatalf("append legacy telemetry error = %v", err)
+	}
+	if err := store.close(); err != nil {
+		t.Fatalf("store.close() error = %v", err)
+	}
+
+	target := &durableTargetStub{failPropertyReports: true}
+	publisher, err := NewDurablePublisher(target, DurablePublisherConfig{
+		SQLitePath:       path,
+		MaxDatabaseBytes: 64 << 20,
+		RetryInitial:     10 * time.Millisecond,
+		RetryMax:         20 * time.Millisecond,
+	}, nil)
+	if err != nil {
+		t.Fatalf("NewDurablePublisher() error = %v", err)
+	}
+	defer publisher.Close()
+
+	batch := publisher.(reliable.BatchTelemetryTransport)
+	resultCh := make(chan []error, 1)
+	go func() {
+		resultCh <- batch.PublishTelemetryBatchAt([]reliable.TelemetryPublishRequest{{
+			Event: testDurableTelemetryEvent("new-after-legacy"), SendAt: time.Now().UnixMilli(),
+		}})
+	}()
+	select {
+	case results := <-resultCh:
+		if len(results) != 1 || results[0] != nil {
+			t.Fatalf("direct batch results = %#v", results)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("direct telemetry remained blocked behind failed property row")
+	}
+	if got := target.telemetrySnapshot(); !reflect.DeepEqual(got, []string{"legacy-behind-property", "new-after-legacy"}) {
+		t.Fatalf("telemetry delivery order = %#v", got)
+	}
+}
+
 func TestDurablePublisherRejectsRemovedPendingDestination(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "outbox.db")
 	failing := &durableTargetStub{failPropertyReports: true}

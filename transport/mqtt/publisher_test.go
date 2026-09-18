@@ -43,6 +43,13 @@ func TestWaitTokenError(t *testing.T) {
 	}
 }
 
+func TestWaitPublishTokenAcceptsAlreadyCompletedTokenAfterDeadline(t *testing.T) {
+	err := waitPublishToken(mockToken{waitTimeoutOK: true}, time.Now().Add(-time.Second), time.Second)
+	if err != nil {
+		t.Fatalf("waitPublishToken() error = %v, want completed token accepted", err)
+	}
+}
+
 type mockToken struct {
 	waitTimeoutOK bool
 	err           error

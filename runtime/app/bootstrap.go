@@ -950,8 +950,17 @@ func runMergedTelemetryWorker(ctx context.Context, driver contracts.ProtocolDriv
 				logClient.Errorf("Telemetry read failed for device %s: %v", device.InternalName, err)
 			} else {
 				sdk.DeviceReadSucceededAt(device.InternalName, now.UnixMilli())
+			}
+			// A driver may return aligned partial values together with an error.
+			// Preserve the healthy points while keeping device health degraded.
+			if len(values) > 0 {
 				// Phase 3: 评估上报
 				var mergedValues []*contracts.CommandValue
+				type pendingStateUpdate struct {
+					state  telemetryState
+					values []*contracts.CommandValue
+				}
+				var pendingStateUpdates []pendingStateUpdate
 
 				// Process device-level values
 				if hasDeviceLevel && (isFirstTick || isDueWallClock(deviceInterval, gcdInterval, elapsed, false)) {
@@ -968,7 +977,7 @@ func runMergedTelemetryWorker(ctx context.Context, driver contracts.ProtocolDriv
 
 					deviceValues := filterValuesByNames(pointValues, devicePointNames)
 					if shouldEmitTelemetry(device.Telemetry, deviceValues, deviceLevelState, now) {
-						updateTelemetryState(deviceLevelState, deviceValues, now.UnixMilli())
+						pendingStateUpdates = append(pendingStateUpdates, pendingStateUpdate{state: deviceLevelState, values: deviceValues})
 						mergedValues = append(mergedValues, deviceValues...)
 
 						// Assemble device-level struct values
@@ -1004,7 +1013,7 @@ func runMergedTelemetryWorker(ctx context.Context, driver contracts.ProtocolDriv
 
 						groupValues := filterValuesByNames(pointValues, groupStates[i].names)
 						if shouldEmitTelemetry(groupStates[i].cfg, groupValues, groupStates[i].state, now) {
-							updateTelemetryState(groupStates[i].state, groupValues, now.UnixMilli())
+							pendingStateUpdates = append(pendingStateUpdates, pendingStateUpdate{state: groupStates[i].state, values: groupValues})
 							mergedValues = append(mergedValues, groupValues...)
 
 							// Assemble group-level struct values
@@ -1034,6 +1043,9 @@ func runMergedTelemetryWorker(ctx context.Context, driver contracts.ProtocolDriv
 					}
 					if err := sdk.ReportAsyncValues(asyncValues); err != nil {
 						return fmt.Errorf("persist telemetry for device %s: %w", device.InternalName, err)
+					}
+					for _, update := range pendingStateUpdates {
+						updateTelemetryState(update.state, update.values, now.UnixMilli())
 					}
 				}
 			}

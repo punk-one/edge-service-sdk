@@ -182,6 +182,73 @@ func TestValidateTelemetryOutboxConfigRejectsNegativeValues(t *testing.T) {
 	}
 }
 
+func TestNormalizeTelemetryOutboxConfigUsesSafeRetentionDefault(t *testing.T) {
+	cfg := NormalizeTelemetryOutboxConfig(TelemetryOutboxConfig{})
+	if cfg.RetentionDays != 7 {
+		t.Fatalf("RetentionDays = %d, want safe default 7", cfg.RetentionDays)
+	}
+
+	cfg = NormalizeTelemetryOutboxConfig(TelemetryOutboxConfig{AllowUnlimitedRetention: true})
+	if cfg.RetentionDays != 0 {
+		t.Fatalf("RetentionDays = %d, want explicit unlimited retention", cfg.RetentionDays)
+	}
+}
+
+type cancelableTelemetryTransportStub struct {
+	started chan struct{}
+	abort   chan struct{}
+	once    sync.Once
+}
+
+func (s *cancelableTelemetryTransportStub) PublishTelemetryEventAt(outevent.TelemetryEvent, bool, int64) error {
+	s.once.Do(func() { close(s.started) })
+	<-s.abort
+	return errors.New("telemetry delivery is shutting down")
+}
+
+func (s *cancelableTelemetryTransportStub) CancelTelemetryWait() {
+	select {
+	case <-s.abort:
+	default:
+		close(s.abort)
+	}
+}
+
+func TestTelemetryDispatcherCloseCancelsTransportWait(t *testing.T) {
+	transport := &cancelableTelemetryTransportStub{started: make(chan struct{}), abort: make(chan struct{})}
+	dispatcher, err := NewTelemetryDispatcher(TelemetryOutboxConfig{
+		SQLitePath:       filepath.Join(t.TempDir(), "telemetry-outbox.db"),
+		RetentionDays:    7,
+		SendBatchSize:    1,
+		MaxInFlight:      1,
+		RetryInitialMs:   10,
+		RetryMaxMs:       20,
+		MaxDatabaseBytes: 64 << 20,
+	}, transport, nil)
+	if err != nil {
+		t.Fatalf("NewTelemetryDispatcher() error = %v", err)
+	}
+	if err := dispatcher.PublishAsyncValues(testDevice(), testAsync("close-cancel", 1_000, 1)); err != nil {
+		t.Fatalf("PublishAsyncValues() error = %v", err)
+	}
+	select {
+	case <-transport.started:
+	case <-time.After(time.Second):
+		t.Fatal("telemetry publish did not start")
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- dispatcher.Close() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close() remained blocked in transport wait")
+	}
+}
+
 func TestTelemetryDispatcherDrainsOfflineDataInTimeOrder(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "telemetry-outbox.db")
 	transport := &telemetryTransportStub{}
@@ -333,12 +400,13 @@ func TestTelemetryDispatcherReplaysEntirePendingSetAfterPublishFailure(t *testin
 func newTestTelemetryDispatcher(t *testing.T, path string, transport *telemetryTransportStub) *TelemetryDispatcher {
 	t.Helper()
 	dispatcher, err := NewTelemetryDispatcher(TelemetryOutboxConfig{
-		SQLitePath:        path,
-		RetentionDays:     0,
-		SendBatchSize:     10,
-		MaxSendRatePerSec: 0,
-		RetryInitialMs:    10,
-		RetryMaxMs:        20,
+		SQLitePath:              path,
+		RetentionDays:           0,
+		AllowUnlimitedRetention: true,
+		SendBatchSize:           10,
+		MaxSendRatePerSec:       0,
+		RetryInitialMs:          10,
+		RetryMaxMs:              20,
 	}, transport, nil)
 	if err != nil {
 		t.Fatalf("NewTelemetryDispatcher() error = %v", err)

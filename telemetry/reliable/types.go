@@ -11,14 +11,18 @@ import (
 // TelemetryOutboxConfig controls the write-ahead telemetry outbox. Every
 // reportable telemetry message is committed to SQLite before MQTT delivery.
 type TelemetryOutboxConfig struct {
-	SQLitePath        string `yaml:"sqlitePath"`
-	RetentionDays     int    `yaml:"retentionDays"`
-	SendBatchSize     int    `yaml:"sendBatchSize"`
-	MaxInFlight       int    `yaml:"maxInFlight"`
-	MaxSendRatePerSec int    `yaml:"maxSendRatePerSec"`
-	RetryInitialMs    int    `yaml:"retryInitialMs"`
-	RetryMaxMs        int    `yaml:"retryMaxMs"`
-	MaxDatabaseBytes  int64  `yaml:"maxDatabaseBytes"`
+	SQLitePath    string `yaml:"sqlitePath"`
+	RetentionDays int    `yaml:"retentionDays"`
+	// AllowUnlimitedRetention must be explicitly enabled before zero can
+	// disable time-based cleanup. The safe default retains pending data for
+	// seven days so a disconnected gateway cannot grow the outbox forever.
+	AllowUnlimitedRetention bool  `yaml:"allowUnlimitedRetention"`
+	SendBatchSize           int   `yaml:"sendBatchSize"`
+	MaxInFlight             int   `yaml:"maxInFlight"`
+	MaxSendRatePerSec       int   `yaml:"maxSendRatePerSec"`
+	RetryInitialMs          int   `yaml:"retryInitialMs"`
+	RetryMaxMs              int   `yaml:"retryMaxMs"`
+	MaxDatabaseBytes        int64 `yaml:"maxDatabaseBytes"`
 }
 
 // TelemetryPublishRequest is one already-persisted telemetry delivery attempt.

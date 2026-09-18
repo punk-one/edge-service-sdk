@@ -90,6 +90,8 @@ type durablePublisher struct {
 	directTelemetry     bool
 	legacyTelemetryDone chan struct{}
 	legacyTelemetryOnce sync.Once
+	telemetryWaitAbort  chan struct{}
+	telemetryAbortOnce  sync.Once
 
 	stopCh    chan struct{}
 	wake      map[string]chan struct{}
@@ -160,6 +162,7 @@ func NewDurablePublisher(base Publisher, cfg DurablePublisherConfig, logClient l
 		retryMax:            cfg.RetryMax,
 		directTelemetry:     directTelemetry,
 		legacyTelemetryDone: make(chan struct{}),
+		telemetryWaitAbort:  make(chan struct{}),
 		stopCh:              make(chan struct{}),
 		wake:                make(map[string]chan struct{}, len(destinations)),
 	}
@@ -348,6 +351,39 @@ LIMIT 1`, destination).Scan(&record.ID, &record.Destination, &record.Kind, &raw,
 	}
 }
 
+// nextLegacyTelemetry bypasses unrelated durable rows during a single-broker
+// upgrade. Otherwise one permanently failing property/event row ahead of old
+// telemetry would keep the direct telemetry gate closed forever.
+func (s *durablePublisherStore) nextLegacyTelemetry(destination string) (durableRecord, bool, error) {
+	for {
+		var record durableRecord
+		var raw string
+		var replayed int
+		err := s.db.QueryRow(`
+SELECT id, destination, kind, payload_json, replayed, delivery_attempts
+FROM mqtt_destination_outbox
+WHERE destination = ? AND kind IN (?, ?)
+ORDER BY id ASC
+LIMIT 1`, destination, durableKindTelemetry, durableKindTelemetryEvent).Scan(
+			&record.ID, &record.Destination, &record.Kind, &raw, &replayed, &record.Attempts,
+		)
+		if err == sql.ErrNoRows {
+			return durableRecord{}, false, nil
+		}
+		if err != nil {
+			return durableRecord{}, false, err
+		}
+		if err := json.Unmarshal([]byte(raw), &record.Envelope); err != nil {
+			if quarantineErr := s.quarantine(record.ID, err.Error()); quarantineErr != nil {
+				return durableRecord{}, false, fmt.Errorf("decode legacy durable mqtt row %d: %v; quarantine: %w", record.ID, err, quarantineErr)
+			}
+			continue
+		}
+		record.Replayed = replayed != 0
+		return record, true, nil
+	}
+}
+
 func (s *durablePublisherStore) markAttempt(id int64) error {
 	result, err := s.db.Exec(`UPDATE mqtt_destination_outbox
 		SET delivery_attempts = delivery_attempts + 1, last_attempt_at = ?, last_error = NULL
@@ -468,7 +504,21 @@ func (d *durablePublisher) runDestination(destination string) {
 	defer d.wg.Done()
 	delay := d.retryInitial
 	for {
-		record, found, err := d.store.next(destination)
+		var record durableRecord
+		var found bool
+		var err error
+		if d.isWaitingForLegacyTelemetry() {
+			record, found, err = d.store.nextLegacyTelemetry(destination)
+			if err == nil && !found {
+				d.refreshLegacyTelemetryGate()
+				if d.isWaitingForLegacyTelemetry() && !d.wait(destination, delay) {
+					return
+				}
+				continue
+			}
+		} else {
+			record, found, err = d.store.next(destination)
+		}
 		if err != nil {
 			d.logError("load", destination, 0, err)
 			if !d.wait(destination, delay) {
@@ -518,6 +568,18 @@ func (d *durablePublisher) runDestination(destination string) {
 	}
 }
 
+func (d *durablePublisher) isWaitingForLegacyTelemetry() bool {
+	if !d.directTelemetry {
+		return false
+	}
+	select {
+	case <-d.legacyTelemetryDone:
+		return false
+	default:
+		return true
+	}
+}
+
 func (d *durablePublisher) refreshLegacyTelemetryGate() {
 	if !d.directTelemetry {
 		return
@@ -539,9 +601,17 @@ func (d *durablePublisher) waitForLegacyTelemetry() error {
 	select {
 	case <-d.legacyTelemetryDone:
 		return nil
+	case <-d.telemetryWaitAbort:
+		return fmt.Errorf("telemetry delivery is shutting down")
 	case <-d.stopCh:
 		return fmt.Errorf("durable mqtt publisher is closed")
 	}
+}
+
+// CancelTelemetryWait releases a telemetry dispatcher that is waiting for
+// legacy rows, without closing the durable publisher before its worker exits.
+func (d *durablePublisher) CancelTelemetryWait() {
+	d.telemetryAbortOnce.Do(func() { close(d.telemetryWaitAbort) })
 }
 
 func (d *durablePublisher) deliver(destination string, record durableRecord) error {

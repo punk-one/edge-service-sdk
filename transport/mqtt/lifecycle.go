@@ -393,16 +393,11 @@ func (c *mqttClient) publishMessages(messages []mqttMessage) []error {
 		})
 	}
 
-	deadline := time.Now().Add(c.config.publishTimeout())
+	publishTimeout := c.config.publishTimeout()
+	deadline := time.Now().Add(publishTimeout)
 	var firstFailure error
 	for _, item := range pending {
-		remaining := time.Until(deadline)
-		var err error
-		if remaining <= 0 || !item.token.WaitTimeout(remaining) {
-			err = fmt.Errorf("mqtt publish timeout after %s", c.config.publishTimeout())
-		} else if tokenErr := item.token.Error(); tokenErr != nil {
-			err = fmt.Errorf("mqtt publish: %w", tokenErr)
-		}
+		err := waitPublishToken(item.token, deadline, publishTimeout)
 		results[item.index] = err
 		if err != nil {
 			if firstFailure == nil {
@@ -424,6 +419,28 @@ func (c *mqttClient) publishMessages(messages []mqttMessage) []error {
 	client.Disconnect(0)
 	c.startReconnect("publish_failure", firstFailure)
 	return results
+}
+
+func waitPublishToken(token paho.Token, deadline time.Time, publishTimeout time.Duration) error {
+	// A later token may already have completed while an earlier token consumed
+	// the shared deadline. Check completion before classifying it as timed out.
+	select {
+	case <-token.Done():
+		if tokenErr := token.Error(); tokenErr != nil {
+			return fmt.Errorf("mqtt publish: %w", tokenErr)
+		}
+		return nil
+	default:
+	}
+
+	remaining := time.Until(deadline)
+	if remaining <= 0 || !token.WaitTimeout(remaining) {
+		return fmt.Errorf("mqtt publish timeout after %s", publishTimeout)
+	}
+	if tokenErr := token.Error(); tokenErr != nil {
+		return fmt.Errorf("mqtt publish: %w", tokenErr)
+	}
+	return nil
 }
 
 // Publish sends raw bytes to the specified MQTT topic.

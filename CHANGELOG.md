@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.12.1 - 2026-09-18
+
+### Reliability fixes
+
+- Changed telemetry retention to a safe seven-day default. A zero value now
+  falls back to seven days unless `allowUnlimitedRetention: true` is explicitly
+  configured.
+- Prioritized legacy telemetry rows during single-broker upgrades so an older
+  failing property/event row cannot block all new telemetry.
+- Made the legacy telemetry gate cancellable during shutdown.
+- Fixed batch MQTT acknowledgement handling so tokens already completed after
+  the shared deadline are not falsely classified as timeouts and replayed.
+- Kept healthy aligned values from partial driver reads while reporting the
+  device read as degraded.
+- Delayed telemetry filter-state updates until the corresponding SQLite commit
+  succeeds.
+
+### Upgrade notes
+
+- Do not delete, replace, rename, or recreate `telemetry-outbox.db`; this update
+  works with the existing schema and drains existing rows in place.
+- Existing `retentionDays: 0` configurations now use seven days. To retain the
+  old unlimited behavior, add `allowUnlimitedRetention: true` explicitly.
+- Finite retention intentionally deletes unacknowledged records older than the
+  configured window. Size `maxDatabaseBytes` so the required retention window
+  fits under worst-case collection volume.
+
 ## v0.12.0 - 2026-09-18
 
 ### Telemetry outbox throughput

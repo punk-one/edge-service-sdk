@@ -142,7 +142,8 @@ so the SDK no longer exposes a process-memory telemetry channel.
 ```yaml
 telemetryOutbox:
   sqlitePath: "./data/telemetry-outbox.db"
-  retentionDays: 0        # 0 = never silently discard pending telemetry
+  retentionDays: 7        # pending telemetry older than 7 days is purged
+  allowUnlimitedRetention: false # true + retentionDays: 0 explicitly disables expiry
   sendBatchSize: 200      # SQLite read page size
   maxInFlight: 32         # concurrent MQTT QoS acknowledgements, max 256
   maxSendRatePerSec: 200  # 0 = unlimited
@@ -187,6 +188,13 @@ controlStore:
 At the limit, SQLite rejects new durable writes instead of deleting unsent
 data. Operators should alert on `/api/v1/ready` and outbox depth/age before the
 95% readiness threshold is reached.
+
+`retentionDays: 0` no longer disables cleanup by itself. Zero falls back to the
+safe seven-day default unless `allowUnlimitedRetention: true` is also set.
+Unlimited retention is intended only for installations with independently
+managed storage capacity and disk-space alerting. A finite retention window is
+a data-discard policy: records older than the configured window are removed
+even when they have not received MQTT acknowledgement.
 
 ## What's New In v0.7.5
 
