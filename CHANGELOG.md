@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.12.3 - 2026-09-21
+
+- Log raw malformed control payloads only when the corresponding dry-run
+  switch is enabled. With dry run disabled, parsing errors retain the earlier
+  error-only log behavior.
+
 ## v0.12.2 - 2026-09-21
 
 ### Control dry run

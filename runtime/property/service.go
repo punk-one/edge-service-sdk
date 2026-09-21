@@ -353,7 +353,11 @@ func (s *Service) handlePropertySet(productCode string, payload []byte) {
 	req, err := cfg.ParsePropertyRequest(payload)
 	if err != nil {
 		if s.logger != nil {
-			s.logger.Warnf("Failed to parse property_set payload for product %s dryRun=%t payload=%s: %v", productCode, s.dryRun, payload, err)
+			if s.dryRun {
+				s.logger.Warnf("Failed to parse property_set payload for product %s dryRun=true payload=%s: %v", productCode, payload, err)
+			} else {
+				s.logger.Warnf("Failed to parse property_set payload for product %s: %v", productCode, err)
+			}
 		}
 		return
 	}

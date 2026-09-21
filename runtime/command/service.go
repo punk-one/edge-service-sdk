@@ -257,7 +257,11 @@ func (s *Service) handleCommandCall(productCode string, identifier string, paylo
 	var req cmdapi.CommandRequest
 	if err := json.Unmarshal(payload, &req); err != nil {
 		if s.logger != nil {
-			s.logger.Warnf("Failed to parse command payload for product %s identifier %s dryRun=%t payload=%s: %v", productCode, identifier, s.dryRun, payload, err)
+			if s.dryRun {
+				s.logger.Warnf("Failed to parse command payload for product %s identifier %s dryRun=true payload=%s: %v", productCode, identifier, payload, err)
+			} else {
+				s.logger.Warnf("Failed to parse command payload for product %s identifier %s: %v", productCode, identifier, err)
+			}
 		}
 		return
 	}

@@ -138,13 +138,18 @@ func (p *propertyTestPublisher) Message(index int) propertyPublishedMessage {
 	return p.messages[index]
 }
 
-type propertyDryRunLogger struct{ lines []string }
+type propertyDryRunLogger struct {
+	lines    []string
+	warnings []string
+}
 
 func (l *propertyDryRunLogger) Debugf(string, ...interface{}) {}
 func (l *propertyDryRunLogger) Infof(format string, args ...interface{}) {
 	l.lines = append(l.lines, fmt.Sprintf(format, args...))
 }
-func (l *propertyDryRunLogger) Warnf(string, ...interface{})  {}
+func (l *propertyDryRunLogger) Warnf(format string, args ...interface{}) {
+	l.warnings = append(l.warnings, fmt.Sprintf(format, args...))
+}
 func (l *propertyDryRunLogger) Errorf(string, ...interface{}) {}
 func (l *propertyDryRunLogger) Error(...interface{})          {}
 
@@ -191,6 +196,21 @@ func TestPendingPropertySetDryRunDoesNotWrite(t *testing.T) {
 	}, nil)
 	if driver.writeCalls != 0 || result.Data["dryRun"] != true || result.Data["executed"] != false {
 		t.Fatalf("pending property dryRun result=%#v writes=%d", result, driver.writeCalls)
+	}
+}
+
+func TestMalformedPropertySetPayloadLoggedOnlyInDryRun(t *testing.T) {
+	for _, dryRun := range []bool{false, true} {
+		log := &propertyDryRunLogger{}
+		service := NewService(&propertyTestCatalog{}, &propertyTestDriver{}, nil, nil, log)
+		service.RegisterMQTTHandlers(rtconfig.Config{PropertySet: mqtt.TopicConfig{DryRun: dryRun}})
+		service.handlePropertySet("acm", []byte(`{"secret":"example",`))
+		if len(log.warnings) != 1 {
+			t.Fatalf("dryRun=%v warnings=%#v", dryRun, log.warnings)
+		}
+		if strings.Contains(log.warnings[0], "secret") != dryRun {
+			t.Fatalf("dryRun=%v warning=%q", dryRun, log.warnings[0])
+		}
 	}
 }
 

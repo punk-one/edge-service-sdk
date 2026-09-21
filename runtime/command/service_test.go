@@ -134,13 +134,18 @@ func (p *commandTestPublisher) Message(index int) commandPublishedMessage {
 	return p.messages[index]
 }
 
-type commandDryRunLogger struct{ lines []string }
+type commandDryRunLogger struct {
+	lines    []string
+	warnings []string
+}
 
 func (l *commandDryRunLogger) Debugf(string, ...interface{}) {}
 func (l *commandDryRunLogger) Infof(format string, args ...interface{}) {
 	l.lines = append(l.lines, fmt.Sprintf(format, args...))
 }
-func (l *commandDryRunLogger) Warnf(string, ...interface{})  {}
+func (l *commandDryRunLogger) Warnf(format string, args ...interface{}) {
+	l.warnings = append(l.warnings, fmt.Sprintf(format, args...))
+}
 func (l *commandDryRunLogger) Errorf(string, ...interface{}) {}
 func (l *commandDryRunLogger) Error(...interface{})          {}
 
@@ -196,6 +201,21 @@ func TestPendingCommandDryRunDoesNotExecute(t *testing.T) {
 	})
 	if called || result.Data["dryRun"] != true || result.Data["executed"] != false {
 		t.Fatalf("pending command dryRun result=%#v called=%v", result, called)
+	}
+}
+
+func TestMalformedCommandPayloadLoggedOnlyInDryRun(t *testing.T) {
+	for _, dryRun := range []bool{false, true} {
+		log := &commandDryRunLogger{}
+		service := NewService(&commandTestCatalog{}, &commandTestDriver{}, nil, nil, log, nil, nil)
+		service.RegisterMQTTHandlers(rtconfig.Config{CommandCall: mqtt.TopicConfig{DryRun: dryRun}})
+		service.handleCommandCall("qhl", "set_speed", []byte(`{"secret":"example",`))
+		if len(log.warnings) != 1 {
+			t.Fatalf("dryRun=%v warnings=%#v", dryRun, log.warnings)
+		}
+		if strings.Contains(log.warnings[0], "secret") != dryRun {
+			t.Fatalf("dryRun=%v warning=%q", dryRun, log.warnings[0])
+		}
 	}
 }
 
