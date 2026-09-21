@@ -2,7 +2,9 @@ package property
 
 import (
 	"encoding/json"
+	"fmt"
 	pathpkg "path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -10,6 +12,7 @@ import (
 	ctl "github.com/punk-one/edge-service-sdk/control"
 	contracts "github.com/punk-one/edge-service-sdk/driver"
 	rtapi "github.com/punk-one/edge-service-sdk/property"
+	rtconfig "github.com/punk-one/edge-service-sdk/runtime/config"
 	rtcontrol "github.com/punk-one/edge-service-sdk/runtime/control"
 	outevent "github.com/punk-one/edge-service-sdk/telemetry"
 	mqtt "github.com/punk-one/edge-service-sdk/transport/mqtt"
@@ -44,13 +47,17 @@ type propertyTestDriver struct {
 	readValues []*contracts.CommandValue
 	readErr    error
 	writeErr   error
+	readCalls  int
+	writeCalls int
 }
 
 func (d *propertyTestDriver) Initialize(sdk contracts.DeviceServiceSDK) error { return nil }
 func (d *propertyTestDriver) HandleReadCommands(deviceName string, protocols map[string]contracts.ProtocolProperties, reqs []contracts.CommandRequest) ([]*contracts.CommandValue, error) {
+	d.readCalls++
 	return d.readValues, d.readErr
 }
 func (d *propertyTestDriver) HandleWriteCommands(deviceName string, protocols map[string]contracts.ProtocolProperties, reqs []contracts.CommandRequest, params []*contracts.CommandValue) error {
+	d.writeCalls++
 	return d.writeErr
 }
 func (d *propertyTestDriver) Stop(force bool) error { return nil }
@@ -129,6 +136,62 @@ func (p *propertyTestPublisher) Message(index int) propertyPublishedMessage {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.messages[index]
+}
+
+type propertyDryRunLogger struct{ lines []string }
+
+func (l *propertyDryRunLogger) Debugf(string, ...interface{}) {}
+func (l *propertyDryRunLogger) Infof(format string, args ...interface{}) {
+	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+}
+func (l *propertyDryRunLogger) Warnf(string, ...interface{})  {}
+func (l *propertyDryRunLogger) Errorf(string, ...interface{}) {}
+func (l *propertyDryRunLogger) Error(...interface{})          {}
+
+func TestPropertySetDryRunLogsAndPublishesWithoutDeviceIO(t *testing.T) {
+	device := contracts.DeviceConfig{
+		Name: "acm006", ProductCode: "acm",
+		Property: contracts.PropertyConfig{Points: []contracts.PointConfig{
+			{Name: "status_text", ValueType: "String", NodeName: "DB1.DBB0", ReadWrite: "RW"},
+		}},
+	}
+	driver := &propertyTestDriver{}
+	publisher := &propertyTestPublisher{}
+	log := &propertyDryRunLogger{}
+	service := NewService(&propertyTestCatalog{device: device}, driver, publisher, nil, log)
+	service.RegisterMQTTHandlers(rtconfig.Config{
+		PropertySet:    mqtt.TopicConfig{DryRun: true},
+		PropertyResult: mqtt.TopicConfig{Topic: "property/result"},
+	})
+	service.handlePropertySet("acm", []byte(`{"device_code":"acm006","trace_id":"dry-property","data":{"status_text":"RUNNING"}}`))
+	if driver.writeCalls != 0 || driver.readCalls != 0 {
+		t.Fatalf("dryRun performed device IO: writes=%d reads=%d", driver.writeCalls, driver.readCalls)
+	}
+	if publisher.Count() != 1 {
+		t.Fatalf("result count = %d, want 1", publisher.Count())
+	}
+	result := publisher.Message(0).payload
+	data, ok := result["data"].(map[string]interface{})
+	if !ok || data["dryRun"] != true || data["executed"] != false || !strings.Contains(result["message"].(string), "not written") {
+		t.Fatalf("dryRun result = %#v", result)
+	}
+	if len(log.lines) != 1 || !strings.Contains(log.lines[0], "dryRun=true") || !strings.Contains(log.lines[0], "RUNNING") {
+		t.Fatalf("dryRun log = %#v", log.lines)
+	}
+}
+
+func TestPendingPropertySetDryRunDoesNotWrite(t *testing.T) {
+	driver := &propertyTestDriver{}
+	log := &propertyDryRunLogger{}
+	service := NewService(&propertyTestCatalog{}, driver, nil, nil, log)
+	service.RegisterMQTTHandlers(rtconfig.Config{PropertySet: mqtt.TopicConfig{DryRun: true}})
+	result := service.executePendingPropertySet(rtcontrol.PendingProperty{
+		TraceID: "pending-property",
+		Request: ctl.Request{TraceID: "pending-property", DeviceCode: "acm006", Data: map[string]interface{}{"status_text": "RUNNING"}},
+	}, nil)
+	if driver.writeCalls != 0 || result.Data["dryRun"] != true || result.Data["executed"] != false {
+		t.Fatalf("pending property dryRun result=%#v writes=%d", result, driver.writeCalls)
+	}
 }
 
 func TestHandlePropertyGetPublishesPropertyResultWithoutProductCode(t *testing.T) {

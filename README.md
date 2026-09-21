@@ -130,6 +130,38 @@ state separately from the durable event outbox, preserves the original event
 connection settings. The v0.9.9 wire contract keeps `event_code` and `type`,
 and does not migrate the legacy SQLite event queue.
 
+## Control dry run (v0.12.2)
+
+The two switches are independent and default to `false` when omitted:
+
+```yaml
+propertySet:
+  topic: "v1/iot/{productCode}/property/set"
+  qos: 1
+  dryRun: false
+
+commandCall:
+  topic: "v1/iot/{productCode}/command/call/{identifier}"
+  qos: 1
+  dryRun: false
+```
+
+Set either switch to `true` to validate and log that type of inbound request
+with `dryRun=true`, but skip the device property write or registered command
+execution. This applies to MQTT, HTTP, and internal bus requests, including
+pending asynchronous work resumed after a restart. Property reads are
+unaffected. A command that writes a property is governed by
+`commandCall.dryRun`, not `propertySet.dryRun`.
+
+Valid simulated requests return `code: 200` with a message explaining that
+nothing was executed and `data: {"dryRun": true, "executed": false}`. MQTT
+property results are published immediately without a write/readback cycle;
+command results carry the same marker. Invalid requests still return their
+normal validation error and are not executed. Request data is written to the
+application log while dry run is enabled, so treat the log as sensitive and
+keep rotation and access controls in place. Changing either switch through
+configuration management requires a service restart.
+
 ## Telemetry Outbox Configuration
 
 Telemetry is persisted after `onChange`, deadband, watched-field, and heartbeat

@@ -145,6 +145,21 @@ func TestNormalizeConfigSetsDefaultStatusHeartbeatInterval(t *testing.T) {
 	}
 }
 
+func TestControlDryRunDefaultsAndOverrides(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "config.json")
+	if err := os.WriteFile(path, []byte(`{"propertySet":{"dryRun":true},"commandCall":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config, err := loadMainConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !config.PropertySet.DryRun || config.CommandCall.DryRun {
+		t.Fatalf("unexpected dryRun defaults: property=%v command=%v", config.PropertySet.DryRun, config.CommandCall.DryRun)
+	}
+}
+
 func TestLoadMainConfigUsesTelemetryOutboxDefaults(t *testing.T) {
 	config, err := loadMainConfig(filepath.Join(t.TempDir(), "missing-config.yaml"))
 	if err != nil {

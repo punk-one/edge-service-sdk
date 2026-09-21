@@ -150,6 +150,7 @@ type TopicConfig struct {
 	Topic             string `yaml:"topic"`
 	QoS               int    `yaml:"qos"`
 	Retain            bool   `yaml:"retain"`
+	DryRun            bool   `yaml:"dryRun"`
 	DataFormat        string `yaml:"dataFormat"`
 	HeartbeatInterval string `yaml:"heartbeatInterval"`
 }

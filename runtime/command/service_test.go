@@ -2,6 +2,8 @@ package command
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -9,6 +11,8 @@ import (
 	cmdapi "github.com/punk-one/edge-service-sdk/command"
 	ctl "github.com/punk-one/edge-service-sdk/control"
 	contracts "github.com/punk-one/edge-service-sdk/driver"
+	rtconfig "github.com/punk-one/edge-service-sdk/runtime/config"
+	rtcontrol "github.com/punk-one/edge-service-sdk/runtime/control"
 	outevent "github.com/punk-one/edge-service-sdk/telemetry"
 	mqtt "github.com/punk-one/edge-service-sdk/transport/mqtt"
 )
@@ -128,6 +132,71 @@ func (p *commandTestPublisher) Message(index int) commandPublishedMessage {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.messages[index]
+}
+
+type commandDryRunLogger struct{ lines []string }
+
+func (l *commandDryRunLogger) Debugf(string, ...interface{}) {}
+func (l *commandDryRunLogger) Infof(format string, args ...interface{}) {
+	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+}
+func (l *commandDryRunLogger) Warnf(string, ...interface{})  {}
+func (l *commandDryRunLogger) Errorf(string, ...interface{}) {}
+func (l *commandDryRunLogger) Error(...interface{})          {}
+
+func TestCommandDryRunLogsAndPublishesWithoutExecution(t *testing.T) {
+	device := testDevice("qhl0001", "qhl", "set_speed")
+	called := false
+	registry := newTestRegistry(stubCommand{
+		desc: cmdapi.CommandDescriptor{Identifier: "set_speed", Mode: "async"},
+		fn: func(ctx cmdapi.CommandContext, req cmdapi.CommandRequest) (map[string]interface{}, *cmdapi.CommandError) {
+			called = true
+			return nil, nil
+		},
+	})
+	publisher := &commandTestPublisher{}
+	log := &commandDryRunLogger{}
+	service := NewService(&commandTestCatalog{device: device}, &commandTestDriver{}, publisher, nil, log, registry, nil)
+	service.RegisterMQTTHandlers(rtconfig.Config{
+		CommandCall:   mqtt.TopicConfig{DryRun: true},
+		CommandResult: mqtt.TopicConfig{Topic: "command/result"},
+	})
+	service.handleCommandCall("qhl", "set_speed", []byte(`{"device_code":"qhl0001","trace_id":"dry-command","data":{"speed":12}}`))
+	if called {
+		t.Fatal("dryRun executed command")
+	}
+	if publisher.Count() != 1 {
+		t.Fatalf("result count = %d, want 1", publisher.Count())
+	}
+	result := publisher.Message(0).payload
+	data, ok := result["data"].(map[string]interface{})
+	if !ok || data["dryRun"] != true || data["executed"] != false || !strings.Contains(result["message"].(string), "not executed") {
+		t.Fatalf("dryRun result = %#v", result)
+	}
+	if len(log.lines) != 1 || !strings.Contains(log.lines[0], "dryRun=true") || !strings.Contains(log.lines[0], "speed") {
+		t.Fatalf("dryRun log = %#v", log.lines)
+	}
+}
+
+func TestPendingCommandDryRunDoesNotExecute(t *testing.T) {
+	called := false
+	registry := newTestRegistry(stubCommand{
+		desc: cmdapi.CommandDescriptor{Identifier: "set_speed", Mode: "async"},
+		fn: func(ctx cmdapi.CommandContext, req cmdapi.CommandRequest) (map[string]interface{}, *cmdapi.CommandError) {
+			called = true
+			return nil, nil
+		},
+	})
+	log := &commandDryRunLogger{}
+	service := NewService(&commandTestCatalog{}, &commandTestDriver{}, nil, nil, log, registry, nil)
+	service.RegisterMQTTHandlers(rtconfig.Config{CommandCall: mqtt.TopicConfig{DryRun: true}})
+	result := service.executePendingCommand(rtcontrol.PendingCommand{
+		TraceID: "pending-command", Identifier: "set_speed",
+		Request: ctl.Request{TraceID: "pending-command", DeviceCode: "qhl0001", Data: map[string]interface{}{"speed": 12}},
+	})
+	if called || result.Data["dryRun"] != true || result.Data["executed"] != false {
+		t.Fatalf("pending command dryRun result=%#v called=%v", result, called)
+	}
 }
 
 type stubCommand struct {

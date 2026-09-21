@@ -41,6 +41,7 @@ type Service struct {
 	registry             cmdapi.Registry
 	logger               logger.LoggingClient
 	commandResultEnabled bool
+	dryRun               bool
 	fileClient           file.Client
 
 	mu           sync.Mutex
@@ -74,6 +75,9 @@ func NewService(catalog DeviceCatalog, driver contracts.ProtocolDriver, publishe
 }
 
 func (s *Service) Execute(identifier string, req cmdapi.CommandRequest, expectedProductCode string) (cmdapi.CommandResponse, int) {
+	if s.dryRun {
+		s.logDryRunRequest(identifier, req)
+	}
 	if !s.beginRequest() {
 		result := newControlResult(req.TraceID, ctl.CodeBusy, "command service is shutting down", nil)
 		return result, httpStatusForCode(result.Code)
@@ -119,6 +123,11 @@ func (s *Service) Execute(identifier string, req cmdapi.CommandRequest, expected
 		s.record(normalized.DeviceCode, device.ProductCode, desc.Identifier, normalized.TraceID, result)
 		return result, httpStatusForCode(result.Code)
 	}
+	if s.dryRun {
+		result := newControlResult(normalized.TraceID, ctl.CodeSuccess, "dryRun: command accepted but not executed", map[string]interface{}{"dryRun": true, "executed": false})
+		s.record(normalized.DeviceCode, device.ProductCode, desc.Identifier, normalized.TraceID, result)
+		return result, httpStatusForCode(result.Code)
+	}
 
 	switch desc.Mode {
 	case "async":
@@ -129,6 +138,7 @@ func (s *Service) Execute(identifier string, req cmdapi.CommandRequest, expected
 }
 
 func (s *Service) RegisterMQTTHandlers(config rtconfig.Config) {
+	s.dryRun = config.CommandCall.DryRun
 	if s.publisher == nil {
 		return
 	}
@@ -247,20 +257,23 @@ func (s *Service) handleCommandCall(productCode string, identifier string, paylo
 	var req cmdapi.CommandRequest
 	if err := json.Unmarshal(payload, &req); err != nil {
 		if s.logger != nil {
-			s.logger.Warnf("Failed to parse command payload for product %s identifier %s: %v", productCode, identifier, err)
+			s.logger.Warnf("Failed to parse command payload for product %s identifier %s dryRun=%t payload=%s: %v", productCode, identifier, s.dryRun, payload, err)
 		}
 		return
 	}
 
 	req.DeviceCode = strings.TrimSpace(req.DeviceCode)
 	if req.DeviceCode == "" {
+		s.logRejectedDryRunPayload(identifier, payload)
 		return
 	}
 	device, ok := s.catalog.DeviceConfigByName(req.DeviceCode)
 	if !ok || device.ProductCode != productCode {
+		s.logRejectedDryRunPayload(identifier, payload)
 		return
 	}
 	if _, ok := cfg.FindCommandByIdentifier(device, identifier); !ok {
+		s.logRejectedDryRunPayload(identifier, payload)
 		return
 	}
 
@@ -281,6 +294,12 @@ func (s *Service) handleCommandCall(productCode string, identifier string, paylo
 	})
 	s.finishResultDelivery(result.TraceID, publishErr)
 	s.deliveryMu.Unlock()
+}
+
+func (s *Service) logRejectedDryRunPayload(identifier string, payload []byte) {
+	if s.dryRun && s.logger != nil {
+		s.logger.Infof("Command dryRun=true identifier=%s rejected request=%s", identifier, payload)
+	}
 }
 
 func (s *Service) resolveCommandDevice(req cmdapi.CommandRequest, expectedProductCode string) (contracts.DeviceConfig, cmdapi.CommandRequest, int, error) {
@@ -511,6 +530,10 @@ func (s *Service) BeginShutdown() {
 }
 
 func (s *Service) executePendingCommand(pending rtcontrol.PendingCommand) cmdapi.CommandResponse {
+	if s.dryRun {
+		s.logDryRunRequest(pending.Identifier, cmdapi.CommandRequest(pending.Request))
+		return newControlResult(pending.TraceID, ctl.CodeSuccess, "dryRun: pending command not executed", map[string]interface{}{"dryRun": true, "executed": false})
+	}
 	device, ok := s.catalog.DeviceConfigByName(strings.TrimSpace(pending.DeviceCode))
 	if !ok {
 		return newControlResult(pending.TraceID, ctl.CodeNotFound, "device_code does not match any configured device", nil)
@@ -538,6 +561,18 @@ func (s *Service) executePendingCommand(pending rtcontrol.PendingCommand) cmdapi
 		return newControlResult(pending.TraceID, normalizedErrorCode(cmdErr.Code), cmdErr.Error(), cmdErr.Data)
 	}
 	return newControlResult(pending.TraceID, ctl.CodeSuccess, "success", resultData)
+}
+
+func (s *Service) logDryRunRequest(identifier string, req cmdapi.CommandRequest) {
+	if s.logger == nil {
+		return
+	}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		s.logger.Warnf("Command dryRun=true identifier=%s trace=%s device=%s request marshal failed: %v", identifier, req.TraceID, req.DeviceCode, err)
+		return
+	}
+	s.logger.Infof("Command dryRun=true identifier=%s trace=%s device=%s request=%s", identifier, req.TraceID, req.DeviceCode, payload)
 }
 
 func (s *Service) executeRegisteredCommand(device contracts.DeviceConfig, desc cmdapi.CommandDescriptor, cmd cmdapi.Command, req cmdapi.CommandRequest, progress func(cmdapi.ProgressPayload)) (_ map[string]interface{}, cmdErr *cmdapi.CommandError) {

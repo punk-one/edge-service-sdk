@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.12.2 - 2026-09-21
+
+### Control dry run
+
+- Added independent `propertySet.dryRun` and `commandCall.dryRun` switches;
+  both default to `false` when omitted.
+- When enabled, the SDK logs the received request with a `dryRun=true`
+  marker, validates it, and records/publishes a result with
+  `data.dryRun=true` and `data.executed=false` without writing properties
+  or executing commands.
+- Property-set dry runs skip delayed readback. Commands configured for
+  asynchronous execution are answered immediately without adding new pending
+  work. Pending asynchronous work from an earlier run is also finalized
+  without device execution while the corresponding switch is enabled.
+- Configuration changes to these switches require a service restart. Existing
+  SQLite databases and schemas are unchanged.
+
 ## v0.12.1 - 2026-09-18
 
 ### Reliability fixes

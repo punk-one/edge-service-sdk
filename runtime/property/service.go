@@ -2,6 +2,7 @@ package property
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -37,6 +38,7 @@ type Service struct {
 	store                 rtcontrol.Store
 	logger                logger.LoggingClient
 	propertyResultEnabled bool
+	dryRun                bool
 	setPostDelay          time.Duration
 
 	mu          sync.Mutex
@@ -148,6 +150,9 @@ func (s *Service) ExecuteGet(req rtapi.PropertyRequest, expectedProductCode stri
 }
 
 func (s *Service) ExecuteSet(req rtapi.PropertyRequest, expectedProductCode string) (rtapi.PropertySetResponse, int) {
+	if s.dryRun {
+		s.logDryRunRequest(req)
+	}
 	if !s.beginRequest() {
 		result := newControlResult(req.TraceID, ctl.CodeBusy, "property service is shutting down", nil)
 		return result, httpStatusForCode(result.Code)
@@ -185,6 +190,11 @@ func (s *Service) ExecuteSet(req rtapi.PropertyRequest, expectedProductCode stri
 		s.record(normalized.DeviceCode, device.ProductCode, normalized.TraceID, result, propertyOperationSet)
 		return result, httpStatusForCode(result.Code)
 	}
+	if s.dryRun {
+		result := newControlResult(normalized.TraceID, ctl.CodeSuccess, "dryRun: property set accepted but not written", map[string]interface{}{"dryRun": true, "executed": false})
+		s.record(normalized.DeviceCode, device.ProductCode, normalized.TraceID, result, propertyOperationSet)
+		return result, httpStatusForCode(result.Code)
+	}
 	processing := newControlResult(normalized.TraceID, ctl.CodeProcessing, "processing", map[string]interface{}{})
 	if !s.claimExecution(normalized.DeviceCode, device.ProductCode, normalized.TraceID, processing, propertyOperationSet) {
 		if existing, ok := s.loadExistingResult(normalized.TraceID); ok {
@@ -205,6 +215,7 @@ func (s *Service) ExecuteSet(req rtapi.PropertyRequest, expectedProductCode stri
 }
 
 func (s *Service) RegisterMQTTHandlers(config rtconfig.Config) {
+	s.dryRun = config.PropertySet.DryRun
 	if s.publisher == nil {
 		return
 	}
@@ -342,7 +353,7 @@ func (s *Service) handlePropertySet(productCode string, payload []byte) {
 	req, err := cfg.ParsePropertyRequest(payload)
 	if err != nil {
 		if s.logger != nil {
-			s.logger.Warnf("Failed to parse property_set payload for product %s: %v", productCode, err)
+			s.logger.Warnf("Failed to parse property_set payload for product %s dryRun=%t payload=%s: %v", productCode, s.dryRun, payload, err)
 		}
 		return
 	}
@@ -362,7 +373,11 @@ func (s *Service) handlePropertySet(productCode string, payload []byte) {
 	}
 	switch response.Code {
 	case ctl.CodeSuccess:
-		s.schedulePropertySetResult(productCode, req, response)
+		if dryRun, _ := response.Data["dryRun"].(bool); dryRun {
+			s.publishPropertyResult(productCode, resolvedDeviceCode(req.DeviceCode, req.DeviceCode), response)
+		} else {
+			s.schedulePropertySetResult(productCode, req, response)
+		}
 	case ctl.CodeAccepted, ctl.CodeProcessing:
 		s.publishPropertyResult(productCode, resolvedDeviceCode(req.DeviceCode, req.DeviceCode), response)
 	default:
@@ -759,6 +774,10 @@ func (s *Service) executePendingProperty(pending rtcontrol.PendingProperty, prog
 }
 
 func (s *Service) executePendingPropertySet(pending rtcontrol.PendingProperty, progress func(propertyProgressEvent)) rtapi.PropertyResponse {
+	if s.dryRun {
+		s.logDryRunRequest(rtapi.PropertyRequest(pending.Request))
+		return newControlResult(pending.TraceID, ctl.CodeSuccess, "dryRun: pending property set not written", map[string]interface{}{"dryRun": true, "executed": false})
+	}
 	taskStart := time.Now()
 	device, req, statusCode, err := s.resolvePropertyDevice(rtapi.PropertyRequest(pending.Request), pending.ProductCode)
 	if err != nil {
@@ -807,6 +826,18 @@ func (s *Service) executePendingPropertySet(pending rtcontrol.PendingProperty, p
 		progress(newPropertyProgressEvent("readback", "completed", 100, propertyNames, result.Data, taskStart, readbackStart))
 	}
 	return result
+}
+
+func (s *Service) logDryRunRequest(req rtapi.PropertyRequest) {
+	if s.logger == nil {
+		return
+	}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		s.logger.Warnf("Property set dryRun=true trace=%s device=%s request marshal failed: %v", req.TraceID, req.DeviceCode, err)
+		return
+	}
+	s.logger.Infof("Property set dryRun=true trace=%s device=%s request=%s", req.TraceID, req.DeviceCode, payload)
 }
 
 func (s *Service) executePendingPropertyGet(pending rtcontrol.PendingProperty, progress func(propertyProgressEvent)) rtapi.PropertyResponse {
