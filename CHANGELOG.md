@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.12.4 - 2026-10-28
+
+### Logging output control
+
+- Added `logging.console` to control whether logs are duplicated to stdout
+  when `logging.file` is configured.
+- Existing configurations that omit `logging.console` retain the historical
+  `true` default. Set `console: false` to write only to the rotating file and
+  prevent systemd/journald/rsyslog from storing a duplicate copy.
+- File rotation continues to use `maxSize`, `maxFiles`, `maxBackups`, and
+  `compress`; an empty file path still writes to stdout.
+
 ## v0.12.3 - 2026-09-21
 
 - Log raw malformed control payloads only when the corresponding dry-run

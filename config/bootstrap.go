@@ -157,8 +157,9 @@ func loadMainConfig(configPath string) (Config, error) {
 func defaultConfig() Config {
 	return Config{
 		Logging: logger.Config{
-			Level:  "info",
-			Format: "json",
+			Level:   "info",
+			Format:  "json",
+			Console: true,
 		},
 		Service: ServiceConfig{
 			Host:       "localhost",

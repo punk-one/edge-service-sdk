@@ -26,6 +26,7 @@ type Config struct {
 	Level      string `yaml:"level"`
 	Format     string `yaml:"format"`
 	File       string `yaml:"file"`
+	Console    bool   `yaml:"console"`
 	MaxSize    int    `yaml:"maxSize"`
 	MaxFiles   int    `yaml:"maxFiles"`
 	MaxBackups int    `yaml:"maxBackups"`
@@ -69,8 +70,12 @@ func buildOutput(config Config) io.Writer {
 		MaxBackups: maxOrDefault(config.MaxBackups, 3),
 		Compress:   config.Compress,
 	}
-	// Keep an independent console copy so disk-full and log-rotation failures
-	// do not make the service completely unobservable.
+	if !config.Console {
+		return rotating
+	}
+
+	// Console output is opt-in at the effective configuration layer. Existing
+	// configurations that omit console retain the historical true default.
 	return io.MultiWriter(os.Stdout, rotating)
 }
 
